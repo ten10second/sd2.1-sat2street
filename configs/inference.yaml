@@ -1,0 +1,80 @@
+# Stable Diffusion 推理配置
+
+# 基本配置
+seed: 42
+device: 'cuda'
+image_size: [256, 256]
+
+# 数据配置
+data:
+  dataset: 'kitti360'
+  data_dir: '/media/zhimiao/Lenovo/KITTI-360'
+  batch_size: 1
+  num_workers: 4
+  mode: 'front'
+  front_resize: [640, 256]
+  sat_size: 512
+  resolution: 0.2
+
+# 模型配置
+model:
+  base_model: 'stabilityai/stable-diffusion-2-1'
+  checkpoint_path: './checkpoints/last.ckpt'
+
+  # 卫星图编码器配置
+  satellite_encoder:
+    name: 'satellite_condition_encoder'
+    embed_dim: 768
+    patch_size: 16
+    num_layers: 12
+    num_heads: 12
+
+  # 坐标位置编码配置
+  coordinate_encoder:
+    name: 'relative_coordinate_encoder'
+    encode_type: 'fourier'
+    embed_dim: 256
+    fourier_scale: 10.0
+    num_frequencies: 10
+
+  # Satellite reading block (V1)
+  reading_block:
+    enable: true
+    injection_sites: ['mid', 'up0', 'up1']
+    num_heads: 8
+    head_dim: 64
+    geo_ratio: 0.5
+    rope_base: 10000.0
+    lambda_geo: 1.0
+    gate_hidden_ratio: 0.25
+    use_geom_bias: true
+    use_gated_residual: true
+    return_attn_map: false
+
+# 推理配置
+inference:
+  # 去噪步数
+  num_inference_steps: 50
+  # 指导强度
+  guidance_scale: 7.5
+  # 采样器
+  sampler: 'euler_a'  # euler, euler_a, dpm_solver++
+  # 批处理大小
+  batch_size: 1
+
+# 保存配置
+output:
+  output_dir: './results'
+  save_images: true
+  save_metrics: true
+
+# 验证配置
+validation:
+  compute_metrics: true
+  metrics: ['psnr', 'ssim', 'lpips']
+
+# 可视化配置
+visualization:
+  save_comparison: true
+  comparison_layout: 'horizontal'  # horizontal, vertical
+  max_visualization_samples: 50

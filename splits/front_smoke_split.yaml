@@ -1,0 +1,6 @@
+train:
+  - drive: 2013_05_28_drive_0003_sync
+    frames_file: ../../kitti360_sd_framework/splits/front_smoke_train_frames.txt
+val:
+  - drive: 2013_05_28_drive_0003_sync
+    frames_file: ../../kitti360_sd_framework/splits/front_smoke_val_frames.txt

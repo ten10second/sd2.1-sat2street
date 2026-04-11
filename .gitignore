@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+checkpoints/
+
+# Outputs and logs
+output/
+inference_results/
+logs/
+results/
+runs/
+tensorboard/
+wandb/
+train.log
+*.log
+
+# Hugging Face / local caches
+.hf-home/
+cache/
+*.cache
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives and packaged data
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+
+# Local-only helper artifacts
+.codex
+sample_*.png
+
+# Dataset files or mounts
+KITTI-360/

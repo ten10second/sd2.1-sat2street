@@ -1,0 +1,99 @@
+# Stable Diffusion 训练配置
+
+# 基本配置
+seed: 42
+device: 'cuda'
+mixed_precision: 'fp16'
+gradient_checkpointing: true
+
+# 数据配置
+data:
+  dataset: 'kitti360'
+  data_dir: '/media/zhimiao/Lenovo/KITTI-360'
+  batch_size: 2
+  num_workers: 8
+  image_size: [256, 256]
+  sat_size: 512
+  resolution: 0.2
+  mode: 'front'
+  front_resize: [640, 256]
+
+# 模型配置
+model:
+  # Stable Diffusion 基础模型
+  base_model: 'stabilityai/stable-diffusion-2-1'
+  # 是否冻结基础层
+  freeze_base: true
+
+  # 卫星图编码器配置
+  satellite_encoder:
+    name: 'satellite_condition_encoder'
+    embed_dim: 768
+    patch_size: 16
+    num_layers: 12
+    num_heads: 12
+
+  # 坐标位置编码配置
+  coordinate_encoder:
+    name: 'relative_coordinate_encoder'
+    encode_type: 'fourier'  # fourier, sincos, linear
+    embed_dim: 256
+    fourier_scale: 10.0
+    num_frequencies: 10
+
+  # Self-Attention 配置
+  self_attention:
+    name: 'relative_position_attention'
+    embed_dim: 768
+    num_heads: 12
+    dropout: 0.1
+    use_relative_pos: true
+
+  # Satellite reading block (V1)
+  reading_block:
+    enable: false
+    injection_sites: ['mid', 'up0', 'up1']
+    num_heads: 8
+    head_dim: 64
+    geo_ratio: 0.5
+    rope_base: 10000.0
+    lambda_geo: 1.0
+    gate_hidden_ratio: 0.25
+    use_geom_bias: true
+    use_gated_residual: true
+
+# 训练配置
+training:
+  epochs: 100
+  warmup_epochs: 5
+  learning_rate: 1e-4
+  weight_decay: 1e-4
+  scheduler: 'cosine'
+  gradient_accumulation_steps: 4
+  gradient_clip_val: 1.0
+
+  # Loss 配置
+  loss:
+    # 原始 SD loss 权重
+    lambda_recon: 1.0
+    # 感知 loss 权重
+    lambda_perceptual: 0.01
+
+# 保存配置
+checkpoint:
+  save_dir: './checkpoints'
+  save_every: 10
+  max_checkpoints: 5
+  resume_from: null
+
+# 日志配置
+logging:
+  log_dir: './logs'
+  log_every: 100
+  use_wandb: true
+  project_name: 'kitti360_sd'
+
+# 验证配置
+validation:
+  validate_every: 5
+  num_validation_samples: 100
