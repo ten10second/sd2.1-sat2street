@@ -15,11 +15,15 @@ from .continuous_xy_georope import ContinuousXYGeoRoPE
 class SatelliteReadingAttention(nn.Module):
     """
     Build Q/K/V, apply GeoRoPE, read satellite tokens for front queries.
+
+    Queries combine geometric position and the current U-Net front feature so the
+    reading policy can change across denoising steps and feature hierarchies.
     """
 
     def __init__(
         self,
         sat_in_dim: int,
+        front_in_dim: int,
         num_heads: int,
         head_dim: int,
         geo_ratio: float = 0.5,
@@ -45,6 +49,11 @@ class SatelliteReadingAttention(nn.Module):
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
+        self.front_adapter = nn.Sequential(
+            nn.Linear(front_in_dim, model_dim),
+            nn.LayerNorm(model_dim),
+        )
+        self.query_norm = nn.LayerNorm(model_dim)
 
         adapter = [nn.Linear(sat_in_dim, model_dim)]
         if use_sat_layer_norm:
@@ -72,21 +81,43 @@ class SatelliteReadingAttention(nn.Module):
 
     def forward(
         self,
+        front_feat: torch.Tensor,
         front_bev_xy: torch.Tensor,
         sat_tokens: torch.Tensor,
         sat_xy: torch.Tensor,
         return_attn_map: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if front_feat.ndim != 4:
+            raise ValueError("front_feat must be rank-4 [B,C,H,W]")
         if front_bev_xy.ndim != 3 or sat_tokens.ndim != 3 or sat_xy.ndim != 3:
             raise ValueError("front_bev_xy, sat_tokens, sat_xy must all be rank-3 tensors")
         if front_bev_xy.shape[-1] != 2 or sat_xy.shape[-1] != 2:
             raise ValueError("front_bev_xy/sat_xy last dim must be 2")
-        if sat_tokens.shape[0] != front_bev_xy.shape[0] or sat_xy.shape[0] != front_bev_xy.shape[0]:
+        if (
+            front_feat.shape[0] != front_bev_xy.shape[0] or
+            sat_tokens.shape[0] != front_bev_xy.shape[0] or
+            sat_xy.shape[0] != front_bev_xy.shape[0]
+        ):
             raise ValueError("Batch size mismatch among front_bev_xy/sat_tokens/sat_xy")
         if sat_tokens.shape[1] != sat_xy.shape[1]:
             raise ValueError("sat_tokens and sat_xy token count mismatch")
 
-        q_embed = self.position_mlp(front_bev_xy)
+        batch_size, _, height, width = front_feat.shape
+        front_feat_flat = front_feat.flatten(2).transpose(1, 2)
+        expected_nf = height * width
+        if front_bev_xy.shape[1] != expected_nf:
+            raise ValueError(
+                f"front_bev_xy token count mismatch: expected {expected_nf}, got {front_bev_xy.shape[1]}"
+            )
+        if front_feat_flat.shape[:2] != front_bev_xy.shape[:2]:
+            raise ValueError(
+                f"front_feat token count mismatch: expected {list(front_bev_xy.shape[:2])}, "
+                f"got {list(front_feat_flat.shape[:2])}"
+            )
+
+        pos_embed = self.position_mlp(front_bev_xy)
+        feat_embed = self.front_adapter(front_feat_flat)
+        q_embed = self.query_norm(pos_embed + feat_embed)
         sat_feat = self.sat_adapter(sat_tokens)
 
         q = self._reshape_heads(self.q_proj(q_embed))
@@ -103,7 +134,6 @@ class SatelliteReadingAttention(nn.Module):
         attn_map = self.attn_dropout(attn_map)
 
         read_tokens = torch.matmul(attn_map, v)
-        read_tokens = read_tokens.transpose(1, 2).reshape(front_bev_xy.shape[0], front_bev_xy.shape[1], self.model_dim)
+        read_tokens = read_tokens.transpose(1, 2).reshape(batch_size, front_bev_xy.shape[1], self.model_dim)
 
         return read_tokens, (attn_map if return_attn_map else None)
-

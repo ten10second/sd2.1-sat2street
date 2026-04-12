@@ -219,8 +219,10 @@ def main():
 
     args = parser.parse_args()
 
-    os.environ.setdefault("HF_ENDPOINT", args.hf_endpoint)
-    os.environ.setdefault("HF_HOME", args.hf_home)
+    os.environ["HF_ENDPOINT"] = args.hf_endpoint
+    os.environ["HF_HOME"] = args.hf_home
+    logger.info(f"HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
+    logger.info(f"HF_HOME={os.environ['HF_HOME']}")
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         logger.warning("CUDA requested but not available, falling back to CPU")

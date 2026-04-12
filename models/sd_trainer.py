@@ -69,6 +69,42 @@ def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> 
     return snapshot_dirs[-1]
 
 
+@torch.no_grad()
+def _materialize_lazy_modules(
+    model: "SatelliteConditionedSDModel",
+    sat_images: torch.Tensor,
+    coords_map: Optional[torch.Tensor],
+    target_size: Tuple[int, int],
+) -> None:
+    sat_encoded = model.encode_satellite(sat_images, coords_map)
+    if isinstance(sat_encoded, tuple):
+        sat_tokens, sat_xy = sat_encoded
+    else:
+        sat_tokens = sat_encoded
+        sat_xy = None
+    encoder_hidden_states = model.adapt_condition_tokens(sat_tokens)
+
+    vae_scale_factor = model._get_vae_scale_factor()
+    latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
+    latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
+    latents = torch.randn(
+        (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
+        device=sat_images.device,
+        dtype=sat_tokens.dtype,
+    )
+    timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
+
+    model.unet(
+        latents,
+        timestep,
+        encoder_hidden_states=encoder_hidden_states,
+        sat_tokens=sat_tokens,
+        sat_xy=sat_xy,
+        front_bev_xy=coords_map,
+        return_attn_map=False,
+    )
+
+
 class SatelliteConditionedSDModel(nn.Module):
     """
     Stable Diffusion model conditioned on satellite images with coordinate encoding.
@@ -119,6 +155,22 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             self.satellite_encoder = satellite_encoder
 
+        sat_token_dim = int(getattr(self.satellite_encoder, "embed_dim", unet.config.cross_attention_dim or 768))
+        cross_attention_dim = int(unet.config.cross_attention_dim or sat_token_dim)
+        adapter_hidden_dim = max(sat_token_dim, cross_attention_dim)
+        self.sat_to_text_input_norm = nn.LayerNorm(sat_token_dim)
+        self.sat_to_text_in_proj = nn.Linear(sat_token_dim, adapter_hidden_dim)
+        self.sat_to_text_act = nn.SiLU()
+        self.sat_to_text_out_proj = nn.Linear(adapter_hidden_dim, cross_attention_dim)
+        self.sat_to_text_residual = (
+            nn.Identity()
+            if sat_token_dim == cross_attention_dim
+            else nn.Linear(sat_token_dim, cross_attention_dim, bias=False)
+        )
+        self.sat_to_text_output_norm = nn.LayerNorm(cross_attention_dim)
+        nn.init.zeros_(self.sat_to_text_out_proj.weight)
+        nn.init.zeros_(self.sat_to_text_out_proj.bias)
+
         # Freeze base layers
         if freeze_base:
             # Freeze VAE
@@ -136,15 +188,41 @@ class SatelliteConditionedSDModel(nn.Module):
         # Satellite encoder is always trainable
         for param in self.satellite_encoder.parameters():
             param.requires_grad = True
+        for param in (
+            *self.sat_to_text_input_norm.parameters(),
+            *self.sat_to_text_in_proj.parameters(),
+            *self.sat_to_text_out_proj.parameters(),
+            *self.sat_to_text_residual.parameters(),
+            *self.sat_to_text_output_norm.parameters(),
+        ):
+            param.requires_grad = True
 
         logger.info(f"[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
         logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
+        logger.info(
+            f"  Satellite-to-text adapter params: "
+            f"{sum(p.numel() for p in self.sat_to_text_parameters() if p.requires_grad)}"
+        )
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
     def encode_satellite(self, sat_images: torch.Tensor, coords_map: torch.Tensor = None) -> torch.Tensor:
         """Encode satellite images to embeddings."""
         return self.satellite_encoder(sat_images, coords_map, return_sat_xy=True)
+
+    def sat_to_text_parameters(self):
+        yield from self.sat_to_text_input_norm.parameters()
+        yield from self.sat_to_text_in_proj.parameters()
+        yield from self.sat_to_text_out_proj.parameters()
+        yield from self.sat_to_text_residual.parameters()
+        yield from self.sat_to_text_output_norm.parameters()
+
+    def adapt_condition_tokens(self, sat_tokens: torch.Tensor) -> torch.Tensor:
+        residual = self.sat_to_text_residual(sat_tokens)
+        delta = self.sat_to_text_in_proj(self.sat_to_text_input_norm(sat_tokens))
+        delta = self.sat_to_text_act(delta)
+        delta = self.sat_to_text_out_proj(delta)
+        return self.sat_to_text_output_norm(residual + delta)
 
     @staticmethod
     def _normalize_images_for_vae(images: torch.Tensor) -> torch.Tensor:
@@ -206,13 +284,16 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             sat_tokens = sat_encoded
             sat_xy = None
+        encoder_hidden_states = self.adapt_condition_tokens(sat_tokens)
         condition_mask = torch.ones(B, device=device, dtype=torch.bool)
         if self.training and self.cond_drop_prob > 0.0:
             condition_mask = torch.rand(B, device=device) >= self.cond_drop_prob
             sat_tokens = sat_tokens * self._expand_condition_mask(condition_mask, sat_tokens)
+            encoder_hidden_states = encoder_hidden_states * self._expand_condition_mask(
+                condition_mask, encoder_hidden_states
+            )
             if sat_xy is not None:
                 sat_xy = sat_xy * self._expand_condition_mask(condition_mask, sat_xy)
-        encoder_hidden_states = sat_tokens
 
         # Encode target images to latents
         with torch.no_grad():
@@ -334,7 +415,7 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             sat_tokens = sat_encoded
             sat_xy = None
-        encoder_hidden_states = sat_tokens
+        encoder_hidden_states = self.adapt_condition_tokens(sat_tokens)
         condition_mask = torch.ones(B, device=device, dtype=torch.bool)
 
         image_h, image_w = self._infer_generation_size(coords_map=coords_map, target_size=target_size)
@@ -353,9 +434,10 @@ class SatelliteConditionedSDModel(nn.Module):
         # Prepare CFG branches once and reuse them for every timestep.
         use_cfg = guidance_scale > 1.0
         if use_cfg:
+            uncond_encoder_hidden_states = torch.zeros_like(encoder_hidden_states)
             uncond_tokens = torch.zeros_like(sat_tokens)
             uncond_sat_xy = torch.zeros_like(sat_xy) if sat_xy is not None else None
-            encoder_hidden_states_double = torch.cat([encoder_hidden_states, uncond_tokens], dim=0)
+            encoder_hidden_states_double = torch.cat([encoder_hidden_states, uncond_encoder_hidden_states], dim=0)
             sat_tokens_double = torch.cat([sat_tokens, uncond_tokens], dim=0)
             sat_xy_double = torch.cat([sat_xy, uncond_sat_xy], dim=0) if sat_xy is not None else None
             coords_map_double = torch.cat([coords_map, coords_map], dim=0) if coords_map is not None else None
@@ -402,9 +484,19 @@ class SatelliteConditionedSDModel(nn.Module):
                 ).sample
 
             # Compute previous noisy sample
-            latents = self.noise_scheduler.step(
-                noise_pred, t, latents
-            ).prev_sample
+            if generator is not None:
+                try:
+                    latents = self.noise_scheduler.step(
+                        noise_pred, t, latents, generator=generator
+                    ).prev_sample
+                except TypeError:
+                    latents = self.noise_scheduler.step(
+                        noise_pred, t, latents
+                    ).prev_sample
+            else:
+                latents = self.noise_scheduler.step(
+                    noise_pred, t, latents
+                ).prev_sample
 
         # Decode latents to images
         vae_param = next(self.vae.parameters(), None)
@@ -579,6 +671,10 @@ class SDTrainer:
         # Setup output dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Reading blocks are created lazily on first forward. Materialize them before
+        # building the optimizer so their parameters are actually trainable.
+        self._materialize_lazy_condition_modules()
+
         # Setup optimizer
         self.optimizer = AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -615,6 +711,44 @@ class SDTrainer:
                 f"  Visualization: every {self.visualize_every} epoch(s), "
                 f"{self.num_visualizations} sample(s), {self.visualization_inference_steps} denoise steps"
             )
+
+    @torch.no_grad()
+    def _materialize_lazy_condition_modules(self) -> None:
+        unet = getattr(self.model, "unet", None)
+        if unet is None or not getattr(unet, "use_satellite_reading", False):
+            return
+        if len(getattr(unet, "reading_blocks", {})) > 0:
+            return
+
+        try:
+            batch = next(iter(self.train_dataloader))
+        except StopIteration:
+            logger.warning("Skipped lazy module materialization because the training dataloader is empty")
+            return
+
+        sat_images = batch.get("sat")
+        target_images = batch.get("image")
+        if sat_images is None or target_images is None:
+            logger.warning("Skipped lazy module materialization because batch is missing 'sat' or 'image'")
+            return
+
+        sat_images = sat_images[:1].to(self.device)
+        coords_map = batch.get("coords_map")
+        if coords_map is not None:
+            coords_map = coords_map[:1].to(self.device)
+        target_size = tuple(int(x) for x in target_images.shape[-2:])
+
+        was_training = self.model.training
+        self.model.eval()
+        _materialize_lazy_modules(self.model, sat_images, coords_map, target_size)
+        if was_training:
+            self.model.train()
+
+        reading_param_count = sum(p.numel() for p in unet.reading_blocks.parameters())
+        logger.info(
+            f"Materialized {len(unet.reading_blocks)} reading block(s) before optimizer init "
+            f"({reading_param_count} parameters)"
+        )
 
     def train(self, resume_from: Optional[str] = None):
         """Run training."""
