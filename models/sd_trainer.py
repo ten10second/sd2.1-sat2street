@@ -34,6 +34,41 @@ from models.sd_model import SatelliteConditionedUNet
 logger = logging.getLogger(__name__)
 
 
+def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> Optional[Path]:
+    candidate_path = Path(model_id).expanduser()
+    if candidate_path.is_dir():
+        return candidate_path
+
+    if "/" not in model_id:
+        return None
+
+    hf_home = os.environ.get("HF_HOME")
+    if not hf_home:
+        return None
+
+    cache_root = Path(hf_home).expanduser() / "hub" / f"models--{model_id.replace('/', '--')}"
+    if not cache_root.is_dir():
+        return None
+
+    ref_name = revision or "main"
+    ref_file = cache_root / "refs" / ref_name
+    if ref_file.is_file():
+        snapshot_hash = ref_file.read_text().strip()
+        snapshot_dir = cache_root / "snapshots" / snapshot_hash
+        if snapshot_dir.is_dir():
+            return snapshot_dir
+
+    snapshots_dir = cache_root / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+
+    snapshot_dirs = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+    if not snapshot_dirs:
+        return None
+
+    return snapshot_dirs[-1]
+
+
 class SatelliteConditionedSDModel(nn.Module):
     """
     Stable Diffusion model conditioned on satellite images with coordinate encoding.
@@ -410,20 +445,27 @@ def create_sd_model(
     Returns:
         SatelliteConditionedSDModel
     """
+    resolved_base_model = _resolve_hf_snapshot_path(base_model, revision=revision)
+    load_source = str(resolved_base_model) if resolved_base_model is not None else base_model
+    if resolved_base_model is not None:
+        logger.info(f"Using cached base model snapshot: {resolved_base_model}")
+
     # Load base components
     component_load_kwargs: Dict[str, Any] = {}
-    if revision is not None:
+    if revision is not None and resolved_base_model is None:
         component_load_kwargs["revision"] = revision
     if torch_dtype is not None:
         component_load_kwargs["torch_dtype"] = torch_dtype
+    if resolved_base_model is not None:
+        component_load_kwargs["local_files_only"] = True
 
     vae = AutoencoderKL.from_pretrained(
-        base_model,
+        load_source,
         subfolder="vae",
         **component_load_kwargs,
     )
     base_unet = UNet2DConditionModel.from_pretrained(
-        base_model,
+        load_source,
         subfolder="unet",
         **component_load_kwargs,
     )
@@ -446,11 +488,13 @@ def create_sd_model(
     )
     unet.load_state_dict(base_unet.state_dict(), strict=False)
     scheduler_load_kwargs: Dict[str, Any] = {}
-    if revision is not None:
+    if revision is not None and resolved_base_model is None:
         scheduler_load_kwargs["revision"] = revision
+    if resolved_base_model is not None:
+        scheduler_load_kwargs["local_files_only"] = True
 
     noise_scheduler = DDPMScheduler.from_pretrained(
-        base_model,
+        load_source,
         subfolder="scheduler",
         **scheduler_load_kwargs,
     )
