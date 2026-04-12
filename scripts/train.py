@@ -299,21 +299,19 @@ def main():
 
     # Load model
     logger.info("Loading model...")
-    model_torch_dtype = None
-    if args.device.startswith("cuda") and args.mixed_precision == "fp16":
-        model_torch_dtype = torch.float16
-    elif args.device.startswith("cuda") and args.mixed_precision == "bf16":
-        model_torch_dtype = torch.bfloat16
-
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
         reading_block_config={"enable": True},
         revision=args.base_model_revision,
-        torch_dtype=model_torch_dtype,
+        torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
         text_anchor_prompt=args.text_anchor_prompt,
     )
+    if args.device.startswith("cuda") and args.mixed_precision != "no":
+        logger.info(
+            "Training keeps model weights in fp32; mixed precision is applied via autocast only"
+        )
     if hasattr(model.unet, "enable_gradient_checkpointing"):
         model.unet.enable_gradient_checkpointing()
         logger.info("Enabled UNet gradient checkpointing")

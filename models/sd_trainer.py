@@ -736,6 +736,7 @@ class SDTrainer:
         # building the optimizer so their parameters are actually trainable.
         self._materialize_lazy_condition_modules()
         self._ensure_trainable_params_fp32()
+        self._assert_no_trainable_fp16_params()
 
         # Setup optimizer
         self.optimizer = AdamW(
@@ -831,6 +832,21 @@ class SDTrainer:
             logger.info(
                 f"Converted {converted_param_count} trainable parameter tensors "
                 f"({converted_numel} values) from fp16 to fp32 for AMP stability"
+            )
+
+    def _assert_no_trainable_fp16_params(self) -> None:
+        remaining_fp16 = [
+            name
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and param.dtype == torch.float16
+        ]
+        if remaining_fp16:
+            preview = ", ".join(remaining_fp16[:8])
+            if len(remaining_fp16) > 8:
+                preview += ", ..."
+            raise RuntimeError(
+                "Found trainable fp16 parameters after AMP preparation. "
+                f"These must stay fp32 for GradScaler: {preview}"
             )
 
     def train(self, resume_from: Optional[str] = None):
