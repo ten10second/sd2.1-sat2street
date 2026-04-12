@@ -129,11 +129,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         if site in self.reading_blocks:
             block = self.reading_blocks[site]
             block_param = next(block.parameters(), None)
-            if (
-                block_param is not None and
-                (block_param.device != front_feat.device or block_param.dtype != front_feat.dtype)
-            ):
-                block = block.to(device=front_feat.device, dtype=front_feat.dtype)
+            if block_param is not None and block_param.device != front_feat.device:
+                block = block.to(device=front_feat.device)
                 self.reading_blocks[site] = block
             return block
 
@@ -149,7 +146,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             use_geom_bias=self.reading_block_config["use_geom_bias"],
             use_gated_residual=self.reading_block_config["use_gated_residual"],
         )
-        block = block.to(device=front_feat.device, dtype=front_feat.dtype)
+        block = block.to(device=front_feat.device)
         self.reading_blocks[site] = block
         return block
 
