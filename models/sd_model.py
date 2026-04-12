@@ -367,11 +367,17 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 encoder_hidden_states=encoder_hidden_states,
                 **kwargs,
             )
-            if enable_reading:
-                self.last_attn_maps = self._conditioning_context.get("attn_maps", {})
-            return output
-        finally:
+        except Exception:
             self._conditioning_context = {}
+            raise
+
+        if enable_reading:
+            self.last_attn_maps = self._conditioning_context.get("attn_maps", {})
+
+        # Keep the conditioning context alive after a successful forward so
+        # gradient checkpointing can re-run hooked submodules during backward
+        # with the same satellite inputs. The next forward overwrites it.
+        return output
 
 
 class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
