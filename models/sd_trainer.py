@@ -323,7 +323,7 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Predict noise
         unet_kwargs = self._build_unet_kwargs(
-            encoder_hidden_states=sat_tokens,
+            encoder_hidden_states=encoder_hidden_states,
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
             coords_map=coords_map,
@@ -735,6 +735,7 @@ class SDTrainer:
         # Reading blocks are created lazily on first forward. Materialize them before
         # building the optimizer so their parameters are actually trainable.
         self._materialize_lazy_condition_modules()
+        self._ensure_trainable_params_fp32()
 
         # Setup optimizer
         self.optimizer = AdamW(
@@ -810,6 +811,27 @@ class SDTrainer:
             f"Materialized {len(unet.reading_blocks)} reading block(s) before optimizer init "
             f"({reading_param_count} parameters)"
         )
+
+    def _ensure_trainable_params_fp32(self) -> None:
+        fp16_params = []
+        converted_param_count = 0
+        converted_numel = 0
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad or param.dtype != torch.float16:
+                continue
+            fp16_params.append(name)
+            param.data = param.data.float()
+            if param.grad is not None:
+                param.grad.data = param.grad.data.float()
+            converted_param_count += 1
+            converted_numel += param.numel()
+
+        if fp16_params:
+            logger.info(
+                f"Converted {converted_param_count} trainable parameter tensors "
+                f"({converted_numel} values) from fp16 to fp32 for AMP stability"
+            )
 
     def train(self, resume_from: Optional[str] = None):
         """Run training."""
