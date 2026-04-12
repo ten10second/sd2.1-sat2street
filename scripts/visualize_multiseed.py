@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Visualize the same sample with multiple random seeds.
+Visualize the same sample with multiple random seeds and/or CFG scales.
 """
 
 import sys
@@ -100,7 +100,9 @@ def _load_split_from_yaml(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Visualize one frame with multiple random seeds")
+    parser = argparse.ArgumentParser(
+        description="Visualize one frame with multiple random seeds and guidance scales"
+    )
     parser.add_argument(
         "--data_dir", type=str, default="/media/zhimiao/Lenovo/KITTI-360",
         help="Path to KITTI-360 data root",
@@ -144,6 +146,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seeds", type=int, nargs="+", default=[0, 1, 2, 3],
         help="Random seeds used to generate the same sample",
+    )
+    parser.add_argument(
+        "--guidance_scales", type=float, nargs="+", default=[7.5],
+        help="Classifier-free guidance scales to compare. Values <= 1 disable CFG.",
     )
     parser.add_argument(
         "--inference_steps", type=int, default=30,
@@ -243,6 +249,14 @@ def _add_label(image: Image.Image, label: str) -> Image.Image:
     return canvas
 
 
+def _format_guidance_scale(scale: float) -> str:
+    return f"{scale:g}"
+
+
+def _guidance_scale_filename_token(scale: float) -> str:
+    return _format_guidance_scale(scale).replace("-", "m").replace(".", "p")
+
+
 def _resize_satellite_for_front(sat_image: torch.Tensor, target_h: int) -> torch.Tensor:
     return F.interpolate(
         sat_image.unsqueeze(0),
@@ -262,6 +276,22 @@ def _compose_panels(panels: Sequence[Tuple[str, torch.Tensor]]) -> Image.Image:
     for image in pil_panels:
         canvas.paste(image, (x_offset, 0))
         x_offset += image.width
+
+    return canvas
+
+
+def _stack_panel_rows(rows: Sequence[Image.Image], spacing: int = 8) -> Image.Image:
+    if not rows:
+        raise ValueError("rows must not be empty")
+
+    width = max(image.width for image in rows)
+    height = sum(image.height for image in rows) + spacing * max(0, len(rows) - 1)
+    canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+
+    y_offset = 0
+    for image in rows:
+        canvas.paste(image, (0, y_offset))
+        y_offset += image.height + spacing
 
     return canvas
 
@@ -374,37 +404,60 @@ def main() -> None:
     _tensor_to_pil(sat_resized).save(sample_dir / "satellite.png")
     _tensor_to_pil(real_image).save(sample_dir / "real.png")
 
-    generated_panels: List[Tuple[str, torch.Tensor]] = []
+    single_cfg = len(args.guidance_scales) == 1
+    summary_rows: List[Image.Image] = []
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
 
-    for seed in args.seeds:
-        logger.info(f"Generating seed={seed}")
-        generator = torch.Generator(device=generator_device)
-        generator.manual_seed(seed)
+    for guidance_scale in args.guidance_scales:
+        guidance_scale_text = _format_guidance_scale(guidance_scale)
+        guidance_scale_token = _guidance_scale_filename_token(guidance_scale)
+        generated_panels: List[Tuple[str, torch.Tensor]] = []
 
-        generated = model.generate(
-            sat_image,
-            coords_map=coords_map,
-            target_size=target_size,
-            num_inference_steps=args.inference_steps,
-            generator=generator,
-        )[0].cpu()
+        for seed in args.seeds:
+            logger.info(f"Generating cfg={guidance_scale_text}, seed={seed}")
+            generator = torch.Generator(device=generator_device)
+            generator.manual_seed(seed)
 
-        _tensor_to_pil(generated).save(sample_dir / f"generated_seed_{seed}.png")
+            generated = model.generate(
+                sat_image,
+                coords_map=coords_map,
+                target_size=target_size,
+                num_inference_steps=args.inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            )[0].cpu()
 
-        comparison = _compose_panels([
+            if single_cfg:
+                generated_name = f"generated_seed_{seed}.png"
+                comparison_name = f"comparison_seed_{seed}.png"
+                comparison_label = f"gen seed={seed}"
+            else:
+                generated_name = f"generated_cfg_{guidance_scale_token}_seed_{seed}.png"
+                comparison_name = f"comparison_cfg_{guidance_scale_token}_seed_{seed}.png"
+                comparison_label = f"gen cfg={guidance_scale_text} seed={seed}"
+
+            _tensor_to_pil(generated).save(sample_dir / generated_name)
+
+            comparison = _compose_panels([
+                ("sat", sat_resized),
+                (comparison_label, generated),
+                ("real", real_image),
+            ])
+            comparison.save(sample_dir / comparison_name)
+            generated_panels.append((f"seed={seed}", generated))
+
+        cfg_summary = _compose_panels([
             ("sat", sat_resized),
-            (f"gen seed={seed}", generated),
             ("real", real_image),
+            *generated_panels,
         ])
-        comparison.save(sample_dir / f"comparison_seed_{seed}.png")
-        generated_panels.append((f"seed={seed}", generated))
+        if single_cfg:
+            summary_rows.append(cfg_summary)
+        else:
+            cfg_summary.save(sample_dir / f"summary_cfg_{guidance_scale_token}.png")
+            summary_rows.append(_add_label(cfg_summary, f"cfg={guidance_scale_text}"))
 
-    summary = _compose_panels([
-        ("sat", sat_resized),
-        ("real", real_image),
-        *generated_panels,
-    ])
+    summary = _stack_panel_rows(summary_rows) if len(summary_rows) > 1 else summary_rows[0]
     summary.save(sample_dir / "summary.png")
 
     metadata = {
@@ -417,6 +470,7 @@ def main() -> None:
         "frame_id": frame_id,
         "target_size": list(target_size),
         "inference_steps": args.inference_steps,
+        "guidance_scales": list(args.guidance_scales),
         "seeds": list(args.seeds),
     }
     with open(sample_dir / "metadata.yaml", "w") as f:
