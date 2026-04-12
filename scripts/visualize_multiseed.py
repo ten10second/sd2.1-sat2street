@@ -150,14 +150,6 @@ def _parse_args() -> argparse.Namespace:
         help="Number of denoising steps for each visualization",
     )
     parser.add_argument(
-        "--guidance_scale", type=float, default=None,
-        help="Single CFG guidance scale. Ignored if --guidance_scales is provided.",
-    )
-    parser.add_argument(
-        "--guidance_scales", type=float, nargs="+", default=None,
-        help="One or more CFG guidance scales to compare in a single run",
-    )
-    parser.add_argument(
         "--device", type=str, default="cuda",
         help="Device to use (cuda or cpu)",
     )
@@ -274,34 +266,6 @@ def _compose_panels(panels: Sequence[Tuple[str, torch.Tensor]]) -> Image.Image:
     return canvas
 
 
-def _stack_images_vertical(images: Sequence[Image.Image]) -> Image.Image:
-    if not images:
-        raise ValueError("images must not be empty")
-
-    max_width = max(image.width for image in images)
-    total_height = sum(image.height for image in images)
-    canvas = Image.new("RGB", (max_width, total_height), color=(255, 255, 255))
-
-    y_offset = 0
-    for image in images:
-        canvas.paste(image, (0, y_offset))
-        y_offset += image.height
-
-    return canvas
-
-
-def _format_scale_for_filename(scale: float) -> str:
-    return format(scale, "g").replace("-", "neg").replace(".", "p")
-
-
-def _resolve_guidance_scales(args: argparse.Namespace) -> List[float]:
-    if args.guidance_scales:
-        return [float(scale) for scale in args.guidance_scales]
-    if args.guidance_scale is not None:
-        return [float(args.guidance_scale)]
-    return [3.0]
-
-
 @torch.no_grad()
 def _materialize_lazy_modules(
     model,
@@ -352,7 +316,6 @@ def _load_checkpoint(model, checkpoint_path: Path, device: str) -> Dict:
 
 def main() -> None:
     args = _parse_args()
-    guidance_scales = _resolve_guidance_scales(args)
 
     os.environ.setdefault("HF_ENDPOINT", args.hf_endpoint)
     os.environ.setdefault("HF_HOME", args.hf_home)
@@ -411,53 +374,38 @@ def main() -> None:
     _tensor_to_pil(sat_resized).save(sample_dir / "satellite.png")
     _tensor_to_pil(real_image).save(sample_dir / "real.png")
 
+    generated_panels: List[Tuple[str, torch.Tensor]] = []
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
-    cfg_summaries: List[Image.Image] = []
 
-    for guidance_scale in guidance_scales:
-        cfg_tag = _format_scale_for_filename(guidance_scale)
-        cfg_dir = sample_dir / f"cfg_{cfg_tag}"
-        cfg_dir.mkdir(parents=True, exist_ok=True)
+    for seed in args.seeds:
+        logger.info(f"Generating seed={seed}")
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(seed)
 
-        generated_panels: List[Tuple[str, torch.Tensor]] = []
-        logger.info(f"Generating guidance_scale={guidance_scale}")
+        generated = model.generate(
+            sat_image,
+            coords_map=coords_map,
+            target_size=target_size,
+            num_inference_steps=args.inference_steps,
+            generator=generator,
+        )[0].cpu()
 
-        for seed in args.seeds:
-            logger.info(f"Generating guidance_scale={guidance_scale}, seed={seed}")
-            generator = torch.Generator(device=generator_device)
-            generator.manual_seed(seed)
+        _tensor_to_pil(generated).save(sample_dir / f"generated_seed_{seed}.png")
 
-            generated = model.generate(
-                sat_image,
-                coords_map=coords_map,
-                target_size=target_size,
-                num_inference_steps=args.inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-            )[0].cpu()
-
-            _tensor_to_pil(generated).save(cfg_dir / f"generated_seed_{seed}.png")
-
-            comparison = _compose_panels([
-                ("sat", sat_resized),
-                (f"cfg={guidance_scale:g} seed={seed}", generated),
-                ("real", real_image),
-            ])
-            comparison.save(cfg_dir / f"comparison_seed_{seed}.png")
-            generated_panels.append((f"cfg={guidance_scale:g} seed={seed}", generated))
-
-        summary = _compose_panels([
+        comparison = _compose_panels([
             ("sat", sat_resized),
+            (f"gen seed={seed}", generated),
             ("real", real_image),
-            *generated_panels,
         ])
-        summary.save(cfg_dir / "summary.png")
-        cfg_summaries.append(_add_label(summary, f"CFG={guidance_scale:g}"))
+        comparison.save(sample_dir / f"comparison_seed_{seed}.png")
+        generated_panels.append((f"seed={seed}", generated))
 
-    if len(cfg_summaries) == 1:
-        cfg_summaries[0].save(sample_dir / "summary_all_cfg.png")
-    else:
-        _stack_images_vertical(cfg_summaries).save(sample_dir / "summary_all_cfg.png")
+    summary = _compose_panels([
+        ("sat", sat_resized),
+        ("real", real_image),
+        *generated_panels,
+    ])
+    summary.save(sample_dir / "summary.png")
 
     metadata = {
         "checkpoint": str(Path(args.checkpoint).resolve()),
@@ -470,7 +418,6 @@ def main() -> None:
         "target_size": list(target_size),
         "inference_steps": args.inference_steps,
         "seeds": list(args.seeds),
-        "guidance_scales": guidance_scales,
     }
     with open(sample_dir / "metadata.yaml", "w") as f:
         yaml.safe_dump(metadata, f, sort_keys=False)
@@ -480,3 +427,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
