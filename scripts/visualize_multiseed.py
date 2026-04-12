@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
+print(DEFAULT_HF_HOME)
 
 
 def _load_frame_ids(frames_file: Path) -> List[int]:
@@ -104,7 +105,7 @@ def _parse_args() -> argparse.Namespace:
         description="Visualize one frame with multiple random seeds and guidance scales"
     )
     parser.add_argument(
-        "--data_dir", type=str, default="/media/zhimiao/Lenovo/KITTI-360",
+        "--data_dir", type=str, default="/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
         help="Path to KITTI-360 data root",
     )
     parser.add_argument(

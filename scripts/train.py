@@ -124,7 +124,7 @@ def main():
         help="Path to config file",
     )
     parser.add_argument(
-        "--data_dir", type=str, default="/media/zhimiao/Lenovo/KITTI-360",
+        "--data_dir", type=str, default="/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
         help="Path to KITTI-360 data",
     )
     parser.add_argument(
