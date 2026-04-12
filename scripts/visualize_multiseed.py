@@ -133,6 +133,10 @@ def _parse_args() -> argparse.Namespace:
         help="Path to training checkpoint",
     )
     parser.add_argument(
+        "--text_anchor_prompt", type=str, default="",
+        help="Fixed text prompt used for the main UNet cross-attention branch.",
+    )
+    parser.add_argument(
         "--base_model", type=str, default=DEFAULT_SD21_BASE_REPO,
         help="Base diffusers model repo id or local path",
     )
@@ -310,7 +314,11 @@ def _materialize_lazy_modules(
     else:
         sat_tokens = sat_encoded
         sat_xy = None
-    encoder_hidden_states = model.adapt_condition_tokens(sat_tokens)
+    encoder_hidden_states = model.get_text_conditioning(
+        batch_size=sat_tokens.shape[0],
+        device=sat_tokens.device,
+        dtype=sat_tokens.dtype,
+    )
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -386,6 +394,7 @@ def main() -> None:
         reading_block_config={"enable": True},
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
+        text_anchor_prompt=args.text_anchor_prompt,
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")
@@ -468,6 +477,7 @@ def main() -> None:
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "checkpoint_epoch": checkpoint_meta.get("epoch"),
         "base_model": args.base_model,
+        "text_anchor_prompt": args.text_anchor_prompt,
         "dataset_split": args.dataset_split,
         "sample_index": sample_index,
         "drive": drive_name,

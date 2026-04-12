@@ -21,6 +21,7 @@ except ImportError:
     from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
 
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
+from models.unet.decoupled_sat_cross_attn import DecoupledSatCrossAttn
 from models.unet.satellite_reading_block import SatelliteReadingBlock
 
 
@@ -46,7 +47,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         self.supports_satellite_reading = True
         self.use_satellite_reading = use_satellite_reading
-        self.reading_injection_sites = reading_injection_sites or ["mid", "up0", "up1"]
+        self.reading_injection_sites = reading_injection_sites or ["mid"]
+        sat_in_dim = int(self.config.cross_attention_dim or 768)
         self.reading_block_config = {
             "num_heads": 8,
             "head_dim": 64,
@@ -61,10 +63,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             self.reading_block_config.update(reading_block_config)
 
         self.reading_blocks = nn.ModuleDict()
-        self._reading_context: Dict[str, Any] = {}
+        self.sat_cross_attn_layers = nn.ModuleDict()
+        self._conditioning_context: Dict[str, Any] = {}
         self._reading_hook_handles = []
+        self._sat_cross_attn_hook_handles = []
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
 
+        self._register_sat_cross_attn_hooks(sat_in_dim=sat_in_dim)
         if self.use_satellite_reading:
             self._register_reading_hooks()
 
@@ -75,6 +80,33 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 continue
             handle = module.register_forward_hook(self._make_reading_hook(site))
             self._reading_hook_handles.append(handle)
+
+    def _register_sat_cross_attn_hooks(self, sat_in_dim: int):
+        for name, module in list(self.named_modules()):
+            if not name.endswith("attn2") or not hasattr(module, "to_q"):
+                continue
+            if not self._is_sat_cross_attn_target(name):
+                continue
+
+            layer_key = name.replace(".", "__")
+            self.sat_cross_attn_layers[layer_key] = DecoupledSatCrossAttn(
+                sat_in_dim=sat_in_dim,
+                inner_dim=int(module.inner_dim),
+                out_dim=int(module.out_dim),
+            )
+            handle = module.register_forward_hook(self._make_sat_cross_attn_hook(layer_key))
+            self._sat_cross_attn_hook_handles.append(handle)
+
+    @staticmethod
+    def _is_sat_cross_attn_target(module_name: str) -> bool:
+        prefixes = (
+            "down_blocks.1.",
+            "down_blocks.2.",
+            "mid_block.",
+            "up_blocks.1.",
+            "up_blocks.2.",
+        )
+        return any(module_name.startswith(prefix) for prefix in prefixes)
 
     def _resolve_injection_module(self, site: str):
         if site == "mid":
@@ -168,9 +200,41 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             )
         return condition_mask.to(device=front_feat.device, dtype=front_feat.dtype).view(-1, 1, 1, 1)
 
+    @staticmethod
+    def _token_condition_mask(condition_mask: torch.Tensor, token_states: torch.Tensor) -> torch.Tensor:
+        if condition_mask.ndim != 1 or condition_mask.shape[0] != token_states.shape[0]:
+            raise ValueError(
+                f"condition_mask must be [B], got {list(condition_mask.shape)} for batch {token_states.shape[0]}"
+            )
+        return condition_mask.to(device=token_states.device, dtype=token_states.dtype).view(-1, 1, 1)
+
+    def _make_sat_cross_attn_hook(self, layer_key: str):
+        def hook(module, inputs, output):
+            if not self._conditioning_context:
+                return output
+            if not inputs or not torch.is_tensor(inputs[0]) or not torch.is_tensor(output):
+                return output
+
+            sat_tokens = self._conditioning_context.get("sat_tokens")
+            condition_mask = self._conditioning_context.get("condition_mask")
+            if sat_tokens is None:
+                return output
+
+            sat_output = self.sat_cross_attn_layers[layer_key](
+                module,
+                hidden_states=inputs[0],
+                sat_tokens=sat_tokens,
+            )
+            if condition_mask is not None:
+                sat_output = sat_output * self._token_condition_mask(condition_mask, sat_output)
+
+            return output + sat_output
+
+        return hook
+
     def _make_reading_hook(self, site: str):
         def hook(_module, _inputs, output):
-            if not self._reading_context:
+            if not self._conditioning_context:
                 return output
 
             if isinstance(output, tuple):
@@ -186,10 +250,10 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             else:
                 return output
 
-            sat_tokens = self._reading_context.get("sat_tokens")
-            sat_xy = self._reading_context.get("sat_xy")
-            raw_front_bev_xy = self._reading_context.get("front_bev_xy")
-            condition_mask = self._reading_context.get("condition_mask")
+            sat_tokens = self._conditioning_context.get("sat_tokens")
+            sat_xy = self._conditioning_context.get("sat_xy")
+            raw_front_bev_xy = self._conditioning_context.get("front_bev_xy")
+            condition_mask = self._conditioning_context.get("condition_mask")
             if sat_tokens is None or sat_xy is None or raw_front_bev_xy is None:
                 return output
 
@@ -210,17 +274,17 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 sat_tokens=sat_tokens.to(device=front_feat.device, dtype=front_feat.dtype),
                 sat_xy=sat_xy.to(device=front_feat.device, dtype=front_feat.dtype),
                 front_bev_xy=front_bev_xy,
-                return_attn_map=self._reading_context.get("return_attn_map", False),
+                return_attn_map=self._conditioning_context.get("return_attn_map", False),
             )
 
             updated = block_output["front_feat_out"]
             if condition_mask is not None:
                 feature_mask = self._feature_condition_mask(condition_mask, front_feat)
                 updated = feature_mask * updated + (1.0 - feature_mask) * front_feat
-            if self._reading_context.get("return_attn_map", False):
+            if self._conditioning_context.get("return_attn_map", False):
                 attn_map = block_output.get("attn_map")
                 if attn_map is not None:
-                    self._reading_context.setdefault("attn_maps", {})[site] = attn_map.detach()
+                    self._conditioning_context.setdefault("attn_maps", {})[site] = attn_map.detach()
 
             if is_tuple:
                 return (updated, *output_tail)
@@ -271,16 +335,19 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 )
             inferred_condition_mask = inferred_condition_mask.to(device=sample.device, dtype=torch.bool)
 
-        enable_reading = (
-            self.use_satellite_reading
-            and inferred_sat_tokens is not None
-            and inferred_sat_xy is not None
-            and front_bev_xy is not None
+        enable_sat_condition = (
+            inferred_sat_tokens is not None
             and (inferred_condition_mask is None or bool(inferred_condition_mask.any().item()))
         )
+        enable_reading = (
+            self.use_satellite_reading
+            and enable_sat_condition
+            and inferred_sat_xy is not None
+            and front_bev_xy is not None
+        )
 
-        if enable_reading:
-            self._reading_context = {
+        if enable_sat_condition:
+            self._conditioning_context = {
                 "sat_tokens": inferred_sat_tokens,
                 "sat_xy": inferred_sat_xy,
                 "front_bev_xy": front_bev_xy,
@@ -289,7 +356,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 "attn_maps": {},
             }
         else:
-            self._reading_context = {}
+            self._conditioning_context = {}
 
         self.last_attn_maps = {}
 
@@ -301,10 +368,10 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 **kwargs,
             )
             if enable_reading:
-                self.last_attn_maps = self._reading_context.get("attn_maps", {})
+                self.last_attn_maps = self._conditioning_context.get("attn_maps", {})
             return output
         finally:
-            self._reading_context = {}
+            self._conditioning_context = {}
 
 
 class SatelliteConditionedSDPipeline(StableDiffusionPipeline):

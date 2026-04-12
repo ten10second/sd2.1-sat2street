@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from transformers import get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, CLIPTextModel, get_cosine_schedule_with_warmup
 from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel,
@@ -82,7 +82,11 @@ def _materialize_lazy_modules(
     else:
         sat_tokens = sat_encoded
         sat_xy = None
-    encoder_hidden_states = model.adapt_condition_tokens(sat_tokens)
+    encoder_hidden_states = model.get_text_conditioning(
+        batch_size=sat_tokens.shape[0],
+        device=sat_tokens.device,
+        dtype=sat_tokens.dtype,
+    )
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -121,6 +125,9 @@ class SatelliteConditionedSDModel(nn.Module):
         vae: AutoencoderKL,
         noise_scheduler: DDPMScheduler,
         satellite_encoder: Optional[SatelliteConditionEncoder] = None,
+        cond_prompt_embeds: Optional[torch.Tensor] = None,
+        uncond_prompt_embeds: Optional[torch.Tensor] = None,
+        text_anchor_prompt: str = "",
         freeze_base: bool = True,
         cond_drop_prob: float = 0.1,
     ):
@@ -130,8 +137,13 @@ class SatelliteConditionedSDModel(nn.Module):
         self.vae = vae
         self.noise_scheduler = noise_scheduler
         self.cond_drop_prob = float(cond_drop_prob)
+        self.text_anchor_prompt = text_anchor_prompt
         if not 0.0 <= self.cond_drop_prob <= 1.0:
             raise ValueError(f"cond_drop_prob must be in [0, 1], got {self.cond_drop_prob}")
+        if cond_prompt_embeds is None or uncond_prompt_embeds is None:
+            raise ValueError("cond_prompt_embeds and uncond_prompt_embeds must be provided")
+        self.register_buffer("cond_prompt_embeds", cond_prompt_embeds.detach().cpu(), persistent=False)
+        self.register_buffer("uncond_prompt_embeds", uncond_prompt_embeds.detach().cpu(), persistent=False)
 
         # Satellite encoder
         if satellite_encoder is None:
@@ -155,22 +167,6 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             self.satellite_encoder = satellite_encoder
 
-        sat_token_dim = int(getattr(self.satellite_encoder, "embed_dim", unet.config.cross_attention_dim or 768))
-        cross_attention_dim = int(unet.config.cross_attention_dim or sat_token_dim)
-        adapter_hidden_dim = max(sat_token_dim, cross_attention_dim)
-        self.sat_to_text_input_norm = nn.LayerNorm(sat_token_dim)
-        self.sat_to_text_in_proj = nn.Linear(sat_token_dim, adapter_hidden_dim)
-        self.sat_to_text_act = nn.SiLU()
-        self.sat_to_text_out_proj = nn.Linear(adapter_hidden_dim, cross_attention_dim)
-        self.sat_to_text_residual = (
-            nn.Identity()
-            if sat_token_dim == cross_attention_dim
-            else nn.Linear(sat_token_dim, cross_attention_dim, bias=False)
-        )
-        self.sat_to_text_output_norm = nn.LayerNorm(cross_attention_dim)
-        nn.init.zeros_(self.sat_to_text_out_proj.weight)
-        nn.init.zeros_(self.sat_to_text_out_proj.bias)
-
         # Freeze base layers
         if freeze_base:
             # Freeze VAE
@@ -180,7 +176,12 @@ class SatelliteConditionedSDModel(nn.Module):
             # Freeze most of UNet
             for name, param in self.unet.named_parameters():
                 # Only train mid and up blocks
-                if 'mid_block' in name or 'up_blocks' in name or 'down_blocks.2' in name:
+                if (
+                    'mid_block' in name or
+                    'up_blocks' in name or
+                    'down_blocks.2' in name or
+                    name.startswith('sat_cross_attn_layers')
+                ):
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -188,41 +189,48 @@ class SatelliteConditionedSDModel(nn.Module):
         # Satellite encoder is always trainable
         for param in self.satellite_encoder.parameters():
             param.requires_grad = True
-        for param in (
-            *self.sat_to_text_input_norm.parameters(),
-            *self.sat_to_text_in_proj.parameters(),
-            *self.sat_to_text_out_proj.parameters(),
-            *self.sat_to_text_residual.parameters(),
-            *self.sat_to_text_output_norm.parameters(),
-        ):
-            param.requires_grad = True
 
         logger.info(f"[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
         logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
         logger.info(
-            f"  Satellite-to-text adapter params: "
-            f"{sum(p.numel() for p in self.sat_to_text_parameters() if p.requires_grad)}"
+            f"  Decoupled sat cross-attn params: "
+            f"{sum(p.numel() for p in self.unet.sat_cross_attn_layers.parameters() if p.requires_grad)}"
         )
+        logger.info(f"  Text anchor prompt: {self.text_anchor_prompt!r}")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
     def encode_satellite(self, sat_images: torch.Tensor, coords_map: torch.Tensor = None) -> torch.Tensor:
         """Encode satellite images to embeddings."""
         return self.satellite_encoder(sat_images, coords_map, return_sat_xy=True)
 
-    def sat_to_text_parameters(self):
-        yield from self.sat_to_text_input_norm.parameters()
-        yield from self.sat_to_text_in_proj.parameters()
-        yield from self.sat_to_text_out_proj.parameters()
-        yield from self.sat_to_text_residual.parameters()
-        yield from self.sat_to_text_output_norm.parameters()
+    def _expand_prompt_embeds(
+        self,
+        prompt_embeds: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return prompt_embeds.to(device=device, dtype=dtype).expand(batch_size, -1, -1)
 
-    def adapt_condition_tokens(self, sat_tokens: torch.Tensor) -> torch.Tensor:
-        residual = self.sat_to_text_residual(sat_tokens)
-        delta = self.sat_to_text_in_proj(self.sat_to_text_input_norm(sat_tokens))
-        delta = self.sat_to_text_act(delta)
-        delta = self.sat_to_text_out_proj(delta)
-        return self.sat_to_text_output_norm(residual + delta)
+    def get_text_conditioning(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        condition_mask: Optional[torch.Tensor] = None,
+        unconditional: bool = False,
+    ) -> torch.Tensor:
+        if unconditional:
+            return self._expand_prompt_embeds(self.uncond_prompt_embeds, batch_size, device, dtype)
+
+        cond_embeds = self._expand_prompt_embeds(self.cond_prompt_embeds, batch_size, device, dtype)
+        if condition_mask is None:
+            return cond_embeds
+
+        uncond_embeds = self._expand_prompt_embeds(self.uncond_prompt_embeds, batch_size, device, dtype)
+        mask = condition_mask.to(device=device, dtype=torch.bool).view(batch_size, 1, 1)
+        return torch.where(mask, cond_embeds, uncond_embeds)
 
     @staticmethod
     def _normalize_images_for_vae(images: torch.Tensor) -> torch.Tensor:
@@ -284,16 +292,18 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             sat_tokens = sat_encoded
             sat_xy = None
-        encoder_hidden_states = self.adapt_condition_tokens(sat_tokens)
         condition_mask = torch.ones(B, device=device, dtype=torch.bool)
         if self.training and self.cond_drop_prob > 0.0:
             condition_mask = torch.rand(B, device=device) >= self.cond_drop_prob
             sat_tokens = sat_tokens * self._expand_condition_mask(condition_mask, sat_tokens)
-            encoder_hidden_states = encoder_hidden_states * self._expand_condition_mask(
-                condition_mask, encoder_hidden_states
-            )
             if sat_xy is not None:
                 sat_xy = sat_xy * self._expand_condition_mask(condition_mask, sat_xy)
+        encoder_hidden_states = self.get_text_conditioning(
+            batch_size=B,
+            device=device,
+            dtype=sat_tokens.dtype,
+            condition_mask=condition_mask,
+        )
 
         # Encode target images to latents
         with torch.no_grad():
@@ -313,7 +323,7 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Predict noise
         unet_kwargs = self._build_unet_kwargs(
-            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states=sat_tokens,
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
             coords_map=coords_map,
@@ -415,7 +425,11 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             sat_tokens = sat_encoded
             sat_xy = None
-        encoder_hidden_states = self.adapt_condition_tokens(sat_tokens)
+        encoder_hidden_states = self.get_text_conditioning(
+            batch_size=B,
+            device=device,
+            dtype=sat_tokens.dtype,
+        )
         condition_mask = torch.ones(B, device=device, dtype=torch.bool)
 
         image_h, image_w = self._infer_generation_size(coords_map=coords_map, target_size=target_size)
@@ -427,16 +441,21 @@ class SatelliteConditionedSDModel(nn.Module):
         latents = torch.randn(
             (B, self.unet.config.in_channels, latent_h, latent_w),
             device=device,
-            dtype=encoder_hidden_states.dtype,
+            dtype=sat_tokens.dtype,
             generator=generator,
         )
 
         # Prepare CFG branches once and reuse them for every timestep.
         use_cfg = guidance_scale > 1.0
         if use_cfg:
-            uncond_encoder_hidden_states = torch.zeros_like(encoder_hidden_states)
             uncond_tokens = torch.zeros_like(sat_tokens)
             uncond_sat_xy = torch.zeros_like(sat_xy) if sat_xy is not None else None
+            uncond_encoder_hidden_states = self.get_text_conditioning(
+                batch_size=B,
+                device=device,
+                dtype=sat_tokens.dtype,
+                unconditional=True,
+            )
             encoder_hidden_states_double = torch.cat([encoder_hidden_states, uncond_encoder_hidden_states], dim=0)
             sat_tokens_double = torch.cat([sat_tokens, uncond_tokens], dim=0)
             sat_xy_double = torch.cat([sat_xy, uncond_sat_xy], dim=0) if sat_xy is not None else None
@@ -526,6 +545,7 @@ def create_sd_model(
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
+    text_anchor_prompt: str = "",
 ) -> SatelliteConditionedSDModel:
     """
     Create a satellite-conditioned Stable Diffusion model.
@@ -591,10 +611,51 @@ def create_sd_model(
         **scheduler_load_kwargs,
     )
 
+    text_load_kwargs: Dict[str, Any] = {}
+    if revision is not None and resolved_base_model is None:
+        text_load_kwargs["revision"] = revision
+    if resolved_base_model is not None:
+        text_load_kwargs["local_files_only"] = True
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        load_source,
+        subfolder="tokenizer",
+        use_fast=False,
+        **text_load_kwargs,
+    )
+    text_encoder = CLIPTextModel.from_pretrained(
+        load_source,
+        subfolder="text_encoder",
+        **text_load_kwargs,
+    )
+    text_encoder.eval()
+
+    def encode_prompt(prompt: str) -> torch.Tensor:
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            prompt_embeds = text_encoder(
+                input_ids=text_inputs.input_ids,
+                attention_mask=text_inputs.attention_mask,
+            ).last_hidden_state
+        return prompt_embeds.to(dtype=torch.float32)
+
+    cond_prompt_embeds = encode_prompt(text_anchor_prompt)
+    uncond_prompt_embeds = encode_prompt("")
+    del text_encoder
+
     model = SatelliteConditionedSDModel(
         unet=unet,
         vae=vae,
         noise_scheduler=noise_scheduler,
+        cond_prompt_embeds=cond_prompt_embeds,
+        uncond_prompt_embeds=uncond_prompt_embeds,
+        text_anchor_prompt=text_anchor_prompt,
         freeze_base=freeze_base,
         cond_drop_prob=cond_drop_prob,
     )
