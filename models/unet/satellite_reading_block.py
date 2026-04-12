@@ -36,6 +36,7 @@ class SatelliteReadingBlock(nn.Module):
 
         self.read_attn = SatelliteReadingAttention(
             sat_in_dim=sat_in_dim,
+            front_in_dim=front_dim,
             num_heads=num_heads,
             head_dim=head_dim,
             geo_ratio=geo_ratio,
@@ -71,6 +72,7 @@ class SatelliteReadingBlock(nn.Module):
             )
 
         read_tokens, attn_map = self.read_attn(
+            front_feat=front_feat,
             front_bev_xy=front_bev_xy,
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
@@ -84,4 +86,3 @@ class SatelliteReadingBlock(nn.Module):
             "attn_map": attn_map,
             "gate": gate,
         }
-

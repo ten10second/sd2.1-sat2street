@@ -309,6 +309,7 @@ def _materialize_lazy_modules(
     else:
         sat_tokens = sat_encoded
         sat_xy = None
+    encoder_hidden_states = model.adapt_condition_tokens(sat_tokens)
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -323,7 +324,7 @@ def _materialize_lazy_modules(
     model.unet(
         latents,
         timestep,
-        encoder_hidden_states=sat_tokens,
+        encoder_hidden_states=encoder_hidden_states,
         sat_tokens=sat_tokens,
         sat_xy=sat_xy,
         front_bev_xy=coords_map,
@@ -347,8 +348,10 @@ def _load_checkpoint(model, checkpoint_path: Path, device: str) -> Dict:
 def main() -> None:
     args = _parse_args()
 
-    os.environ.setdefault("HF_ENDPOINT", args.hf_endpoint)
-    os.environ.setdefault("HF_HOME", args.hf_home)
+    os.environ["HF_ENDPOINT"] = args.hf_endpoint
+    os.environ["HF_HOME"] = args.hf_home
+    logger.info(f"HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
+    logger.info(f"HF_HOME={os.environ['HF_HOME']}")
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         logger.warning("CUDA requested but not available, falling back to CPU")
