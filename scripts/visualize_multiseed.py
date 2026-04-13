@@ -319,11 +319,6 @@ def _materialize_lazy_modules(
     else:
         sat_tokens = sat_encoded
         sat_xy = None
-    encoder_hidden_states = model.get_text_conditioning(
-        batch_size=sat_tokens.shape[0],
-        device=sat_tokens.device,
-        dtype=sat_tokens.dtype,
-    )
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -338,7 +333,7 @@ def _materialize_lazy_modules(
     model.unet(
         latents,
         timestep,
-        encoder_hidden_states=encoder_hidden_states,
+        encoder_hidden_states=None,
         sat_tokens=sat_tokens,
         sat_xy=sat_xy,
         front_bev_xy=coords_map,

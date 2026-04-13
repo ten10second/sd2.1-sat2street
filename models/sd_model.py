@@ -20,8 +20,6 @@ try:
 except ImportError:
     from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
 
-from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
-from models.unet.decoupled_sat_cross_attn import DecoupledSatCrossAttn
 from models.unet.satellite_reading_block import SatelliteReadingBlock
 
 
@@ -63,13 +61,12 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             self.reading_block_config.update(reading_block_config)
 
         self.reading_blocks = nn.ModuleDict()
-        self.sat_cross_attn_layers = nn.ModuleDict()
         self._conditioning_context: Dict[str, Any] = {}
         self._reading_hook_handles = []
-        self._sat_cross_attn_hook_handles = []
+        self._attn2_sat_hook_handles = []
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
 
-        self._register_sat_cross_attn_hooks(sat_in_dim=sat_in_dim)
+        self._register_attn2_sat_hooks(sat_in_dim=sat_in_dim)
         if self.use_satellite_reading:
             self._register_reading_hooks()
 
@@ -81,32 +78,21 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             handle = module.register_forward_hook(self._make_reading_hook(site))
             self._reading_hook_handles.append(handle)
 
-    def _register_sat_cross_attn_hooks(self, sat_in_dim: int):
+    def _register_attn2_sat_hooks(self, sat_in_dim: int):
         for name, module in list(self.named_modules()):
-            if not name.endswith("attn2") or not hasattr(module, "to_q"):
+            if not name.endswith("attn2"):
                 continue
-            if not self._is_sat_cross_attn_target(name):
-                continue
-
-            layer_key = name.replace(".", "__")
-            self.sat_cross_attn_layers[layer_key] = DecoupledSatCrossAttn(
-                sat_in_dim=sat_in_dim,
-                inner_dim=int(module.inner_dim),
-                out_dim=int(module.out_dim),
+            cross_attention_dim = getattr(module, "cross_attention_dim", None)
+            if cross_attention_dim is None or int(cross_attention_dim) != sat_in_dim:
+                raise ValueError(
+                    f"attn2 module {name} has cross_attention_dim={cross_attention_dim}, "
+                    f"expected {sat_in_dim} to match satellite token dim"
+                )
+            handle = module.register_forward_pre_hook(
+                self._make_attn2_sat_hook(name),
+                with_kwargs=True,
             )
-            handle = module.register_forward_hook(self._make_sat_cross_attn_hook(layer_key))
-            self._sat_cross_attn_hook_handles.append(handle)
-
-    @staticmethod
-    def _is_sat_cross_attn_target(module_name: str) -> bool:
-        prefixes = (
-            "down_blocks.1.",
-            "down_blocks.2.",
-            "mid_block.",
-            "up_blocks.1.",
-            "up_blocks.2.",
-        )
-        return any(module_name.startswith(prefix) for prefix in prefixes)
+            self._attn2_sat_hook_handles.append(handle)
 
     def _resolve_injection_module(self, site: str):
         if site == "mid":
@@ -212,27 +198,32 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             )
         return condition_mask.to(device=token_states.device, dtype=token_states.dtype).view(-1, 1, 1)
 
-    def _make_sat_cross_attn_hook(self, layer_key: str):
-        def hook(module, inputs, output):
+    def _make_attn2_sat_hook(self, module_name: str):
+        def hook(module, args, kwargs):
             if not self._conditioning_context:
-                return output
-            if not inputs or not torch.is_tensor(inputs[0]) or not torch.is_tensor(output):
-                return output
+                return args, kwargs
 
             sat_tokens = self._conditioning_context.get("sat_tokens")
             condition_mask = self._conditioning_context.get("condition_mask")
             if sat_tokens is None:
-                return output
+                return args, kwargs
 
-            sat_output = self.sat_cross_attn_layers[layer_key](
-                module,
-                hidden_states=inputs[0],
-                sat_tokens=sat_tokens,
-            )
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None and args:
+                hidden_states = args[0]
+            if not torch.is_tensor(hidden_states):
+                return args, kwargs
+
+            sat_encoder_hidden_states = sat_tokens.to(device=hidden_states.device, dtype=hidden_states.dtype)
             if condition_mask is not None:
-                sat_output = sat_output * self._token_condition_mask(condition_mask, sat_output)
+                sat_encoder_hidden_states = (
+                    sat_encoder_hidden_states
+                    * self._token_condition_mask(condition_mask, sat_encoder_hidden_states)
+                )
 
-            return output + sat_output
+            kwargs = dict(kwargs)
+            kwargs["encoder_hidden_states"] = sat_encoder_hidden_states
+            return args, kwargs
 
         return hook
 
@@ -314,7 +305,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         Args:
             sample: (B, 4, H, W) - Noisy latent representation
             timestep: (B,) or (1,) - Current timestep
-            encoder_hidden_states: (B, N, D) - Text encoder hidden states
+            encoder_hidden_states: Optional legacy argument, ignored by attn2 hooks
             sat_tokens: (B, Ns, Cs) - Pre-encoded satellite tokens
             sat_xy: (B, Ns, 2) - Satellite token BEV coordinates
             front_bev_xy: (B, Nf, 2) - Frontview pixel BEV coordinates
