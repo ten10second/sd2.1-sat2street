@@ -38,7 +38,7 @@ class SatelliteConditionEncoder(nn.Module):
         self,
         embed_dim: int = 768,
         patch_size: int = 16,
-        num_layers: int = 12,
+        num_layers: int = 4,
         num_heads: int = 12,
         use_relative_pos: bool = True,
         sat_resolution: float = 0.2,

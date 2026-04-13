@@ -173,15 +173,10 @@ class SatelliteConditionedSDModel(nn.Module):
             for param in self.vae.parameters():
                 param.requires_grad = False
 
-            # Freeze most of UNet
+            # Freeze the pretrained UNet backbone. Satellite-specific modules are
+            # trained separately to preserve the SD prior and avoid scene drift.
             for name, param in self.unet.named_parameters():
-                # Only train mid and up blocks
-                if (
-                    'mid_block' in name or
-                    'up_blocks' in name or
-                    'down_blocks.2' in name or
-                    name.startswith('sat_cross_attn_layers')
-                ):
+                if name.startswith('sat_cross_attn_layers'):
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -688,6 +683,7 @@ class SDTrainer:
         use_wandb: bool = False,
         project_name: str = 'kitti360_sd',
         mixed_precision: Optional[str] = None,
+        max_grad_norm: float = 1.0,
         visualize_every: int = 1,
         num_visualizations: int = 4,
         visualization_inference_steps: int = 20,
@@ -709,6 +705,7 @@ class SDTrainer:
         self.device = device
         self.use_wandb = use_wandb
         self.project_name = project_name
+        self.max_grad_norm = float(max_grad_norm)
         self.visualize_every = max(0, int(visualize_every))
         self.num_visualizations = max(0, int(num_visualizations))
         self.visualization_inference_steps = int(visualization_inference_steps)
@@ -769,6 +766,7 @@ class SDTrainer:
         logger.info(f"  Num epochs: {num_train_epochs}")
         logger.info(f"  Batch size: {train_dataloader.batch_size}")
         logger.info(f"  Mixed precision: {self.mixed_precision or 'disabled'}")
+        logger.info(f"  Max grad norm: {self.max_grad_norm}")
         if self.visualize_every > 0 and self.num_visualizations > 0:
             logger.info(
                 f"  Visualization: every {self.visualize_every} epoch(s), "
@@ -913,9 +911,20 @@ class SDTrainer:
 
             if (step + 1) == accumulation_end:
                 if self.use_amp and self.amp_dtype == torch.float16:
+                    if self.max_grad_norm > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in self.model.parameters() if p.requires_grad],
+                            self.max_grad_norm,
+                        )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
+                    if self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in self.model.parameters() if p.requires_grad],
+                            self.max_grad_norm,
+                        )
                     self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)

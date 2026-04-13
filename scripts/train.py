@@ -172,6 +172,10 @@ def main():
         help="Number of gradient accumulation steps",
     )
     parser.add_argument(
+        "--max_grad_norm", type=float, default=1.0,
+        help="Gradient clipping threshold. Set <=0 to disable.",
+    )
+    parser.add_argument(
         "--base_model", type=str, default=DEFAULT_SD21_BASE_REPO,
         help="Base diffusers model repo id or local path",
     )
@@ -341,6 +345,7 @@ def main():
         use_wandb=False,
         project_name="kitti360_sd",
         mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
+        max_grad_norm=args.max_grad_norm,
         visualize_every=args.visualize_every,
         num_visualizations=args.num_visualizations,
         visualization_inference_steps=args.visualization_inference_steps,

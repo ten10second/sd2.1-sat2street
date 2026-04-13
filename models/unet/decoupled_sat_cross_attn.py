@@ -25,7 +25,10 @@ class DecoupledSatCrossAttn(nn.Module):
         self.to_k_sat = nn.Linear(sat_in_dim, inner_dim, bias=False)
         self.to_v_sat = nn.Linear(sat_in_dim, inner_dim, bias=False)
         self.to_out_sat = nn.Identity() if inner_dim == out_dim else nn.Linear(inner_dim, out_dim, bias=False)
-        self.alpha = nn.Parameter(torch.tensor(1e-3))
+        nn.init.zeros_(self.to_v_sat.weight)
+        if isinstance(self.to_out_sat, nn.Linear):
+            nn.init.zeros_(self.to_out_sat.weight)
+        self.alpha = nn.Parameter(torch.tensor(1.0))
 
     def forward(
         self,
