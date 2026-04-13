@@ -37,7 +37,7 @@ class GatedResidualInject(nn.Module):
         )
 
         nn.init.zeros_(self.gate_mlp[-1].weight)
-        nn.init.constant_(self.gate_mlp[-1].bias, -2.0)
+        nn.init.constant_(self.gate_mlp[-1].bias, -1.0)
 
     def _tokens_to_feat(self, read_tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
         batch_size, token_count, _ = read_tokens.shape
@@ -72,4 +72,3 @@ class GatedResidualInject(nn.Module):
             out = front_feat + read_feat
 
         return out, read_feat, gate
-

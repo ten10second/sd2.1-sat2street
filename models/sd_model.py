@@ -47,7 +47,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         self.supports_satellite_reading = True
         self.use_satellite_reading = use_satellite_reading
-        self.reading_injection_sites = reading_injection_sites or ["mid"]
+        self.reading_injection_sites = reading_injection_sites or ["down2", "mid"]
         sat_in_dim = int(self.config.cross_attention_dim or 768)
         self.reading_block_config = {
             "num_heads": 8,
@@ -111,6 +111,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
     def _resolve_injection_module(self, site: str):
         if site == "mid":
             return self.mid_block
+        if site.startswith("down"):
+            try:
+                index = int(site[4:])
+            except ValueError:
+                return None
+            if 0 <= index < len(self.down_blocks):
+                return self.down_blocks[index]
         if site.startswith("up"):
             try:
                 index = int(site[2:])
