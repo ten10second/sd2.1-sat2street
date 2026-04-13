@@ -332,10 +332,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 )
             inferred_condition_mask = inferred_condition_mask.to(device=sample.device, dtype=torch.bool)
 
-        enable_sat_condition = (
-            inferred_sat_tokens is not None
-            and (inferred_condition_mask is None or bool(inferred_condition_mask.any().item()))
-        )
+        enable_sat_condition = inferred_sat_tokens is not None
         enable_reading = (
             self.use_satellite_reading
             and enable_sat_condition

@@ -290,6 +290,9 @@ class SatelliteConditionedSDModel(nn.Module):
         condition_mask = torch.ones(B, device=device, dtype=torch.bool)
         if self.training and self.cond_drop_prob > 0.0:
             condition_mask = torch.rand(B, device=device) >= self.cond_drop_prob
+            if not bool(condition_mask.any().item()):
+                keep_index = torch.randint(0, B, (1,), device=device)
+                condition_mask[keep_index] = True
             sat_tokens = sat_tokens * self._expand_condition_mask(condition_mask, sat_tokens)
             if sat_xy is not None:
                 sat_xy = sat_xy * self._expand_condition_mask(condition_mask, sat_xy)
