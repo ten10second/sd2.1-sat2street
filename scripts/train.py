@@ -193,10 +193,6 @@ def main():
         help="Probability of dropping satellite conditioning during training.",
     )
     parser.add_argument(
-        "--text_anchor_prompt", type=str, default="",
-        help="Fixed text prompt used for the main UNet cross-attention branch.",
-    )
-    parser.add_argument(
         "--guidance_scale", type=float, default=3.0,
         help="Guidance scale used for training visualizations. 1.0 disables CFG.",
     )
@@ -310,7 +306,6 @@ def main():
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
-        text_anchor_prompt=args.text_anchor_prompt,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":
         logger.info(

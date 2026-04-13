@@ -117,7 +117,6 @@ class SatelliteConditionedSDModel(nn.Module):
         vae: AutoencoderKL,
         noise_scheduler: DDPMScheduler,
         satellite_encoder: Optional[SatelliteConditionEncoder] = None,
-        text_anchor_prompt: str = "",
         freeze_base: bool = True,
         cond_drop_prob: float = 0.1,
     ):
@@ -127,7 +126,6 @@ class SatelliteConditionedSDModel(nn.Module):
         self.vae = vae
         self.noise_scheduler = noise_scheduler
         self.cond_drop_prob = float(cond_drop_prob)
-        self.text_anchor_prompt = text_anchor_prompt
         if not 0.0 <= self.cond_drop_prob <= 1.0:
             raise ValueError(f"cond_drop_prob must be in [0, 1], got {self.cond_drop_prob}")
 
@@ -498,7 +496,6 @@ def create_sd_model(
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
-    text_anchor_prompt: str = "",
 ) -> SatelliteConditionedSDModel:
     """
     Create a satellite-conditioned Stable Diffusion model.
@@ -568,7 +565,6 @@ def create_sd_model(
         unet=unet,
         vae=vae,
         noise_scheduler=noise_scheduler,
-        text_anchor_prompt=text_anchor_prompt,
         freeze_base=freeze_base,
         cond_drop_prob=cond_drop_prob,
     )
