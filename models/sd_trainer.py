@@ -399,6 +399,7 @@ class SatelliteConditionedSDModel(nn.Module):
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
         generator: Optional[torch.Generator] = None,
+        sat_condition_mode: str = "normal",
     ) -> torch.Tensor:
         """
         Generate frontview images from satellite images.
@@ -409,6 +410,8 @@ class SatelliteConditionedSDModel(nn.Module):
             target_size: Optional target image size as (H, W)
             num_inference_steps: Number of denoising steps
             guidance_scale: Guidance scale for classifier-free guidance
+            sat_condition_mode: "normal" uses encoded satellite conditioning,
+                "zero" disables satellite conditioning by zeroing tokens and masks.
 
         Returns:
             generated_images: (B, 3, H, W) - Generated images
@@ -423,12 +426,21 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             sat_tokens = sat_encoded
             sat_xy = None
+
+        if sat_condition_mode == "normal":
+            condition_mask = torch.ones(B, device=device, dtype=torch.bool)
+        elif sat_condition_mode == "zero":
+            sat_tokens = torch.zeros_like(sat_tokens)
+            sat_xy = torch.zeros_like(sat_xy) if sat_xy is not None else None
+            condition_mask = torch.zeros(B, device=device, dtype=torch.bool)
+        else:
+            raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
+
         encoder_hidden_states = self.get_text_conditioning(
             batch_size=B,
             device=device,
             dtype=sat_tokens.dtype,
         )
-        condition_mask = torch.ones(B, device=device, dtype=torch.bool)
 
         image_h, image_w = self._infer_generation_size(coords_map=coords_map, target_size=target_size)
         vae_scale_factor = self._get_vae_scale_factor()

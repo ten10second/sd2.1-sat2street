@@ -170,6 +170,11 @@ def _parse_args() -> argparse.Namespace:
         help="Precision mode used to load the model",
     )
     parser.add_argument(
+        "--sat_condition_mode", type=str, default="normal",
+        choices=["normal", "zero"],
+        help="Satellite conditioning mode. 'zero' disables satellite conditioning for ablation.",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Dataset construction seed",
     )
@@ -394,6 +399,7 @@ def main() -> None:
         reading_block_config={"enable": True},
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
+        cond_drop_prob=0.0,
         text_anchor_prompt=args.text_anchor_prompt,
     )
     if hasattr(model.unet, "set_attention_slice"):
@@ -410,7 +416,11 @@ def main() -> None:
     model.eval()
 
     output_root = Path(args.output_dir)
-    sample_dir = output_root / f"{drive_name}_frame_{frame_id:010d}_idx_{sample_index:05d}"
+    sample_dir = (
+        output_root
+        / f"{drive_name}_frame_{frame_id:010d}_idx_{sample_index:05d}"
+        / f"sat_condition_{args.sat_condition_mode}"
+    )
     sample_dir.mkdir(parents=True, exist_ok=True)
 
     sat_resized = _resize_satellite_for_front(sat_image[0], target_size[0])
@@ -427,7 +437,9 @@ def main() -> None:
         generated_panels: List[Tuple[str, torch.Tensor]] = []
 
         for seed in args.seeds:
-            logger.info(f"Generating cfg={guidance_scale_text}, seed={seed}")
+            logger.info(
+                f"Generating sat_condition={args.sat_condition_mode}, cfg={guidance_scale_text}, seed={seed}"
+            )
             generator = torch.Generator(device=generator_device)
             generator.manual_seed(seed)
 
@@ -438,6 +450,7 @@ def main() -> None:
                 num_inference_steps=args.inference_steps,
                 guidance_scale=guidance_scale,
                 generator=generator,
+                sat_condition_mode=args.sat_condition_mode,
             )[0].cpu()
 
             if single_cfg:
@@ -486,6 +499,7 @@ def main() -> None:
         "inference_steps": args.inference_steps,
         "guidance_scales": list(args.guidance_scales),
         "seeds": list(args.seeds),
+        "sat_condition_mode": args.sat_condition_mode,
     }
     with open(sample_dir / "metadata.yaml", "w") as f:
         yaml.safe_dump(metadata, f, sort_keys=False)
