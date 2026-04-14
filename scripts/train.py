@@ -23,7 +23,7 @@ import yaml
 from pathlib import Path
 from typing import List, Tuple
 
-from models.sd_trainer import create_sd_model, SDTrainer
+from models.sd_trainer import create_sd_model, load_model_checkpoint, SDTrainer
 from data.kitti360d_dataset import Kitti360dDataset
 from torch.utils.data import DataLoader, default_collate
 
@@ -193,6 +193,32 @@ def main():
         help="Probability of dropping satellite conditioning during training.",
     )
     parser.add_argument(
+        "--enable_plucker_guider", action="store_true",
+        help="Enable the lightweight PluckerGuider residual branch.",
+    )
+    parser.add_argument(
+        "--init_checkpoint", type=str, default=None,
+        help="Optional checkpoint used to initialize model weights before training.",
+    )
+    parser.add_argument(
+        "--dataset_mode", type=str, default="front",
+        choices=["front", "fisheye_virtual", "virtual"],
+        help="Dataset view mode used for training/validation.",
+    )
+    parser.add_argument(
+        "--yaw_mode", type=str, default="fisheye_relative",
+        choices=["fisheye_relative", "vehicle_relative"],
+        help="Yaw semantics for virtual fisheye views.",
+    )
+    parser.add_argument(
+        "--vehicle_yaw_min_deg", type=float, default=60.0,
+        help="Minimum vehicle-relative yaw sampled for the PluckerGuider experiment.",
+    )
+    parser.add_argument(
+        "--vehicle_yaw_max_deg", type=float, default=120.0,
+        help="Maximum vehicle-relative yaw sampled for the PluckerGuider experiment.",
+    )
+    parser.add_argument(
         "--guidance_scale", type=float, default=3.0,
         help="Guidance scale used for training visualizations. 1.0 disables CFG.",
     )
@@ -233,6 +259,21 @@ def main():
         args.device = "cpu"
         args.mixed_precision = "no"
 
+    if args.resume is not None and args.init_checkpoint is not None:
+        raise ValueError("--resume and --init_checkpoint are mutually exclusive")
+
+    if args.enable_plucker_guider:
+        if args.cond_drop_prob != 0.0:
+            logger.info(
+                "PluckerGuider experiment overrides cond_drop_prob to 0.0 to isolate pose residual effects"
+            )
+            args.cond_drop_prob = 0.0
+        if args.guidance_scale != 1.0:
+            logger.info(
+                "PluckerGuider experiment overrides visualization guidance_scale to 1.0"
+            )
+            args.guidance_scale = 1.0
+
     # Set random seed for reproducibility
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -251,28 +292,42 @@ def main():
     logger.info(f"Loaded split file: {split_yaml}")
     logger.info(f"Training on {len(train_dirs)} drives, validating on {len(val_dirs)} drives")
 
-    train_dataset = Kitti360dDataset(
-        drives=train_dirs,
-        frames=train_frames,
-        mode="front",
+    common_dataset_kwargs = dict(
+        mode=args.dataset_mode,
+        yaw_mode=args.yaw_mode,
         virtual_size=(640, 256),
         front_resize=(640, 256),
         front_center_crop=None,
         random_fisheye_relative_yaw=False,
+        random_vehicle_relative_yaw=False,
         seed=args.seed,
         return_bgr=False,
+    )
+    train_dataset_kwargs = dict(common_dataset_kwargs)
+    val_dataset_kwargs = dict(common_dataset_kwargs)
+
+    if args.dataset_mode != "front" and args.yaw_mode == "vehicle_relative":
+        train_dataset_kwargs.update({
+            "random_vehicle_relative_yaw": True,
+            "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
+            "vehicle_yaw_max_deg": args.vehicle_yaw_max_deg,
+        })
+        val_dataset_kwargs.update({
+            "vehicle_relative_yaw_deg": 0.5 * (args.vehicle_yaw_min_deg + args.vehicle_yaw_max_deg),
+            "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
+            "vehicle_yaw_max_deg": args.vehicle_yaw_max_deg,
+        })
+
+    train_dataset = Kitti360dDataset(
+        drives=train_dirs,
+        frames=train_frames,
+        **train_dataset_kwargs,
     )
 
     val_dataset = Kitti360dDataset(
         drives=val_dirs,
         frames=val_frames,
-        mode="front",
-        virtual_size=(640, 256),
-        front_resize=(640, 256),
-        front_center_crop=None,
-        random_fisheye_relative_yaw=False,
-        seed=args.seed,
-        return_bgr=False,
+        **val_dataset_kwargs,
     )
 
     # Create data loaders
@@ -306,7 +361,17 @@ def main():
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
+        enable_plucker_guider=args.enable_plucker_guider,
     )
+    if args.enable_plucker_guider:
+        model.freeze_except_plucker_guider()
+        logger.info(
+            "PluckerGuider experiment: froze UNet/satellite branches and left only guider parameters trainable"
+        )
+        logger.info(
+            f"  Trainable PluckerGuider params: "
+            f"{sum(p.numel() for p in model.parameters() if p.requires_grad)}"
+        )
     if args.device.startswith("cuda") and args.mixed_precision != "no":
         logger.info(
             "Training keeps model weights in fp32; mixed precision is applied via autocast only"
@@ -347,6 +412,16 @@ def main():
         visualization_guidance_scale=args.guidance_scale,
         visualization_seed=args.visualization_seed,
     )
+
+    if args.init_checkpoint is not None:
+        allow_missing = ("plucker_guider.",) if args.enable_plucker_guider else ()
+        logger.info(f"Initializing model weights from checkpoint: {args.init_checkpoint}")
+        load_model_checkpoint(
+            trainer.model,
+            Path(args.init_checkpoint),
+            args.device,
+            allow_missing_prefixes=allow_missing,
+        )
 
     # Start training
     logger.info("Starting training...")

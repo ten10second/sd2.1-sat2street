@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Visualize the same sample with multiple random seeds and/or CFG scales.
+Visualize one fixed sample while sweeping vehicle-relative yaw values.
 """
 
 import sys
@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image, ImageDraw
 
-from data.kitti360d_dataset import Kitti360dDataset
+from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
 from models.sd_trainer import create_sd_model, load_model_checkpoint
 
 
@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
-print(DEFAULT_HF_HOME)
 
 
 def _load_frame_ids(frames_file: Path) -> List[int]:
@@ -102,7 +101,7 @@ def _load_split_from_yaml(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visualize one frame with multiple random seeds and guidance scales"
+        description="Visualize one frame while sweeping vehicle-relative yaw values"
     )
     parser.add_argument(
         "--data_dir", type=str, default="/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
@@ -117,16 +116,12 @@ def _parse_args() -> argparse.Namespace:
         help="Which split to draw the sample from",
     )
     parser.add_argument(
-        "--frame_index", type=int, default=0,
-        help="Index inside the chosen split after flattening all samples",
+        "--drive", type=str, required=True,
+        help="Drive name used together with --frame_id",
     )
     parser.add_argument(
-        "--frame_id", type=int, default=None,
-        help="Optional exact frame id to search for",
-    )
-    parser.add_argument(
-        "--drive", type=str, default=None,
-        help="Optional drive name used together with --frame_id",
+        "--frame_id", type=int, required=True,
+        help="Exact frame id to render",
     )
     parser.add_argument(
         "--checkpoint", type=str, required=True,
@@ -141,20 +136,24 @@ def _parse_args() -> argparse.Namespace:
         help="Optional model revision/branch, e.g. fp16",
     )
     parser.add_argument(
-        "--output_dir", type=str, default="output/multiseed_visualizations",
+        "--output_dir", type=str, default="output/yaw_sweep_visualizations",
         help="Directory to save outputs",
     )
     parser.add_argument(
-        "--seeds", type=int, nargs="+", default=[0, 1, 2, 3],
-        help="Random seeds used to generate the same sample",
-    )
-    parser.add_argument(
-        "--guidance_scales", type=float, nargs="+", default=[7.5],
-        help="Classifier-free guidance scales to compare. Values <= 1 disable CFG.",
+        "--vehicle_yaws", type=float, nargs="+", default=[60.0, 75.0, 90.0, 105.0, 120.0],
+        help="Vehicle-relative yaw values in degrees",
     )
     parser.add_argument(
         "--inference_steps", type=int, default=30,
         help="Number of denoising steps for each visualization",
+    )
+    parser.add_argument(
+        "--guidance_scale", type=float, default=1.0,
+        help="Guidance scale for generation. 1.0 disables CFG.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed reused for every yaw",
     )
     parser.add_argument(
         "--device", type=str, default="cuda",
@@ -164,15 +163,6 @@ def _parse_args() -> argparse.Namespace:
         "--mixed_precision", type=str, default="fp16",
         choices=["no", "fp16", "bf16"],
         help="Precision mode used to load the model",
-    )
-    parser.add_argument(
-        "--sat_condition_mode", type=str, default="normal",
-        choices=["normal", "zero"],
-        help="Satellite conditioning mode. 'zero' disables satellite conditioning for ablation.",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Dataset construction seed",
     )
     parser.add_argument(
         "--hf_endpoint", type=str, default=DEFAULT_HF_ENDPOINT,
@@ -196,7 +186,10 @@ def _build_dataset(args: argparse.Namespace) -> Kitti360dDataset:
     return Kitti360dDataset(
         drives=drives,
         frames=frames,
-        mode="front",
+        mode="fisheye_virtual",
+        yaw_mode="vehicle_relative",
+        vehicle_relative_yaw_deg=90.0,
+        random_vehicle_relative_yaw=False,
         virtual_size=(640, 256),
         front_resize=(640, 256),
         front_center_crop=None,
@@ -208,34 +201,41 @@ def _build_dataset(args: argparse.Namespace) -> Kitti360dDataset:
 
 def _resolve_sample_index(
     dataset: Kitti360dDataset,
-    frame_index: int,
-    frame_id: Optional[int],
-    drive: Optional[str],
+    frame_id: int,
+    drive: str,
 ) -> int:
-    if frame_id is None:
-        if frame_index < 0 or frame_index >= len(dataset):
-            raise IndexError(f"frame_index out of range: {frame_index}, dataset size={len(dataset)}")
-        return frame_index
-
     matches = []
     for idx, sample in enumerate(dataset.samples):
-        if sample.frame_id != frame_id:
-            continue
-        if drive is not None and sample.drive_dir.name != drive:
-            continue
-        matches.append(idx)
+        if sample.frame_id == frame_id and sample.drive_dir.name == drive:
+            matches.append(idx)
 
     if not matches:
-        drive_suffix = f" in drive {drive}" if drive is not None else ""
-        raise ValueError(f"Could not find frame_id={frame_id}{drive_suffix} in the chosen split")
-
-    if len(matches) > 1 and drive is None:
-        drives = sorted({dataset.samples[idx].drive_dir.name for idx in matches})
-        raise ValueError(
-            f"frame_id={frame_id} appears in multiple drives {drives}. Please pass --drive to disambiguate."
-        )
-
+        raise ValueError(f"Could not find frame_id={frame_id} in drive {drive}")
+    if len(matches) > 1:
+        raise ValueError(f"frame_id={frame_id} appears multiple times in drive {drive}")
     return matches[0]
+
+
+def _get_sample_with_vehicle_yaw(
+    dataset: Kitti360dDataset,
+    sample_index: int,
+    vehicle_yaw_deg: float,
+) -> Dict:
+    base_sample = dataset.samples[sample_index]
+    override_meta = dict(base_sample.meta or {})
+    override_meta["vehicle_relative_yaw_deg_override"] = float(vehicle_yaw_deg)
+    override_sample = SampleIndex(
+        drive_dir=base_sample.drive_dir,
+        frame_id=base_sample.frame_id,
+        meta=override_meta,
+    )
+
+    original_sample = dataset.samples[sample_index]
+    dataset.samples[sample_index] = override_sample
+    try:
+        return dataset[sample_index]
+    finally:
+        dataset.samples[sample_index] = original_sample
 
 
 def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
@@ -255,31 +255,14 @@ def _add_label(image: Image.Image, label: str) -> Image.Image:
     return canvas
 
 
-def _format_guidance_scale(scale: float) -> str:
-    return f"{scale:g}"
-
-
-def _guidance_scale_filename_token(scale: float) -> str:
-    return _format_guidance_scale(scale).replace("-", "m").replace(".", "p")
-
-
-def _resize_satellite_for_front(sat_image: torch.Tensor, target_h: int) -> torch.Tensor:
-    return F.interpolate(
-        sat_image.unsqueeze(0),
-        size=(target_h, target_h),
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze(0)
-
-
 def _compose_panels(panels: Sequence[Tuple[str, torch.Tensor]]) -> Image.Image:
-    pil_panels = [_add_label(_tensor_to_pil(image), label) for label, image in panels]
-    total_width = sum(image.width for image in pil_panels)
-    max_height = max(image.height for image in pil_panels)
+    labeled = [_add_label(_tensor_to_pil(image), label) for label, image in panels]
+    total_width = sum(image.width for image in labeled)
+    max_height = max(image.height for image in labeled)
     canvas = Image.new("RGB", (total_width, max_height), color=(255, 255, 255))
 
     x_offset = 0
-    for image in pil_panels:
+    for image in labeled:
         canvas.paste(image, (x_offset, 0))
         x_offset += image.width
 
@@ -287,9 +270,6 @@ def _compose_panels(panels: Sequence[Tuple[str, torch.Tensor]]) -> Image.Image:
 
 
 def _stack_panel_rows(rows: Sequence[Image.Image], spacing: int = 8) -> Image.Image:
-    if not rows:
-        raise ValueError("rows must not be empty")
-
     width = max(image.width for image in rows)
     height = sum(image.height for image in rows) + spacing * max(0, len(rows) - 1)
     canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
@@ -300,6 +280,15 @@ def _stack_panel_rows(rows: Sequence[Image.Image], spacing: int = 8) -> Image.Im
         y_offset += image.height + spacing
 
     return canvas
+
+
+def _resize_satellite_for_front(sat_image: torch.Tensor, target_h: int) -> torch.Tensor:
+    return F.interpolate(
+        sat_image.unsqueeze(0),
+        size=(target_h, target_h),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
 
 
 @torch.no_grad()
@@ -351,21 +340,11 @@ def main() -> None:
         args.mixed_precision = "no"
 
     dataset = _build_dataset(args)
-    sample_index = _resolve_sample_index(dataset, args.frame_index, args.frame_id, args.drive)
-    sample = dataset[sample_index]
+    sample_index = _resolve_sample_index(dataset, args.frame_id, args.drive)
+    sample_90 = _get_sample_with_vehicle_yaw(dataset, sample_index, 90.0)
 
-    sat_image = sample["sat"].unsqueeze(0).to(args.device)
-    real_image = sample["image"]
-    coords_map = sample.get("coords_map")
-    if coords_map is not None:
-        coords_map = coords_map.unsqueeze(0).to(args.device)
-    plucker_map = sample.get("plucker_map")
-    if plucker_map is not None:
-        plucker_map = plucker_map.unsqueeze(0).to(args.device)
-
-    frame_id = int(sample["frame_id"])
-    drive_name = str(sample["drive"])
-    target_size = tuple(int(x) for x in real_image.shape[-2:])
+    sat_image = sample_90["sat"].unsqueeze(0).to(args.device)
+    target_size = tuple(int(x) for x in sample_90["image"].shape[-2:])
 
     model_torch_dtype = None
     if args.device.startswith("cuda") and args.mixed_precision == "fp16":
@@ -390,10 +369,11 @@ def main() -> None:
     model.to(args.device)
     model.eval()
 
+    coords_map_90 = sample_90["coords_map"].unsqueeze(0).to(args.device)
     logger.info("Materializing lazy reading blocks before loading checkpoint")
-    _materialize_lazy_modules(model, sat_image, coords_map, target_size)
+    _materialize_lazy_modules(model, sat_image, coords_map_90, target_size)
 
-    checkpoint_meta = load_model_checkpoint(
+    load_model_checkpoint(
         model,
         Path(args.checkpoint),
         args.device,
@@ -402,97 +382,65 @@ def main() -> None:
     model.eval()
 
     output_root = Path(args.output_dir)
-    sample_dir = (
-        output_root
-        / f"{drive_name}_frame_{frame_id:010d}_idx_{sample_index:05d}"
-        / f"sat_condition_{args.sat_condition_mode}"
-    )
+    sample_dir = output_root / f"{args.drive}_frame_{args.frame_id:010d}_seed_{args.seed}"
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    sat_resized = _resize_satellite_for_front(sat_image[0], target_size[0])
+    sat_resized = _resize_satellite_for_front(sample_90["sat"], target_size[0])
     _tensor_to_pil(sat_resized).save(sample_dir / "satellite.png")
-    _tensor_to_pil(real_image).save(sample_dir / "real.png")
 
-    single_cfg = len(args.guidance_scales) == 1
     summary_rows: List[Image.Image] = []
+    summary_rows.append(_compose_panels([("satellite", sat_resized)]))
+
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
 
-    for guidance_scale in args.guidance_scales:
-        guidance_scale_text = _format_guidance_scale(guidance_scale)
-        guidance_scale_token = _guidance_scale_filename_token(guidance_scale)
-        generated_panels: List[Tuple[str, torch.Tensor]] = []
+    for yaw in args.vehicle_yaws:
+        logger.info(f"Generating yaw={yaw:g}")
+        sample = _get_sample_with_vehicle_yaw(dataset, sample_index, yaw)
+        real_image = sample["image"]
+        coords_map = sample["coords_map"].unsqueeze(0).to(args.device)
+        plucker_map = sample["plucker_map"].unsqueeze(0).to(args.device)
 
-        for seed in args.seeds:
-            logger.info(
-                f"Generating sat_condition={args.sat_condition_mode}, cfg={guidance_scale_text}, seed={seed}"
-            )
-            generator = torch.Generator(device=generator_device)
-            generator.manual_seed(seed)
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(args.seed)
+        generated = model.generate(
+            sat_image,
+            coords_map=coords_map,
+            plucker_map=plucker_map,
+            target_size=target_size,
+            num_inference_steps=args.inference_steps,
+            guidance_scale=args.guidance_scale,
+            generator=generator,
+        )[0].cpu()
 
-            generated = model.generate(
-                sat_image,
-                coords_map=coords_map,
-                plucker_map=plucker_map,
-                target_size=target_size,
-                num_inference_steps=args.inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                sat_condition_mode=args.sat_condition_mode,
-            )[0].cpu()
+        yaw_token = str(yaw).replace("-", "m").replace(".", "p")
+        _tensor_to_pil(real_image).save(sample_dir / f"real_yaw_{yaw_token}.png")
+        _tensor_to_pil(generated).save(sample_dir / f"generated_yaw_{yaw_token}.png")
 
-            if single_cfg:
-                generated_name = f"generated_seed_{seed}.png"
-                comparison_name = f"comparison_seed_{seed}.png"
-                comparison_label = f"gen seed={seed}"
-            else:
-                generated_name = f"generated_cfg_{guidance_scale_token}_seed_{seed}.png"
-                comparison_name = f"comparison_cfg_{guidance_scale_token}_seed_{seed}.png"
-                comparison_label = f"gen cfg={guidance_scale_text} seed={seed}"
+        summary_rows.append(_compose_panels([
+            (f"real yaw={yaw:g}", real_image),
+            (f"generated yaw={yaw:g}", generated),
+        ]))
 
-            _tensor_to_pil(generated).save(sample_dir / generated_name)
-
-            comparison = _compose_panels([
-                ("sat", sat_resized),
-                (comparison_label, generated),
-                ("real", real_image),
-            ])
-            comparison.save(sample_dir / comparison_name)
-            generated_panels.append((f"seed={seed}", generated))
-
-        cfg_summary = _compose_panels([
-            ("sat", sat_resized),
-            ("real", real_image),
-            *generated_panels,
-        ])
-        if single_cfg:
-            summary_rows.append(cfg_summary)
-        else:
-            cfg_summary.save(sample_dir / f"summary_cfg_{guidance_scale_token}.png")
-            summary_rows.append(_add_label(cfg_summary, f"cfg={guidance_scale_text}"))
-
-    summary = _stack_panel_rows(summary_rows) if len(summary_rows) > 1 else summary_rows[0]
+    summary = _stack_panel_rows(summary_rows)
     summary.save(sample_dir / "summary.png")
 
     metadata = {
         "checkpoint": str(Path(args.checkpoint).resolve()),
-        "checkpoint_epoch": checkpoint_meta.get("epoch"),
         "base_model": args.base_model,
         "dataset_split": args.dataset_split,
-        "sample_index": sample_index,
-        "drive": drive_name,
-        "frame_id": frame_id,
-        "target_size": list(target_size),
-        "inference_steps": args.inference_steps,
-        "guidance_scales": list(args.guidance_scales),
-        "seeds": list(args.seeds),
-        "sat_condition_mode": args.sat_condition_mode,
+        "drive": args.drive,
+        "frame_id": int(args.frame_id),
+        "vehicle_yaws": [float(yaw) for yaw in args.vehicle_yaws],
+        "seed": int(args.seed),
+        "inference_steps": int(args.inference_steps),
+        "guidance_scale": float(args.guidance_scale),
+        "sample_index": int(sample_index),
     }
     with open(sample_dir / "metadata.yaml", "w") as f:
         yaml.safe_dump(metadata, f, sort_keys=False)
 
-    logger.info(f"Saved multiseed visualizations to: {sample_dir}")
+    logger.info(f"Saved yaw sweep visualizations to: {sample_dir}")
 
 
 if __name__ == "__main__":
     main()
-    

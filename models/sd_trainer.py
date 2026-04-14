@@ -20,15 +20,62 @@ from diffusers.utils import is_wandb_available
 from tqdm.auto import tqdm
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Sequence, Tuple
 import logging
 from PIL import Image
 
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import SatelliteConditionedUNet
+from models.unet.plucker_guider import PluckerGuider
 
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_compatible_keys(keys: Sequence[str], allowed_prefixes: Sequence[str]) -> Sequence[str]:
+    if not allowed_prefixes:
+        return list(keys)
+    return [
+        key
+        for key in keys
+        if not any(key.startswith(prefix) for prefix in allowed_prefixes)
+    ]
+
+
+def load_model_state_dict(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    allow_missing_prefixes: Sequence[str] = (),
+    allow_unexpected_prefixes: Sequence[str] = (),
+) -> Tuple[Sequence[str], Sequence[str]]:
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    filtered_missing = _filter_compatible_keys(missing_keys, allow_missing_prefixes)
+    filtered_unexpected = _filter_compatible_keys(unexpected_keys, allow_unexpected_prefixes)
+    if filtered_missing:
+        raise RuntimeError(f"Missing keys when loading checkpoint: {filtered_missing}")
+    if filtered_unexpected:
+        raise RuntimeError(f"Unexpected keys when loading checkpoint: {filtered_unexpected}")
+    return missing_keys, unexpected_keys
+
+
+def load_model_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path,
+    device: str,
+    *,
+    allow_missing_prefixes: Sequence[str] = (),
+    allow_unexpected_prefixes: Sequence[str] = (),
+) -> Dict[str, Any]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+    load_model_state_dict(
+        model,
+        state_dict,
+        allow_missing_prefixes=allow_missing_prefixes,
+        allow_unexpected_prefixes=allow_unexpected_prefixes,
+    )
+    return checkpoint if isinstance(checkpoint, dict) else {}
 
 
 def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> Optional[Path]:
@@ -119,6 +166,7 @@ class SatelliteConditionedSDModel(nn.Module):
         satellite_encoder: Optional[SatelliteConditionEncoder] = None,
         freeze_base: bool = True,
         cond_drop_prob: float = 0.1,
+        enable_plucker_guider: bool = False,
     ):
         super().__init__()
 
@@ -126,6 +174,7 @@ class SatelliteConditionedSDModel(nn.Module):
         self.vae = vae
         self.noise_scheduler = noise_scheduler
         self.cond_drop_prob = float(cond_drop_prob)
+        self.enable_plucker_guider = bool(enable_plucker_guider)
         if not 0.0 <= self.cond_drop_prob <= 1.0:
             raise ValueError(f"cond_drop_prob must be in [0, 1], got {self.cond_drop_prob}")
 
@@ -151,6 +200,12 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             self.satellite_encoder = satellite_encoder
 
+        self.plucker_guider = PluckerGuider(
+            in_channels=6,
+            hidden_channels=32,
+            out_channels=int(unet.config.in_channels),
+        ) if self.enable_plucker_guider else None
+
         # Freeze base layers
         if freeze_base:
             # Freeze VAE
@@ -169,6 +224,10 @@ class SatelliteConditionedSDModel(nn.Module):
         for param in self.satellite_encoder.parameters():
             param.requires_grad = True
 
+        if self.plucker_guider is not None:
+            for param in self.plucker_guider.parameters():
+                param.requires_grad = True
+
         logger.info(f"[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
         logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
@@ -178,6 +237,13 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         logger.info("  Main attn2 route: satellite tokens")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
+        logger.info(
+            f"  Plucker guider: {'enabled' if self.plucker_guider is not None else 'disabled'}"
+        )
+        if self.plucker_guider is not None:
+            logger.info(
+                f"  Plucker guider params: {sum(p.numel() for p in self.plucker_guider.parameters())}"
+            )
 
     def encode_satellite(self, sat_images: torch.Tensor, coords_map: torch.Tensor = None) -> torch.Tensor:
         """Encode satellite images to embeddings."""
@@ -194,6 +260,67 @@ class SatelliteConditionedSDModel(nn.Module):
         while mask.ndim < reference.ndim:
             mask = mask.unsqueeze(-1)
         return mask
+
+    def freeze_except_plucker_guider(self) -> None:
+        for param in self.parameters():
+            param.requires_grad = False
+        if self.plucker_guider is None:
+            raise RuntimeError("Plucker guider is not enabled on this model")
+        for param in self.plucker_guider.parameters():
+            param.requires_grad = True
+
+    @staticmethod
+    def _prepare_plucker_map(
+        plucker_map: Optional[torch.Tensor],
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if plucker_map is None or not torch.is_tensor(plucker_map):
+            return None
+
+        if plucker_map.ndim == 3:
+            plucker_map = plucker_map.unsqueeze(0)
+
+        if plucker_map.ndim == 4 and plucker_map.shape[1] == 6:
+            plucker = plucker_map.to(device=device, dtype=dtype)
+        elif plucker_map.ndim == 4 and plucker_map.shape[-1] == 6:
+            plucker = plucker_map.permute(0, 3, 1, 2).to(device=device, dtype=dtype)
+        else:
+            raise ValueError(
+                f"plucker_map must be [B, 6, H, W] or [B, H, W, 6], got {list(plucker_map.shape)}"
+            )
+
+        if plucker.shape[-2:] != (height, width):
+            plucker = F.interpolate(
+                plucker,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return plucker
+
+    def _apply_plucker_residual(
+        self,
+        latents: torch.Tensor,
+        plucker_map: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.plucker_guider is None:
+            return latents
+
+        prepared_plucker = self._prepare_plucker_map(
+            plucker_map,
+            height=latents.shape[-2],
+            width=latents.shape[-1],
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        if prepared_plucker is None:
+            return latents
+
+        residual = self.plucker_guider(prepared_plucker)
+        return latents + residual.to(device=latents.device, dtype=latents.dtype)
 
     def _build_unet_kwargs(
         self,
@@ -221,6 +348,7 @@ class SatelliteConditionedSDModel(nn.Module):
         sat_images: torch.Tensor,
         target_images: torch.Tensor,
         coords_map: torch.Tensor = None,
+        plucker_map: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for training.
@@ -229,6 +357,7 @@ class SatelliteConditionedSDModel(nn.Module):
             sat_images: (B, 3, H_sat, W_sat) - Satellite images
             target_images: (B, 3, H, W) - Target frontview images
             coords_map: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
+            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
 
         Returns:
             dict with 'loss' and other info
@@ -269,6 +398,7 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Add noise to latents
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+        noisy_latents = self._apply_plucker_residual(noisy_latents, plucker_map)
 
         # Predict noise
         unet_kwargs = self._build_unet_kwargs(
@@ -346,6 +476,7 @@ class SatelliteConditionedSDModel(nn.Module):
         self,
         sat_images: torch.Tensor,
         coords_map: torch.Tensor = None,
+        plucker_map: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
@@ -358,6 +489,7 @@ class SatelliteConditionedSDModel(nn.Module):
         Args:
             sat_images: (B, 3, H_sat, W_sat) - Satellite images
             coords_map: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
+            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
             target_size: Optional target image size as (H, W)
             num_inference_steps: Number of denoising steps
             guidance_scale: Guidance scale for classifier-free guidance
@@ -411,6 +543,7 @@ class SatelliteConditionedSDModel(nn.Module):
             sat_tokens_double = torch.cat([sat_tokens, uncond_tokens], dim=0)
             sat_xy_double = torch.cat([sat_xy, uncond_sat_xy], dim=0) if sat_xy is not None else None
             coords_map_double = torch.cat([coords_map, coords_map], dim=0) if coords_map is not None else None
+            plucker_map_double = torch.cat([plucker_map, plucker_map], dim=0) if plucker_map is not None else None
             condition_mask_double = torch.cat([
                 condition_mask,
                 torch.zeros_like(condition_mask),
@@ -423,6 +556,7 @@ class SatelliteConditionedSDModel(nn.Module):
         for t in self.noise_scheduler.timesteps:
             if use_cfg:
                 latent_model_input = torch.cat([latents, latents], dim=0)
+                latent_model_input = self._apply_plucker_residual(latent_model_input, plucker_map_double)
                 unet_kwargs = self._build_unet_kwargs(
                     encoder_hidden_states=encoder_hidden_states_double,
                     sat_tokens=sat_tokens_double,
@@ -440,6 +574,7 @@ class SatelliteConditionedSDModel(nn.Module):
                     noise_pred_cond - noise_pred_uncond
                 )
             else:
+                latent_model_input = self._apply_plucker_residual(latents, plucker_map)
                 unet_kwargs = self._build_unet_kwargs(
                     encoder_hidden_states=encoder_hidden_states,
                     sat_tokens=sat_tokens,
@@ -448,7 +583,7 @@ class SatelliteConditionedSDModel(nn.Module):
                     condition_mask=condition_mask,
                 )
                 noise_pred = self.unet(
-                    latents,
+                    latent_model_input,
                     t,
                     **unet_kwargs,
                 ).sample
@@ -496,6 +631,7 @@ def create_sd_model(
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
+    enable_plucker_guider: bool = False,
 ) -> SatelliteConditionedSDModel:
     """
     Create a satellite-conditioned Stable Diffusion model.
@@ -567,6 +703,7 @@ def create_sd_model(
         noise_scheduler=noise_scheduler,
         freeze_base=freeze_base,
         cond_drop_prob=cond_drop_prob,
+        enable_plucker_guider=enable_plucker_guider,
     )
 
     return model
@@ -803,6 +940,9 @@ class SDTrainer:
             coords_map = batch.get('coords_map')
             if coords_map is not None:
                 coords_map = coords_map.to(self.device)
+            plucker_map = batch.get('plucker_map')
+            if plucker_map is not None:
+                plucker_map = plucker_map.to(self.device)
 
             # Forward pass
             with torch.autocast(
@@ -810,7 +950,12 @@ class SDTrainer:
                 dtype=self.amp_dtype,
                 enabled=self.use_amp,
             ):
-                outputs = self.model(sat_images, target_images, coords_map)
+                outputs = self.model(
+                    sat_images,
+                    target_images,
+                    coords_map=coords_map,
+                    plucker_map=plucker_map,
+                )
                 raw_loss = outputs['loss']
 
             # Backward pass
@@ -868,13 +1013,21 @@ class SDTrainer:
             coords_map = batch.get('coords_map')
             if coords_map is not None:
                 coords_map = coords_map.to(self.device)
+            plucker_map = batch.get('plucker_map')
+            if plucker_map is not None:
+                plucker_map = plucker_map.to(self.device)
 
             with torch.autocast(
                 device_type="cuda",
                 dtype=self.amp_dtype,
                 enabled=self.use_amp,
             ):
-                outputs = self.model(sat_images, target_images, coords_map)
+                outputs = self.model(
+                    sat_images,
+                    target_images,
+                    coords_map=coords_map,
+                    plucker_map=plucker_map,
+                )
                 loss = outputs['loss']
             total_loss += loss.item()
 
@@ -937,6 +1090,7 @@ class SDTrainer:
         sat_chunks = []
         target_chunks = []
         coords_chunks = []
+        plucker_chunks = []
         frame_ids = []
 
         for batch in data_loader:
@@ -952,6 +1106,9 @@ class SDTrainer:
             coords_map = batch.get('coords_map')
             if coords_map is not None:
                 coords_chunks.append(coords_map[:take])
+            plucker_map = batch.get('plucker_map')
+            if plucker_map is not None:
+                plucker_chunks.append(plucker_map[:take])
 
             batch_frame_ids = batch.get('frame_id')
             if batch_frame_ids is None:
@@ -968,6 +1125,7 @@ class SDTrainer:
         sat_images = torch.cat(sat_chunks, dim=0).to(self.device)
         target_images = torch.cat(target_chunks, dim=0).to(self.device)
         coords_map = torch.cat(coords_chunks, dim=0).to(self.device) if coords_chunks else None
+        plucker_map = torch.cat(plucker_chunks, dim=0).to(self.device) if plucker_chunks else None
 
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
         generator = torch.Generator(device=generator_device)
@@ -978,6 +1136,7 @@ class SDTrainer:
         generated_images = self.model.generate(
             sat_images,
             coords_map=coords_map,
+            plucker_map=plucker_map,
             target_size=tuple(target_images.shape[-2:]),
             num_inference_steps=self.visualization_inference_steps,
             guidance_scale=self.visualization_guidance_scale,
@@ -1004,7 +1163,7 @@ class SDTrainer:
     def _load_checkpoint(self, checkpoint_path: str):
         """Load from checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        load_model_state_dict(self.model, checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         logger.info(f"Checkpoint loaded: {checkpoint_path}")

@@ -247,6 +247,24 @@ def _get_camera_height_m(camera_name: Optional[str]) -> float:
     return float(CAMERA_HEIGHT_M.get(camera_name, DEFAULT_CAMERA_HEIGHT_M))
 
 
+def _wrap_angle_deg(angle_deg: float) -> float:
+    wrapped = (float(angle_deg) + 180.0) % 360.0 - 180.0
+    if wrapped == -180.0:
+        return 180.0
+    return float(wrapped)
+
+
+def _angular_distance_deg(a_deg: float, b_deg: float) -> float:
+    return float(abs(_wrap_angle_deg(float(a_deg) - float(b_deg))))
+
+
+def _choose_nearest_fisheye_camera(vehicle_relative_yaw_deg: float) -> str:
+    return min(
+        FISHEYE_CAMERAS,
+        key=lambda cam: (_angular_distance_deg(vehicle_relative_yaw_deg, MOUNT_ANGLES[cam]), cam),
+    )
+
+
 def compute_camera_bev_xy(
     K: np.ndarray,
     T_cam_to_world: np.ndarray,
@@ -303,6 +321,51 @@ def compute_camera_bev_xy(
     return torch.from_numpy(bev_xy).to(torch.float32).contiguous()
 
 
+def compute_plucker_map(
+    K: np.ndarray,
+    T_cam_to_world: np.ndarray,
+    height: int,
+    width: int,
+    T_imu_to_world: Optional[np.ndarray] = None,
+    sat_m_per_px: float = 0.2,
+    sat_w: int = 512,
+) -> torch.Tensor:
+    """Return a per-pixel Plucker ray map as (6, H, W)."""
+    K_inv = np.linalg.inv(K.astype(np.float64))
+    R = T_cam_to_world[:3, :3].astype(np.float64)
+    cam_center = T_cam_to_world[:3, 3].astype(np.float64)
+
+    if T_imu_to_world is not None:
+        local_origin = np.array(
+            [T_imu_to_world[0, 3], T_imu_to_world[1, 3], 0.0],
+            dtype=np.float64,
+        )
+    else:
+        local_origin = np.array([cam_center[0], cam_center[1], 0.0], dtype=np.float64)
+
+    u = np.arange(width, dtype=np.float64) + 0.5
+    v = np.arange(height, dtype=np.float64) + 0.5
+    vv, uu = np.meshgrid(v, u, indexing='ij')
+    pixels = np.stack([uu, vv, np.ones_like(uu)], axis=0).reshape(3, -1)
+
+    dirs_cam = K_inv @ pixels
+    dirs_world = R @ dirs_cam
+    dirs_world = dirs_world / np.clip(np.linalg.norm(dirs_world, axis=0, keepdims=True), a_min=1e-8, a_max=None)
+
+    c_local = (cam_center - local_origin).astype(np.float64)
+    moments = np.cross(
+        np.broadcast_to(c_local[None, :], (dirs_world.shape[1], 3)),
+        dirs_world.T,
+    ).T
+
+    bev_extent_m = float(sat_w) * float(sat_m_per_px) / 2.0
+    plucker = np.concatenate(
+        [dirs_world, moments / (bev_extent_m + 1e-8)],
+        axis=0,
+    ).reshape(6, height, width)
+    return torch.from_numpy(plucker).to(torch.float32).contiguous()
+
+
 def _sample_random_signed_yaw(
     yaw_min_abs: float,
     yaw_max_abs: float,
@@ -317,6 +380,17 @@ def _sample_random_signed_yaw(
     mag = rng.uniform(yaw_min_abs, yaw_max_abs)
     sign = 1.0 if rng.rand() > 0.5 else -1.0
     return float(mag * sign)
+
+
+def _sample_uniform_yaw(
+    yaw_min_deg: float,
+    yaw_max_deg: float,
+    rng: Optional[np.random.RandomState] = None,
+) -> float:
+    low = float(min(yaw_min_deg, yaw_max_deg))
+    high = float(max(yaw_min_deg, yaw_max_deg))
+    rng = rng or np.random
+    return float(rng.uniform(low, high))
 
 
 
@@ -396,19 +470,23 @@ class Kitti360dDataset(Dataset):
         exclude_frames: Optional[List[int]] = None,
         require_exact_pose: bool = False,
         mode: str = "front",
+        yaw_mode: str = "fisheye_relative",
         # Camera selection: if None, will randomly pick between image_02/image_03
         fisheye_camera: Optional[str] = None,
         # Yaw is now relative to the selected fisheye's optical axis
         fisheye_relative_yaw_deg: float = 0.0,
+        vehicle_relative_yaw_deg: Optional[float] = None,
         virtual_hfov_deg: float = 100.0,
         # Random yaw sampling (relative to fisheye optical axis)
         random_fisheye_relative_yaw: bool = False,
         yaw_min_abs: float = 0.0,  # Now relative to fisheye optical axis
         yaw_max_abs: float = 90.0,  # Reasonable max yaw relative to fisheye
+        random_vehicle_relative_yaw: bool = False,
+        vehicle_yaw_min_deg: float = 60.0,
+        vehicle_yaw_max_deg: float = 120.0,
         # IPM correction angles (degrees)
         roll_deg: float = 0.0,  # Roll correction for IPM
         pitch_deg: float = 0.0,  # Pitch correction for IPM
-        calib_yaw_fix_deg: float = 4.0, # Yaw correction for T_pose_cam
 
         # Reproducible per-item randomness (e.g. yaw sampling)
         seed: Optional[int] = None,
@@ -419,6 +497,7 @@ class Kitti360dDataset(Dataset):
     ):
         self.drives: List[Path] = [Path(drives)] if not isinstance(drives, list) else [Path(x) for x in drives]
         self.mode = mode
+        self.yaw_mode = str(yaw_mode)
         self.exclude_frames = set(exclude_frames) if exclude_frames else set()
 
         # Camera selection: None means randomly pick between image_02/image_03
@@ -426,6 +505,7 @@ class Kitti360dDataset(Dataset):
 
         # Yaw is now relative to the selected fisheye's optical axis
         self.fisheye_relative_yaw_deg = float(fisheye_relative_yaw_deg)
+        self.vehicle_relative_yaw_deg = None if vehicle_relative_yaw_deg is None else float(vehicle_relative_yaw_deg)
         self.virtual_hfov_deg = float(virtual_hfov_deg)
         self.virtual_w = int(virtual_size[0])
         self.virtual_h = int(virtual_size[1])
@@ -434,9 +514,11 @@ class Kitti360dDataset(Dataset):
         self.random_fisheye_relative_yaw = bool(random_fisheye_relative_yaw)
         self.yaw_min_abs = float(yaw_min_abs)
         self.yaw_max_abs = float(yaw_max_abs)
+        self.random_vehicle_relative_yaw = bool(random_vehicle_relative_yaw)
+        self.vehicle_yaw_min_deg = float(vehicle_yaw_min_deg)
+        self.vehicle_yaw_max_deg = float(vehicle_yaw_max_deg)
         self.roll_deg = float(roll_deg)
         self.pitch_deg = float(pitch_deg)
-        self.calib_yaw_fix_deg = float(calib_yaw_fix_deg)
 
         # For reproducible randomness
         self.seed = seed
@@ -465,6 +547,8 @@ class Kitti360dDataset(Dataset):
 
         if self.mode not in {"front", "fisheye_virtual", "virtual"}:
             raise ValueError(f"Unknown mode: {self.mode}")
+        if self.yaw_mode not in {"fisheye_relative", "vehicle_relative"}:
+            raise ValueError(f"Unknown yaw_mode: {self.yaw_mode}")
         # fisheye_camera can be auto-selected based on yaw; only validate when explicitly set
         if self.fisheye_camera is not None and self.fisheye_camera not in {"image_02", "image_03"}:
             raise ValueError(f"fisheye_camera must be image_02 or image_03, got {self.fisheye_camera}")
@@ -675,6 +759,7 @@ class Kitti360dDataset(Dataset):
             "camera_height_m": camera_height_m,
             "front_bev_xy": front_bev_xy,
             "coords_map": front_bev_xy,
+            "plucker_map": torch.zeros(6, h, w, dtype=torch.float32),
             "K": torch.eye(3, dtype=torch.float32),
             "T_pose_cam": torch.eye(4, dtype=torch.float32),
             "T_imu_to_world": torch.eye(4, dtype=torch.float32),
@@ -684,9 +769,13 @@ class Kitti360dDataset(Dataset):
             "drive": s.drive_dir.name,
             "meta": {
                 "mode": self.mode,
+                "yaw_mode": self.yaw_mode,
                 "fisheye_camera": self.fisheye_camera,
-                "fisheye_relative_yaw_deg": self.fisheye_relative_yaw_deg,
-                "vehicle_relative_yaw_deg": self.fisheye_relative_yaw_deg,
+                "fisheye_camera_used": self.fisheye_camera if self.mode != "front" else None,
+                "fisheye_relative_yaw_deg": self.fisheye_relative_yaw_deg if self.mode != "front" else None,
+                "fisheye_relative_yaw_deg_used": self.fisheye_relative_yaw_deg if self.mode != "front" else None,
+                "vehicle_relative_yaw_deg": self.vehicle_relative_yaw_deg if self.mode != "front" else None,
+                "vehicle_yaw_deg_used": self.vehicle_relative_yaw_deg if self.mode != "front" else None,
                 "virtual_hfov_deg": self.virtual_hfov_deg,
                 "physical_camera": physical_camera,
                 "camera_height_m": camera_height_m,
@@ -724,35 +813,65 @@ class Kitti360dDataset(Dataset):
         # Optional deterministic overrides (provided by an outer wrapper dataset).
         # This avoids relying on internal RNG, and is DDP/worker safe.
         fisheye_relative_yaw_override_deg = None
+        vehicle_relative_yaw_override_deg = None
         fisheye_camera_override = None
         if hasattr(s, "meta") and isinstance(getattr(s, "meta"), dict):
             fisheye_relative_yaw_override_deg = s.meta.get("fisheye_relative_yaw_deg_override")
+            vehicle_relative_yaw_override_deg = s.meta.get("vehicle_relative_yaw_deg_override")
             fisheye_camera_override = s.meta.get("fisheye_camera_override")
 
-        # Choose fisheye camera for this sample
-        if self.mode == "front":
-            fisheye_camera_item = None
-        else:
+        fisheye_camera_item: Optional[str] = None
+        vehicle_yaw_deg_item: Optional[float] = None
+        fisheye_relative_yaw_deg_item: Optional[float] = None
+
+        if self.mode != "front":
+            explicit_fisheye_camera = None
             if fisheye_camera_override in FISHEYE_CAMERAS:
-                fisheye_camera_item = str(fisheye_camera_override)
+                explicit_fisheye_camera = str(fisheye_camera_override)
             elif self.fisheye_camera in FISHEYE_CAMERAS:
-                fisheye_camera_item = str(self.fisheye_camera)
-            else:
-                # Randomly choose fisheye camera
-                if self.rng is not None:
-                    fisheye_camera_item = str(self.rng.choice(FISHEYE_CAMERAS))
+                explicit_fisheye_camera = str(self.fisheye_camera)
+
+            if self.yaw_mode == "vehicle_relative":
+                if vehicle_relative_yaw_override_deg is not None:
+                    vehicle_yaw_deg_item = float(vehicle_relative_yaw_override_deg)
+                elif self.random_vehicle_relative_yaw:
+                    rng = self.rng if self.rng is not None else None
+                    vehicle_yaw_deg_item = _sample_uniform_yaw(
+                        self.vehicle_yaw_min_deg,
+                        self.vehicle_yaw_max_deg,
+                        rng=rng,
+                    )
+                elif self.vehicle_relative_yaw_deg is not None:
+                    vehicle_yaw_deg_item = float(self.vehicle_relative_yaw_deg)
                 else:
-                    fisheye_camera_item = str(np.random.choice(FISHEYE_CAMERAS))
+                    base_camera = explicit_fisheye_camera or _choose_nearest_fisheye_camera(0.0)
+                    vehicle_yaw_deg_item = _wrap_angle_deg(MOUNT_ANGLES[base_camera] + self.fisheye_relative_yaw_deg)
 
-        # Choose yaw relative to the chosen fisheye optical axis
-        sampled_fisheye_relative_yaw_deg = self.fisheye_relative_yaw_deg
-        if fisheye_relative_yaw_override_deg is not None:
-            sampled_fisheye_relative_yaw_deg = float(fisheye_relative_yaw_override_deg)
-        elif self.mode != "front" and self.random_fisheye_relative_yaw:
-            rng = self.rng if self.rng is not None else None
-            sampled_fisheye_relative_yaw_deg = _sample_random_signed_yaw(self.yaw_min_abs, self.yaw_max_abs, rng=rng)
+                fisheye_camera_item = explicit_fisheye_camera or _choose_nearest_fisheye_camera(vehicle_yaw_deg_item)
+                fisheye_relative_yaw_deg_item = _wrap_angle_deg(vehicle_yaw_deg_item - MOUNT_ANGLES[fisheye_camera_item])
+            else:
+                fisheye_camera_item = explicit_fisheye_camera
+                if fisheye_camera_item is None:
+                    if self.rng is not None:
+                        fisheye_camera_item = str(self.rng.choice(FISHEYE_CAMERAS))
+                    else:
+                        fisheye_camera_item = str(np.random.choice(FISHEYE_CAMERAS))
 
-        fisheye_relative_yaw_deg_item = float(sampled_fisheye_relative_yaw_deg)
+                sampled_fisheye_relative_yaw_deg = self.fisheye_relative_yaw_deg
+                if fisheye_relative_yaw_override_deg is not None:
+                    sampled_fisheye_relative_yaw_deg = float(fisheye_relative_yaw_override_deg)
+                elif self.random_fisheye_relative_yaw:
+                    rng = self.rng if self.rng is not None else None
+                    sampled_fisheye_relative_yaw_deg = _sample_random_signed_yaw(
+                        self.yaw_min_abs,
+                        self.yaw_max_abs,
+                        rng=rng,
+                    )
+
+                fisheye_relative_yaw_deg_item = float(sampled_fisheye_relative_yaw_deg)
+                vehicle_yaw_deg_item = _wrap_angle_deg(
+                    MOUNT_ANGLES[fisheye_camera_item] + fisheye_relative_yaw_deg_item
+                )
 
         # Load satellite BEV image
         sat_rgb, sat_available = self._read_satellite(drive_dir, frame_id)
@@ -820,24 +939,13 @@ class Kitti360dDataset(Dataset):
                 "crop": None,
                 "final_size": (self.virtual_w, self.virtual_h),
                 "fisheye_relative_yaw_deg": float(fisheye_yaw_used),
+                "vehicle_yaw_deg": float(vehicle_yaw_deg_item) if vehicle_yaw_deg_item is not None else None,
             }
 
             # remember which camera was used for this sample
             aug_meta["fisheye_camera_used"] = cam_used
 
             T_pose_cam = all_extrinsics.get(cam_used)
-
-            # Apply calib_yaw_fix if specified. This must be done *before* composing with T_imu_to_world.
-            if T_pose_cam is not None and abs(self.calib_yaw_fix_deg) > 1e-6:
-                yaw_rad = np.radians(self.calib_yaw_fix_deg)
-                # Correction is a rotation around the Z axis of the *pose* frame (IMU frame)
-                R_fix = np.array([
-                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0, 0],
-                    [np.sin(yaw_rad),  np.cos(yaw_rad), 0, 0],
-                    [0,                0,                1, 0],
-                    [0,                0,                0, 1]
-                ], dtype=np.float64)
-                T_pose_cam = R_fix @ T_pose_cam
 
         # BGR->RGB unless requested
         if img_bgr is not None:
@@ -929,8 +1037,18 @@ class Kitti360dDataset(Dataset):
                 sat_h=self.sat_size[1],
                 cam_height=camera_height_m,
             )
+            plucker_map = compute_plucker_map(
+                K=K,
+                T_cam_to_world=T_cam_to_world,
+                T_imu_to_world=T_imu_to_world,
+                height=int(img.shape[0]),
+                width=int(img.shape[1]),
+                sat_m_per_px=self.sat_m_per_px,
+                sat_w=self.sat_size[0],
+            )
         else:
             front_bev_xy = self._get_front_bev_xy(int(img.shape[0]), int(img.shape[1]))
+            plucker_map = torch.zeros(6, int(img.shape[0]), int(img.shape[1]), dtype=torch.float32)
 
         return {
             "image": img_t,
@@ -940,6 +1058,7 @@ class Kitti360dDataset(Dataset):
             "camera_height_m": camera_height_m,
             "front_bev_xy": front_bev_xy,
             "coords_map": front_bev_xy,
+            "plucker_map": plucker_map,
             "K": K_t,  # (3,3) after resize/crop, or virtual K in fisheye mode
             "T_pose_cam": T_pose_cam_t,  # (4,4) camera pose (prefer cam->world if available)
             "T_imu_to_world": T_imu_to_world_t,  # (4,4) imu->world, may be None if missing
@@ -949,10 +1068,14 @@ class Kitti360dDataset(Dataset):
             "drive": drive_dir.name,
             "meta": {
                 "mode": self.mode,
+                "yaw_mode": self.yaw_mode,
                 "fisheye_camera": aug_meta.get("fisheye_camera_used", self.fisheye_camera),
+                "fisheye_camera_used": aug_meta.get("fisheye_camera_used", self.fisheye_camera),
                 "physical_camera": physical_camera,
-                "fisheye_relative_yaw_deg": self.fisheye_relative_yaw_deg,
-                "vehicle_relative_yaw_deg": self.fisheye_relative_yaw_deg,  # For backward compatibility
+                "fisheye_relative_yaw_deg": aug_meta.get("fisheye_relative_yaw_deg"),
+                "fisheye_relative_yaw_deg_used": aug_meta.get("fisheye_relative_yaw_deg"),
+                "vehicle_relative_yaw_deg": aug_meta.get("vehicle_yaw_deg"),
+                "vehicle_yaw_deg_used": aug_meta.get("vehicle_yaw_deg"),
                 "virtual_hfov_deg": self.virtual_hfov_deg,
                 "camera_height_m": camera_height_m,
                 "oxts_yaw": yaw,

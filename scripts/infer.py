@@ -15,7 +15,7 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
-from models.sd_trainer import create_sd_model, SatelliteConditionedSDModel
+from models.sd_trainer import create_sd_model, load_model_checkpoint, SatelliteConditionedSDModel
 from data.kitti360d_dataset import Kitti360dDataset
 
 
@@ -89,15 +89,15 @@ def main():
 
     # Load model
     print(f"Loading model from checkpoint: {args.checkpoint}")
-    model = create_sd_model()
+    model = create_sd_model(enable_plucker_guider=True)
 
     # Load checkpoint
-    if torch.cuda.is_available():
-        checkpoint = torch.load(args.checkpoint)
-    else:
-        checkpoint = torch.load(args.checkpoint, map_location=torch.device('cpu'))
-
-    model.load_state_dict(checkpoint['model_state_dict'])
+    load_model_checkpoint(
+        model,
+        Path(args.checkpoint),
+        device,
+        allow_missing_prefixes=("plucker_guider.",),
+    )
     model = model.to(device)
     model.eval()
     print("Model loaded successfully!")
@@ -171,12 +171,19 @@ def process_single_frame(
         # Get satellite image
         sat_image = batch['sat'].to(device)
         real_image = batch['image']
+        coords_map = batch.get('coords_map', None)
+        if coords_map is not None:
+            coords_map = coords_map.to(device)
+        plucker_map = batch.get('plucker_map', None)
+        if plucker_map is not None:
+            plucker_map = plucker_map.to(device)
 
         # Generate frontview
         with torch.no_grad():
             generated = model.generate(
                 sat_image,
-                coords_map=batch.get('coords_map', None),
+                coords_map=coords_map,
+                plucker_map=plucker_map,
                 target_size=tuple(real_image.shape[-2:]),
                 num_inference_steps=num_inference_steps,
             )
@@ -236,12 +243,19 @@ def process_drive(
         sat_images = batch['sat'].to(device)
         real_images = batch['image']
         frame_ids = batch['frame_id']
+        coords_map = batch.get('coords_map', None)
+        if coords_map is not None:
+            coords_map = coords_map.to(device)
+        plucker_map = batch.get('plucker_map', None)
+        if plucker_map is not None:
+            plucker_map = plucker_map.to(device)
 
         # Generate frontviews
         with torch.no_grad():
             generated = model.generate(
                 sat_images,
-                coords_map=batch.get('coords_map', None),
+                coords_map=coords_map,
+                plucker_map=plucker_map,
                 target_size=tuple(real_images.shape[-2:]),
                 num_inference_steps=num_inference_steps,
             )
@@ -309,12 +323,19 @@ def process_validation(
         real_images = batch['image']
         frame_ids = batch['frame_id']
         drive_names = batch['drive']
+        coords_map = batch.get('coords_map', None)
+        if coords_map is not None:
+            coords_map = coords_map.to(device)
+        plucker_map = batch.get('plucker_map', None)
+        if plucker_map is not None:
+            plucker_map = plucker_map.to(device)
 
         # Generate frontviews
         with torch.no_grad():
             generated = model.generate(
                 sat_images,
-                coords_map=batch.get('coords_map', None),
+                coords_map=coords_map,
+                plucker_map=plucker_map,
                 target_size=tuple(real_images.shape[-2:]),
                 num_inference_steps=num_inference_steps,
             )
