@@ -360,7 +360,6 @@ def main() -> None:
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
-        enable_plucker_guider=True,
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")
@@ -377,7 +376,6 @@ def main() -> None:
         model,
         Path(args.checkpoint),
         args.device,
-        allow_missing_prefixes=("plucker_guider.",),
     )
     model.eval()
 

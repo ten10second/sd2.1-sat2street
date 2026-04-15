@@ -182,6 +182,45 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         return None
 
+    def _prepare_front_plucker(
+        self,
+        front_plucker: Any,
+        site: str,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if front_plucker is None:
+            return None
+
+        if isinstance(front_plucker, dict):
+            site_plucker = front_plucker.get(site)
+            if site_plucker is None:
+                site_plucker = front_plucker.get("default")
+            return self._prepare_front_plucker(site_plucker, site, height, width, device, dtype)
+
+        if not torch.is_tensor(front_plucker):
+            return None
+
+        front_plucker = front_plucker.to(device=device, dtype=dtype)
+
+        if front_plucker.ndim == 3 and front_plucker.shape[-1] == 6:
+            if front_plucker.shape[1] == height * width:
+                return front_plucker
+            return None
+
+        if front_plucker.ndim == 4 and front_plucker.shape[1] == 6:
+            resized = F.interpolate(front_plucker, size=(height, width), mode="bilinear", align_corners=False)
+            return resized.permute(0, 2, 3, 1).reshape(front_plucker.shape[0], height * width, 6)
+
+        if front_plucker.ndim == 4 and front_plucker.shape[-1] == 6:
+            plucker = front_plucker.permute(0, 3, 1, 2)
+            resized = F.interpolate(plucker, size=(height, width), mode="bilinear", align_corners=False)
+            return resized.permute(0, 2, 3, 1).reshape(front_plucker.shape[0], height * width, 6)
+
+        return None
+
     @staticmethod
     def _feature_condition_mask(condition_mask: torch.Tensor, front_feat: torch.Tensor) -> torch.Tensor:
         if condition_mask.ndim != 1 or condition_mask.shape[0] != front_feat.shape[0]:
@@ -248,6 +287,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             sat_tokens = self._conditioning_context.get("sat_tokens")
             sat_xy = self._conditioning_context.get("sat_xy")
             raw_front_bev_xy = self._conditioning_context.get("front_bev_xy")
+            raw_front_plucker = self._conditioning_context.get("front_plucker")
             condition_mask = self._conditioning_context.get("condition_mask")
             if sat_tokens is None or sat_xy is None or raw_front_bev_xy is None:
                 return output
@@ -262,6 +302,14 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             )
             if front_bev_xy is None:
                 return output
+            front_plucker = self._prepare_front_plucker(
+                raw_front_plucker,
+                site,
+                front_feat.shape[2],
+                front_feat.shape[3],
+                front_feat.device,
+                front_feat.dtype,
+            )
 
             block = self._get_or_create_reading_block(site, front_feat, sat_tokens)
             block_output = block(
@@ -269,6 +317,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 sat_tokens=sat_tokens.to(device=front_feat.device, dtype=front_feat.dtype),
                 sat_xy=sat_xy.to(device=front_feat.device, dtype=front_feat.dtype),
                 front_bev_xy=front_bev_xy,
+                front_plucker=front_plucker,
                 return_attn_map=self._conditioning_context.get("return_attn_map", False),
             )
 
@@ -295,6 +344,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         sat_tokens: Optional[torch.Tensor] = None,
         sat_xy: Optional[torch.Tensor] = None,
         front_bev_xy: Optional[torch.Tensor] = None,
+        front_plucker: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
         return_attn_map: bool = False,
         **kwargs,
@@ -309,6 +359,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             sat_tokens: (B, Ns, Cs) - Pre-encoded satellite tokens
             sat_xy: (B, Ns, 2) - Satellite token BEV coordinates
             front_bev_xy: (B, Nf, 2) - Frontview pixel BEV coordinates
+            front_plucker: (B, 6, H, W) or (B, Nf, 6) - Per-pixel Plucker ray map
             condition_mask: (B,) - Per-sample mask controlling whether reading injection is enabled
             return_attn_map: Whether to return attention maps
 
@@ -343,6 +394,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 "sat_tokens": inferred_sat_tokens,
                 "sat_xy": inferred_sat_xy,
                 "front_bev_xy": front_bev_xy,
+                "front_plucker": front_plucker,
                 "condition_mask": inferred_condition_mask,
                 "return_attn_map": return_attn_map,
                 "attn_maps": {},

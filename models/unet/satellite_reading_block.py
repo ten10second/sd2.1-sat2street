@@ -57,6 +57,7 @@ class SatelliteReadingBlock(nn.Module):
         sat_tokens: torch.Tensor,
         sat_xy: torch.Tensor,
         front_bev_xy: torch.Tensor,
+        front_plucker: Optional[torch.Tensor] = None,
         return_attn_map: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         if front_feat.ndim != 4:
@@ -76,6 +77,7 @@ class SatelliteReadingBlock(nn.Module):
             front_bev_xy=front_bev_xy,
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
+            front_plucker=front_plucker,
             return_attn_map=return_attn_map,
         )
         front_feat_out, read_feat, gate = self.inject(front_feat, read_tokens)

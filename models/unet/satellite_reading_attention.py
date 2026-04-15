@@ -49,6 +49,7 @@ class SatelliteReadingAttention(nn.Module):
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
+        self.plucker_adapter = nn.Linear(6, model_dim)
         self.front_adapter = nn.Sequential(
             nn.Linear(front_in_dim, model_dim),
             nn.LayerNorm(model_dim),
@@ -70,6 +71,9 @@ class SatelliteReadingAttention(nn.Module):
             rope_base=rope_base,
         )
         self.attn_dropout = nn.Dropout(attn_dropout)
+        nn.init.zeros_(self.plucker_adapter.weight)
+        if self.plucker_adapter.bias is not None:
+            nn.init.zeros_(self.plucker_adapter.bias)
 
     def _reshape_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch_size, token_count, _ = tensor.shape
@@ -85,6 +89,7 @@ class SatelliteReadingAttention(nn.Module):
         front_bev_xy: torch.Tensor,
         sat_tokens: torch.Tensor,
         sat_xy: torch.Tensor,
+        front_plucker: Optional[torch.Tensor] = None,
         return_attn_map: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if front_feat.ndim != 4:
@@ -114,10 +119,21 @@ class SatelliteReadingAttention(nn.Module):
                 f"front_feat token count mismatch: expected {list(front_bev_xy.shape[:2])}, "
                 f"got {list(front_feat_flat.shape[:2])}"
             )
+        if front_plucker is not None:
+            if front_plucker.ndim != 3 or front_plucker.shape[-1] != 6:
+                raise ValueError("front_plucker must be [B,Nf,6]")
+            if front_plucker.shape[:2] != front_bev_xy.shape[:2]:
+                raise ValueError(
+                    f"front_plucker token count mismatch: expected {list(front_bev_xy.shape[:2])}, "
+                    f"got {list(front_plucker.shape[:2])}"
+                )
 
         pos_embed = self.position_mlp(front_bev_xy)
         feat_embed = self.front_adapter(front_feat_flat)
-        q_embed = self.query_norm(pos_embed + feat_embed)
+        q_embed = pos_embed + feat_embed
+        if front_plucker is not None:
+            q_embed = q_embed + self.plucker_adapter(front_plucker)
+        q_embed = self.query_norm(q_embed)
         sat_feat = self.sat_adapter(sat_tokens)
 
         q = self._reshape_heads(self.q_proj(q_embed))

@@ -26,7 +26,6 @@ from PIL import Image
 
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import SatelliteConditionedUNet
-from models.unet.plucker_guider import PluckerGuider
 
 
 logger = logging.getLogger(__name__)
@@ -166,7 +165,6 @@ class SatelliteConditionedSDModel(nn.Module):
         satellite_encoder: Optional[SatelliteConditionEncoder] = None,
         freeze_base: bool = True,
         cond_drop_prob: float = 0.1,
-        enable_plucker_guider: bool = False,
     ):
         super().__init__()
 
@@ -174,7 +172,6 @@ class SatelliteConditionedSDModel(nn.Module):
         self.vae = vae
         self.noise_scheduler = noise_scheduler
         self.cond_drop_prob = float(cond_drop_prob)
-        self.enable_plucker_guider = bool(enable_plucker_guider)
         if not 0.0 <= self.cond_drop_prob <= 1.0:
             raise ValueError(f"cond_drop_prob must be in [0, 1], got {self.cond_drop_prob}")
 
@@ -200,12 +197,6 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             self.satellite_encoder = satellite_encoder
 
-        self.plucker_guider = PluckerGuider(
-            in_channels=6,
-            hidden_channels=32,
-            out_channels=int(unet.config.in_channels),
-        ) if self.enable_plucker_guider else None
-
         # Freeze base layers
         if freeze_base:
             # Freeze VAE
@@ -224,10 +215,6 @@ class SatelliteConditionedSDModel(nn.Module):
         for param in self.satellite_encoder.parameters():
             param.requires_grad = True
 
-        if self.plucker_guider is not None:
-            for param in self.plucker_guider.parameters():
-                param.requires_grad = True
-
         logger.info(f"[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
         logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
@@ -237,13 +224,6 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         logger.info("  Main attn2 route: satellite tokens")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
-        logger.info(
-            f"  Plucker guider: {'enabled' if self.plucker_guider is not None else 'disabled'}"
-        )
-        if self.plucker_guider is not None:
-            logger.info(
-                f"  Plucker guider params: {sum(p.numel() for p in self.plucker_guider.parameters())}"
-            )
 
     def encode_satellite(self, sat_images: torch.Tensor, coords_map: torch.Tensor = None) -> torch.Tensor:
         """Encode satellite images to embeddings."""
@@ -261,101 +241,13 @@ class SatelliteConditionedSDModel(nn.Module):
             mask = mask.unsqueeze(-1)
         return mask
 
-    def freeze_for_plucker_residual_tuning(self) -> None:
-        for param in self.parameters():
-            param.requires_grad = False
-        if self.plucker_guider is None:
-            raise RuntimeError("Plucker guider is not enabled on this model")
-
-        for param in self.plucker_guider.parameters():
-            param.requires_grad = True
-        for param in self.unet.conv_in.parameters():
-            param.requires_grad = True
-        for param in self.unet.down_blocks[0].parameters():
-            param.requires_grad = True
-
-    def _compute_plucker_residual(
-        self,
-        latents: torch.Tensor,
-        plucker_map: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if self.plucker_guider is None:
-            return None
-
-        prepared_plucker = self._prepare_plucker_map(
-            plucker_map,
-            height=latents.shape[-2],
-            width=latents.shape[-1],
-            device=latents.device,
-            dtype=latents.dtype,
-        )
-        if prepared_plucker is None:
-            return None
-
-        return self.plucker_guider(prepared_plucker)
-
-    @staticmethod
-    def _summarize_plucker_residual(residual: Optional[torch.Tensor]) -> Dict[str, float]:
-        if residual is None:
-            return {
-                "plucker_residual_mean": 0.0,
-                "plucker_residual_var": 0.0,
-            }
-        residual_fp32 = residual.detach().float()
-        return {
-            "plucker_residual_mean": float(residual_fp32.mean().item()),
-            "plucker_residual_var": float(residual_fp32.var(unbiased=False).item()),
-        }
-
-    @staticmethod
-    def _prepare_plucker_map(
-        plucker_map: Optional[torch.Tensor],
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        if plucker_map is None or not torch.is_tensor(plucker_map):
-            return None
-
-        if plucker_map.ndim == 3:
-            plucker_map = plucker_map.unsqueeze(0)
-
-        if plucker_map.ndim == 4 and plucker_map.shape[1] == 6:
-            plucker = plucker_map.to(device=device, dtype=dtype)
-        elif plucker_map.ndim == 4 and plucker_map.shape[-1] == 6:
-            plucker = plucker_map.permute(0, 3, 1, 2).to(device=device, dtype=dtype)
-        else:
-            raise ValueError(
-                f"plucker_map must be [B, 6, H, W] or [B, H, W, 6], got {list(plucker_map.shape)}"
-            )
-
-        if plucker.shape[-2:] != (height, width):
-            plucker = F.interpolate(
-                plucker,
-                size=(height, width),
-                mode="bilinear",
-                align_corners=False,
-            )
-        return plucker
-
-    def _apply_plucker_residual(
-        self,
-        latents: torch.Tensor,
-        plucker_map: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        residual = self._compute_plucker_residual(latents, plucker_map)
-        if residual is None:
-            return latents
-
-        return latents + residual.to(device=latents.device, dtype=latents.dtype)
-
     def _build_unet_kwargs(
         self,
         encoder_hidden_states: Optional[torch.Tensor],
         sat_tokens: torch.Tensor,
         sat_xy: Optional[torch.Tensor],
         coords_map: Optional[torch.Tensor],
+        plucker_map: Optional[torch.Tensor],
         condition_mask: Optional[torch.Tensor],
     ) -> Dict[str, Any]:
         unet_kwargs: Dict[str, Any] = {}
@@ -366,6 +258,7 @@ class SatelliteConditionedSDModel(nn.Module):
                 'sat_tokens': sat_tokens,
                 'sat_xy': sat_xy,
                 'front_bev_xy': coords_map,
+                'front_plucker': plucker_map,
                 'condition_mask': condition_mask,
                 'return_attn_map': False,
             })
@@ -426,12 +319,6 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Add noise to latents
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-        plucker_residual = self._compute_plucker_residual(noisy_latents, plucker_map)
-        if plucker_residual is not None:
-            noisy_latents = noisy_latents + plucker_residual.to(
-                device=noisy_latents.device,
-                dtype=noisy_latents.dtype,
-            )
 
         # Predict noise
         unet_kwargs = self._build_unet_kwargs(
@@ -439,6 +326,7 @@ class SatelliteConditionedSDModel(nn.Module):
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
             coords_map=coords_map,
+            plucker_map=plucker_map,
             condition_mask=condition_mask,
         )
 
@@ -462,7 +350,6 @@ class SatelliteConditionedSDModel(nn.Module):
             'loss': loss,
             'model_pred': model_pred,
             'target': target,
-            **self._summarize_plucker_residual(plucker_residual),
         }
 
     @torch.no_grad()
@@ -590,12 +477,12 @@ class SatelliteConditionedSDModel(nn.Module):
         for t in self.noise_scheduler.timesteps:
             if use_cfg:
                 latent_model_input = torch.cat([latents, latents], dim=0)
-                latent_model_input = self._apply_plucker_residual(latent_model_input, plucker_map_double)
                 unet_kwargs = self._build_unet_kwargs(
                     encoder_hidden_states=encoder_hidden_states_double,
                     sat_tokens=sat_tokens_double,
                     sat_xy=sat_xy_double,
                     coords_map=coords_map_double,
+                    plucker_map=plucker_map_double,
                     condition_mask=condition_mask_double,
                 )
                 noise_pred_both = self.unet(
@@ -608,16 +495,16 @@ class SatelliteConditionedSDModel(nn.Module):
                     noise_pred_cond - noise_pred_uncond
                 )
             else:
-                latent_model_input = self._apply_plucker_residual(latents, plucker_map)
                 unet_kwargs = self._build_unet_kwargs(
                     encoder_hidden_states=encoder_hidden_states,
                     sat_tokens=sat_tokens,
                     sat_xy=sat_xy,
                     coords_map=coords_map,
+                    plucker_map=plucker_map,
                     condition_mask=condition_mask,
                 )
                 noise_pred = self.unet(
-                    latent_model_input,
+                    latents,
                     t,
                     **unet_kwargs,
                 ).sample
@@ -665,7 +552,6 @@ def create_sd_model(
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
-    enable_plucker_guider: bool = False,
 ) -> SatelliteConditionedSDModel:
     """
     Create a satellite-conditioned Stable Diffusion model.
@@ -737,7 +623,6 @@ def create_sd_model(
         noise_scheduler=noise_scheduler,
         freeze_base=freeze_base,
         cond_drop_prob=cond_drop_prob,
-        enable_plucker_guider=enable_plucker_guider,
     )
 
     return model
@@ -991,8 +876,6 @@ class SDTrainer:
                     plucker_map=plucker_map,
                 )
                 raw_loss = outputs['loss']
-                plucker_residual_mean = float(outputs.get('plucker_residual_mean', 0.0))
-                plucker_residual_var = float(outputs.get('plucker_residual_var', 0.0))
 
             # Backward pass
             accumulation_start = (step // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
@@ -1025,30 +908,20 @@ class SDTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             total_raw_loss += raw_loss.item()
-            progress_bar.set_postfix({
-                'raw_loss': f"{raw_loss.item():.3f}",
-                'plk_mu': f"{plucker_residual_mean:.2e}",
-                'plk_var': f"{plucker_residual_var:.2e}",
-            })
+            progress_bar.set_postfix({'raw_loss': f"{raw_loss.item():.3f}"})
 
             # Log
-            should_log_this_step = self.model.plucker_guider is not None or (step + 1) % self.log_every == 0
-            if should_log_this_step:
+            if (step + 1) % self.log_every == 0:
                 logger.info(
-                    "Train step %d/%d: raw_loss=%.6f plucker_residual_mean=%.6e plucker_residual_var=%.6e",
+                    "Train step %d/%d: raw_loss=%.6f",
                     step + 1,
                     num_batches,
                     raw_loss.item(),
-                    plucker_residual_mean,
-                    plucker_residual_var,
                 )
-            if (step + 1) % self.log_every == 0:
                 if self.use_wandb:
                     import wandb
                     wandb.log({
                         'train_raw_loss': raw_loss.item(),
-                        'plucker_residual_mean': plucker_residual_mean,
-                        'plucker_residual_var': plucker_residual_var,
                         'epoch': epoch,
                         'step': step,
                     })

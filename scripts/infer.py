@@ -89,14 +89,13 @@ def main():
 
     # Load model
     print(f"Loading model from checkpoint: {args.checkpoint}")
-    model = create_sd_model(enable_plucker_guider=True)
+    model = create_sd_model()
 
     # Load checkpoint
     load_model_checkpoint(
         model,
         Path(args.checkpoint),
         device,
-        allow_missing_prefixes=("plucker_guider.",),
     )
     model = model.to(device)
     model.eval()

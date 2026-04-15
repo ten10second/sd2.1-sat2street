@@ -193,10 +193,6 @@ def main():
         help="Probability of dropping satellite conditioning during training.",
     )
     parser.add_argument(
-        "--enable_plucker_guider", action="store_true",
-        help="Enable the lightweight PluckerGuider residual branch.",
-    )
-    parser.add_argument(
         "--init_checkpoint", type=str, default=None,
         help="Optional checkpoint used to initialize model weights before training.",
     )
@@ -212,11 +208,11 @@ def main():
     )
     parser.add_argument(
         "--vehicle_yaw_min_deg", type=float, default=60.0,
-        help="Minimum vehicle-relative yaw sampled for the PluckerGuider experiment.",
+        help="Minimum vehicle-relative yaw sampled for virtual-view training.",
     )
     parser.add_argument(
         "--vehicle_yaw_max_deg", type=float, default=120.0,
-        help="Maximum vehicle-relative yaw sampled for the PluckerGuider experiment.",
+        help="Maximum vehicle-relative yaw sampled for virtual-view training.",
     )
     parser.add_argument(
         "--guidance_scale", type=float, default=3.0,
@@ -261,18 +257,6 @@ def main():
 
     if args.resume is not None and args.init_checkpoint is not None:
         raise ValueError("--resume and --init_checkpoint are mutually exclusive")
-
-    if args.enable_plucker_guider:
-        if args.cond_drop_prob != 0.0:
-            logger.info(
-                "PluckerGuider experiment overrides cond_drop_prob to 0.0 to isolate pose residual effects"
-            )
-            args.cond_drop_prob = 0.0
-        if args.guidance_scale != 1.0:
-            logger.info(
-                "PluckerGuider experiment overrides visualization guidance_scale to 1.0"
-            )
-            args.guidance_scale = 1.0
 
     # Set random seed for reproducibility
     random.seed(args.seed)
@@ -361,17 +345,7 @@ def main():
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
-        enable_plucker_guider=args.enable_plucker_guider,
     )
-    if args.enable_plucker_guider:
-        model.freeze_for_plucker_residual_tuning()
-        logger.info(
-            "PluckerGuider experiment: froze satellite branches and left guider + unet.conv_in + unet.down_blocks.0 trainable"
-        )
-        logger.info(
-            f"  Trainable parameters after Plucker setup: "
-            f"{sum(p.numel() for p in model.parameters() if p.requires_grad)}"
-        )
     if args.device.startswith("cuda") and args.mixed_precision != "no":
         logger.info(
             "Training keeps model weights in fp32; mixed precision is applied via autocast only"
@@ -414,13 +388,12 @@ def main():
     )
 
     if args.init_checkpoint is not None:
-        allow_missing = ("plucker_guider.",) if args.enable_plucker_guider else ()
         logger.info(f"Initializing model weights from checkpoint: {args.init_checkpoint}")
         load_model_checkpoint(
             trainer.model,
             Path(args.init_checkpoint),
             args.device,
-            allow_missing_prefixes=allow_missing,
+            allow_missing_prefixes=("unet.reading_blocks.",),
         )
 
     # Start training
