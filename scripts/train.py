@@ -364,12 +364,12 @@ def main():
         enable_plucker_guider=args.enable_plucker_guider,
     )
     if args.enable_plucker_guider:
-        model.freeze_except_plucker_guider()
+        model.freeze_for_plucker_residual_tuning()
         logger.info(
-            "PluckerGuider experiment: froze UNet/satellite branches and left only guider parameters trainable"
+            "PluckerGuider experiment: froze satellite branches and left guider + unet.conv_in + unet.down_blocks.0 trainable"
         )
         logger.info(
-            f"  Trainable PluckerGuider params: "
+            f"  Trainable parameters after Plucker setup: "
             f"{sum(p.numel() for p in model.parameters() if p.requires_grad)}"
         )
     if args.device.startswith("cuda") and args.mixed_precision != "no":

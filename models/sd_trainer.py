@@ -261,13 +261,51 @@ class SatelliteConditionedSDModel(nn.Module):
             mask = mask.unsqueeze(-1)
         return mask
 
-    def freeze_except_plucker_guider(self) -> None:
+    def freeze_for_plucker_residual_tuning(self) -> None:
         for param in self.parameters():
             param.requires_grad = False
         if self.plucker_guider is None:
             raise RuntimeError("Plucker guider is not enabled on this model")
+
         for param in self.plucker_guider.parameters():
             param.requires_grad = True
+        for param in self.unet.conv_in.parameters():
+            param.requires_grad = True
+        for param in self.unet.down_blocks[0].parameters():
+            param.requires_grad = True
+
+    def _compute_plucker_residual(
+        self,
+        latents: torch.Tensor,
+        plucker_map: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if self.plucker_guider is None:
+            return None
+
+        prepared_plucker = self._prepare_plucker_map(
+            plucker_map,
+            height=latents.shape[-2],
+            width=latents.shape[-1],
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        if prepared_plucker is None:
+            return None
+
+        return self.plucker_guider(prepared_plucker)
+
+    @staticmethod
+    def _summarize_plucker_residual(residual: Optional[torch.Tensor]) -> Dict[str, float]:
+        if residual is None:
+            return {
+                "plucker_residual_mean": 0.0,
+                "plucker_residual_var": 0.0,
+            }
+        residual_fp32 = residual.detach().float()
+        return {
+            "plucker_residual_mean": float(residual_fp32.mean().item()),
+            "plucker_residual_var": float(residual_fp32.var(unbiased=False).item()),
+        }
 
     @staticmethod
     def _prepare_plucker_map(
@@ -306,20 +344,10 @@ class SatelliteConditionedSDModel(nn.Module):
         latents: torch.Tensor,
         plucker_map: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.plucker_guider is None:
+        residual = self._compute_plucker_residual(latents, plucker_map)
+        if residual is None:
             return latents
 
-        prepared_plucker = self._prepare_plucker_map(
-            plucker_map,
-            height=latents.shape[-2],
-            width=latents.shape[-1],
-            device=latents.device,
-            dtype=latents.dtype,
-        )
-        if prepared_plucker is None:
-            return latents
-
-        residual = self.plucker_guider(prepared_plucker)
         return latents + residual.to(device=latents.device, dtype=latents.dtype)
 
     def _build_unet_kwargs(
@@ -398,7 +426,12 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Add noise to latents
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-        noisy_latents = self._apply_plucker_residual(noisy_latents, plucker_map)
+        plucker_residual = self._compute_plucker_residual(noisy_latents, plucker_map)
+        if plucker_residual is not None:
+            noisy_latents = noisy_latents + plucker_residual.to(
+                device=noisy_latents.device,
+                dtype=noisy_latents.dtype,
+            )
 
         # Predict noise
         unet_kwargs = self._build_unet_kwargs(
@@ -429,6 +462,7 @@ class SatelliteConditionedSDModel(nn.Module):
             'loss': loss,
             'model_pred': model_pred,
             'target': target,
+            **self._summarize_plucker_residual(plucker_residual),
         }
 
     @torch.no_grad()
@@ -957,6 +991,8 @@ class SDTrainer:
                     plucker_map=plucker_map,
                 )
                 raw_loss = outputs['loss']
+                plucker_residual_mean = float(outputs.get('plucker_residual_mean', 0.0))
+                plucker_residual_var = float(outputs.get('plucker_residual_var', 0.0))
 
             # Backward pass
             accumulation_start = (step // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
@@ -989,13 +1025,33 @@ class SDTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             total_raw_loss += raw_loss.item()
+            progress_bar.set_postfix({
+                'raw_loss': f"{raw_loss.item():.3f}",
+                'plk_mu': f"{plucker_residual_mean:.2e}",
+                'plk_var': f"{plucker_residual_var:.2e}",
+            })
 
             # Log
+            should_log_this_step = self.model.plucker_guider is not None or (step + 1) % self.log_every == 0
+            if should_log_this_step:
+                logger.info(
+                    "Train step %d/%d: raw_loss=%.6f plucker_residual_mean=%.6e plucker_residual_var=%.6e",
+                    step + 1,
+                    num_batches,
+                    raw_loss.item(),
+                    plucker_residual_mean,
+                    plucker_residual_var,
+                )
             if (step + 1) % self.log_every == 0:
-                progress_bar.set_postfix({'raw_loss': raw_loss.item()})
                 if self.use_wandb:
                     import wandb
-                    wandb.log({'train_raw_loss': raw_loss.item(), 'epoch': epoch, 'step': step})
+                    wandb.log({
+                        'train_raw_loss': raw_loss.item(),
+                        'plucker_residual_mean': plucker_residual_mean,
+                        'plucker_residual_var': plucker_residual_var,
+                        'epoch': epoch,
+                        'step': step,
+                    })
 
         return total_raw_loss / num_batches
 
