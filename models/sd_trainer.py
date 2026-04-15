@@ -31,6 +31,38 @@ from models.sd_model import SatelliteConditionedUNet
 logger = logging.getLogger(__name__)
 
 
+def _aggregate_reading_stats(
+    reading_stats: Optional[Dict[str, Dict[str, torch.Tensor]]],
+) -> Dict[str, torch.Tensor]:
+    if not reading_stats:
+        return {}
+
+    aggregated: Dict[str, torch.Tensor] = {}
+    sem_values = []
+    geom_values = []
+    ratio_values = []
+    for site, site_stats in reading_stats.items():
+        sem = site_stats.get("logits_sem_std")
+        geom = site_stats.get("logits_geom_std")
+        ratio = site_stats.get("logits_geom_to_sem_ratio")
+        if sem is not None:
+            aggregated[f"{site}_logits_sem_std"] = sem
+            sem_values.append(sem)
+        if geom is not None:
+            aggregated[f"{site}_logits_geom_std"] = geom
+            geom_values.append(geom)
+        if ratio is not None:
+            aggregated[f"{site}_logits_geom_to_sem_ratio"] = ratio
+            ratio_values.append(ratio)
+    if sem_values:
+        aggregated["reading_logits_sem_std_mean"] = torch.stack(sem_values).mean()
+    if geom_values:
+        aggregated["reading_logits_geom_std_mean"] = torch.stack(geom_values).mean()
+    if ratio_values:
+        aggregated["reading_logits_geom_to_sem_ratio_mean"] = torch.stack(ratio_values).mean()
+    return aggregated
+
+
 def _filter_compatible_keys(keys: Sequence[str], allowed_prefixes: Sequence[str]) -> Sequence[str]:
     if not allowed_prefixes:
         return list(keys)
@@ -345,11 +377,14 @@ class SatelliteConditionedSDModel(nn.Module):
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
         loss = F.mse_loss(model_pred, target, reduction="mean")
+        reading_stats = _aggregate_reading_stats(getattr(self.unet, "last_reading_stats", {}))
 
         return {
             'loss': loss,
             'model_pred': model_pred,
             'target': target,
+            'reading_stats': reading_stats,
+            **reading_stats,
         }
 
     @torch.no_grad()
@@ -598,6 +633,9 @@ def create_sd_model(
             'geo_ratio': reading_cfg.get('geo_ratio', 0.5),
             'rope_base': reading_cfg.get('rope_base', 10000.0),
             'lambda_geo': reading_cfg.get('lambda_geo', 1.0),
+            'lambda_geom': reading_cfg.get('lambda_geom', 1.0),
+            'geom_hidden_dim': reading_cfg.get('geom_hidden_dim', 128),
+            'geom_head_dim': reading_cfg.get('geom_head_dim', 16),
             'gate_hidden_ratio': reading_cfg.get('gate_hidden_ratio', 0.25),
             'use_geom_bias': reading_cfg.get('use_geom_bias', True),
             'use_gated_residual': reading_cfg.get('use_gated_residual', True),
@@ -908,23 +946,55 @@ class SDTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             total_raw_loss += raw_loss.item()
-            progress_bar.set_postfix({'raw_loss': f"{raw_loss.item():.3f}"})
+            postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
+            geom_ratio = outputs.get('reading_logits_geom_to_sem_ratio_mean')
+            if torch.is_tensor(geom_ratio):
+                postfix['geom/sem'] = f"{geom_ratio.item():.2f}"
+            progress_bar.set_postfix(postfix)
 
             # Log
             if (step + 1) % self.log_every == 0:
-                logger.info(
-                    "Train step %d/%d: raw_loss=%.6f",
-                    step + 1,
-                    num_batches,
-                    raw_loss.item(),
-                )
+                geom_std = outputs.get('reading_logits_geom_std_mean')
+                sem_std = outputs.get('reading_logits_sem_std_mean')
+                geom_ratio = outputs.get('reading_logits_geom_to_sem_ratio_mean')
+                if all(torch.is_tensor(v) for v in (geom_std, sem_std, geom_ratio)):
+                    site_ratio_parts = []
+                    for site, site_stats in outputs.get('reading_stats', {}).items():
+                        ratio = site_stats.get('logits_geom_to_sem_ratio')
+                        if torch.is_tensor(ratio):
+                            site_ratio_parts.append(f"{site}={ratio.item():.3f}")
+                    site_ratio_text = f" ({', '.join(site_ratio_parts)})" if site_ratio_parts else ""
+                    logger.info(
+                        "Train step %d/%d: raw_loss=%.6f sem_std=%.6f geom_std=%.6f geom/sem=%.3f%s",
+                        step + 1,
+                        num_batches,
+                        raw_loss.item(),
+                        sem_std.item(),
+                        geom_std.item(),
+                        geom_ratio.item(),
+                        site_ratio_text,
+                    )
+                else:
+                    logger.info(
+                        "Train step %d/%d: raw_loss=%.6f",
+                        step + 1,
+                        num_batches,
+                        raw_loss.item(),
+                    )
                 if self.use_wandb:
                     import wandb
-                    wandb.log({
+                    log_payload = {
                         'train_raw_loss': raw_loss.item(),
                         'epoch': epoch,
                         'step': step,
-                    })
+                    }
+                    if torch.is_tensor(sem_std):
+                        log_payload['reading_logits_sem_std_mean'] = sem_std.item()
+                    if torch.is_tensor(geom_std):
+                        log_payload['reading_logits_geom_std_mean'] = geom_std.item()
+                    if torch.is_tensor(geom_ratio):
+                        log_payload['reading_logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
+                    wandb.log(log_payload)
 
         return total_raw_loss / num_batches
 

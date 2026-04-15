@@ -27,6 +27,9 @@ class SatelliteReadingBlock(nn.Module):
         geo_ratio: float = 0.5,
         rope_base: float = 10000.0,
         lambda_geo: float = 1.0,
+        lambda_geom: float = 1.0,
+        geom_hidden_dim: int = 128,
+        geom_head_dim: int = 16,
         gate_hidden_ratio: float = 0.25,
         use_geom_bias: bool = True,
         use_gated_residual: bool = True,
@@ -42,6 +45,9 @@ class SatelliteReadingBlock(nn.Module):
             geo_ratio=geo_ratio,
             rope_base=rope_base,
             lambda_geo=lambda_geo,
+            lambda_geom=lambda_geom,
+            geom_hidden_dim=geom_hidden_dim,
+            geom_head_dim=geom_head_dim,
             use_geom_bias=use_geom_bias,
         )
         self.inject = GatedResidualInject(
@@ -72,7 +78,7 @@ class SatelliteReadingBlock(nn.Module):
                 f"front_bev_xy shape mismatch, expected [B,{expected_nf},2], got {list(front_bev_xy.shape)}"
             )
 
-        read_tokens, attn_map = self.read_attn(
+        read_tokens, attn_map, stats = self.read_attn(
             front_feat=front_feat,
             front_bev_xy=front_bev_xy,
             sat_tokens=sat_tokens,
@@ -87,4 +93,5 @@ class SatelliteReadingBlock(nn.Module):
             "read_feat": read_feat,
             "attn_map": attn_map,
             "gate": gate,
+            "stats": stats,
         }

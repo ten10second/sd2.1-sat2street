@@ -53,6 +53,9 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "geo_ratio": 0.5,
             "rope_base": 10000.0,
             "lambda_geo": 1.0,
+            "lambda_geom": 1.0,
+            "geom_hidden_dim": 128,
+            "geom_head_dim": 16,
             "gate_hidden_ratio": 0.25,
             "use_geom_bias": True,
             "use_gated_residual": True,
@@ -65,6 +68,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self._reading_hook_handles = []
         self._attn2_sat_hook_handles = []
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
+        self.last_reading_stats: Dict[str, Dict[str, torch.Tensor]] = {}
 
         self._register_attn2_sat_hooks(sat_in_dim=sat_in_dim)
         if self.use_satellite_reading:
@@ -135,6 +139,9 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             geo_ratio=self.reading_block_config["geo_ratio"],
             rope_base=self.reading_block_config["rope_base"],
             lambda_geo=self.reading_block_config["lambda_geo"],
+            lambda_geom=self.reading_block_config["lambda_geom"],
+            geom_hidden_dim=self.reading_block_config["geom_hidden_dim"],
+            geom_head_dim=self.reading_block_config["geom_head_dim"],
             gate_hidden_ratio=self.reading_block_config["gate_hidden_ratio"],
             use_geom_bias=self.reading_block_config["use_geom_bias"],
             use_gated_residual=self.reading_block_config["use_gated_residual"],
@@ -329,6 +336,14 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 attn_map = block_output.get("attn_map")
                 if attn_map is not None:
                     self._conditioning_context.setdefault("attn_maps", {})[site] = attn_map.detach()
+            stats = block_output.get("stats")
+            if stats:
+                detached_stats = {}
+                for key, value in stats.items():
+                    if torch.is_tensor(value):
+                        detached_stats[key] = value.detach()
+                if detached_stats:
+                    self._conditioning_context.setdefault("reading_stats", {})[site] = detached_stats
 
             if is_tuple:
                 return (updated, *output_tail)
@@ -398,11 +413,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 "condition_mask": inferred_condition_mask,
                 "return_attn_map": return_attn_map,
                 "attn_maps": {},
+                "reading_stats": {},
             }
         else:
             self._conditioning_context = {}
 
         self.last_attn_maps = {}
+        self.last_reading_stats = {}
 
         try:
             output = super().forward(
@@ -417,6 +434,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         if enable_reading:
             self.last_attn_maps = self._conditioning_context.get("attn_maps", {})
+            self.last_reading_stats = self._conditioning_context.get("reading_stats", {})
 
         # Keep the conditioning context alive after a successful forward so
         # gradient checkpointing can re-run hooked submodules during backward
