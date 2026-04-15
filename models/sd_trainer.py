@@ -377,13 +377,15 @@ class SatelliteConditionedSDModel(nn.Module):
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
         loss = F.mse_loss(model_pred, target, reduction="mean")
-        reading_stats = _aggregate_reading_stats(getattr(self.unet, "last_reading_stats", {}))
+        reading_stats_by_site = getattr(self.unet, "last_reading_stats", {})
+        reading_stats = _aggregate_reading_stats(reading_stats_by_site)
 
         return {
             'loss': loss,
             'model_pred': model_pred,
             'target': target,
             'reading_stats': reading_stats,
+            'reading_stats_by_site': reading_stats_by_site,
             **reading_stats,
         }
 
@@ -959,7 +961,7 @@ class SDTrainer:
                 geom_ratio = outputs.get('reading_logits_geom_to_sem_ratio_mean')
                 if all(torch.is_tensor(v) for v in (geom_std, sem_std, geom_ratio)):
                     site_ratio_parts = []
-                    for site, site_stats in outputs.get('reading_stats', {}).items():
+                    for site, site_stats in outputs.get('reading_stats_by_site', {}).items():
                         ratio = site_stats.get('logits_geom_to_sem_ratio')
                         if torch.is_tensor(ratio):
                             site_ratio_parts.append(f"{site}={ratio.item():.3f}")
