@@ -235,6 +235,41 @@ def main():
         help="Random seed for reproducible visualization generations.",
     )
     parser.add_argument(
+        "--use_wandb", action="store_true",
+        help="Log training metrics and visualization images to Weights & Biases.",
+    )
+    parser.add_argument(
+        "--wandb_project", type=str, default="kitti360_sd",
+        help="Weights & Biases project name.",
+    )
+    parser.add_argument(
+        "--wandb_run_name", type=str, default=None,
+        help="Optional Weights & Biases run name.",
+    )
+    parser.add_argument(
+        "--wandb_entity", type=str, default=None,
+        help="Optional Weights & Biases entity/team.",
+    )
+    parser.add_argument(
+        "--wandb_mode", type=str, default="online",
+        choices=["online", "offline", "disabled"],
+        help="Weights & Biases mode.",
+    )
+    tensorboard_group = parser.add_mutually_exclusive_group()
+    tensorboard_group.add_argument(
+        "--use_tensorboard", dest="use_tensorboard", action="store_true",
+        help="Log training metrics and visualization images to TensorBoard (default: enabled).",
+    )
+    tensorboard_group.add_argument(
+        "--no_tensorboard", dest="use_tensorboard", action="store_false",
+        help="Disable TensorBoard logging.",
+    )
+    parser.set_defaults(use_tensorboard=True)
+    parser.add_argument(
+        "--tensorboard_log_dir", type=str, default=None,
+        help="TensorBoard log directory. Defaults to <output_dir>/tensorboard.",
+    )
+    parser.add_argument(
         "--hf_endpoint", type=str, default=DEFAULT_HF_ENDPOINT,
         help="Hugging Face endpoint. Defaults to hf-mirror for first-time downloads.",
     )
@@ -376,8 +411,14 @@ def main():
         save_every=10,
         log_every=100,
         device=args.device,
-        use_wandb=False,
-        project_name="kitti360_sd",
+        use_wandb=args.use_wandb,
+        project_name=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_entity=args.wandb_entity,
+        wandb_mode=args.wandb_mode,
+        use_tensorboard=args.use_tensorboard,
+        tensorboard_log_dir=args.tensorboard_log_dir,
+        run_config=vars(args),
         mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
         max_grad_norm=args.max_grad_norm,
         visualize_every=args.visualize_every,

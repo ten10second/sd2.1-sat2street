@@ -83,6 +83,51 @@ python scripts/train.py --data_dir "/path/to/your/data" --batch_size 4 --epochs 
 - `--seed`: 随机种子（默认 42）
 - `--device`: 使用的设备（"cuda" 或 "cpu"）
 
+### 训练可视化监控
+
+如果你在远程服务器上训练，不想再来回 `scp` 每轮生成图，可以直接开启在线或面板式监控。训练过程中的标量和每轮保存的对比图都会自动同步。
+
+`TensorBoard` 现在默认开启；如果想关闭，可以在训练命令里加 `--no_tensorboard`。
+
+**方式 1：W&B（最省事）**
+
+```bash
+export WANDB_API_KEY=your_wandb_api_key
+
+python scripts/train.py \
+    --data_dir "/path/to/your/data" \
+    --output_dir "./output/exp01" \
+    --use_wandb \
+    --wandb_project "kitti360_sd" \
+    --wandb_run_name "exp01"
+```
+
+适合服务器能联网的情况。启动后直接在 W&B 网页里看 loss 曲线和 `sat | generated | real` 对比图，不需要再手动拷图。
+
+**方式 2：TensorBoard + SSH 端口转发**
+
+先训练并写入 TensorBoard 日志：
+
+```bash
+python scripts/train.py \
+    --data_dir "/path/to/your/data" \
+    --output_dir "./output/exp01"
+```
+
+然后在服务器上启动 TensorBoard：
+
+```bash
+tensorboard --logdir ./output/exp01/tensorboard --host 127.0.0.1 --port 6006
+```
+
+本地机器建立端口转发：
+
+```bash
+ssh -L 6006:127.0.0.1:6006 user@your-server
+```
+
+之后在本地浏览器打开 `http://127.0.0.1:6006` 即可查看训练曲线和生成图，同样不需要 `scp`。
+
 ### 4. 推理
 
 **单张图片推理：**

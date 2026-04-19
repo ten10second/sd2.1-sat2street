@@ -5,6 +5,7 @@ This module provides a simplified training interface using diffusers library.
 """
 
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -692,6 +693,12 @@ class SDTrainer:
         device: str = 'cuda',
         use_wandb: bool = False,
         project_name: str = 'kitti360_sd',
+        wandb_run_name: Optional[str] = None,
+        wandb_entity: Optional[str] = None,
+        wandb_mode: str = 'online',
+        use_tensorboard: bool = False,
+        tensorboard_log_dir: Optional[str] = None,
+        run_config: Optional[Dict[str, Any]] = None,
         mixed_precision: Optional[str] = None,
         max_grad_norm: float = 1.0,
         visualize_every: int = 1,
@@ -715,6 +722,10 @@ class SDTrainer:
         self.device = device
         self.use_wandb = use_wandb
         self.project_name = project_name
+        self.wandb_run_name = wandb_run_name
+        self.wandb_entity = wandb_entity
+        self.wandb_mode = wandb_mode
+        self.use_tensorboard = use_tensorboard
         self.max_grad_norm = float(max_grad_norm)
         self.visualize_every = max(0, int(visualize_every))
         self.num_visualizations = max(0, int(num_visualizations))
@@ -723,6 +734,8 @@ class SDTrainer:
         self.visualization_seed = int(visualization_seed)
         self.visualization_dir = self.output_dir / "visualizations"
         self.visualization_dir.mkdir(parents=True, exist_ok=True)
+        self.tensorboard_log_dir = Path(tensorboard_log_dir) if tensorboard_log_dir is not None else self.output_dir / "tensorboard"
+        self.tb_writer = None
         self.mixed_precision = None if mixed_precision is None else mixed_precision.lower()
         self.use_amp = device.startswith("cuda") and self.mixed_precision in {"fp16", "bf16"}
         self.amp_dtype = (
@@ -769,7 +782,22 @@ class SDTrainer:
             if not is_wandb_available():
                 raise ImportError("Please install wandb to use logging: pip install wandb")
             import wandb
-            wandb.init(project=project_name)
+            wandb.init(
+                project=project_name,
+                entity=wandb_entity,
+                name=wandb_run_name,
+                mode=wandb_mode,
+                config=run_config,
+            )
+        if use_tensorboard:
+            try:
+                from tensorboardX import SummaryWriter
+            except ImportError as exc:
+                raise ImportError(
+                    "Please install tensorboardX to use TensorBoard logging: pip install tensorboardX"
+                ) from exc
+            self.tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
+            self.tb_writer = SummaryWriter(logdir=str(self.tensorboard_log_dir))
 
         logger.info(f"[SDTrainer] Initialized")
         logger.info(f"  Learning rate: {learning_rate}")
@@ -777,6 +805,13 @@ class SDTrainer:
         logger.info(f"  Batch size: {train_dataloader.batch_size}")
         logger.info(f"  Mixed precision: {self.mixed_precision or 'disabled'}")
         logger.info(f"  Max grad norm: {self.max_grad_norm}")
+        if self.use_wandb:
+            logger.info(
+                f"  W&B logging: project={self.project_name}, "
+                f"run_name={self.wandb_run_name or 'auto'}, mode={self.wandb_mode}"
+            )
+        if self.tb_writer is not None:
+            logger.info(f"  TensorBoard log dir: {self.tensorboard_log_dir}")
         if self.visualize_every > 0 and self.num_visualizations > 0:
             logger.info(
                 f"  Visualization: every {self.visualize_every} epoch(s), "
@@ -857,6 +892,75 @@ class SDTrainer:
                 f"These must stay fp32 for GradScaler: {preview}"
             )
 
+    def _global_step(self, epoch: int, step: int) -> int:
+        return epoch * max(1, len(self.train_dataloader)) + step + 1
+
+    def _log_scalars(self, metrics: Dict[str, float], step: int) -> None:
+        scalar_metrics = {
+            key: float(value)
+            for key, value in metrics.items()
+            if value is not None
+        }
+        if not scalar_metrics:
+            return
+
+        if self.use_wandb:
+            import wandb
+            wandb.log(scalar_metrics, step=step)
+
+        if self.tb_writer is not None:
+            for key, value in scalar_metrics.items():
+                self.tb_writer.add_scalar(key, value, global_step=step)
+
+    @staticmethod
+    def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
+        array = np.asarray(image, dtype=np.uint8).copy()
+        return torch.from_numpy(array).permute(2, 0, 1)
+
+    def _log_visualizations(
+        self,
+        images: Sequence[Image.Image],
+        captions: Sequence[str],
+        step: int,
+    ) -> None:
+        if not images:
+            return
+
+        if self.use_wandb:
+            import wandb
+            wandb.log(
+                {
+                    "visualizations": [
+                        wandb.Image(image, caption=caption)
+                        for image, caption in zip(images, captions)
+                    ]
+                },
+                step=step,
+            )
+
+        if self.tb_writer is not None:
+            for idx, (image, caption) in enumerate(zip(images, captions)):
+                tag = f"visualizations/sample_{idx:02d}"
+                self.tb_writer.add_image(
+                    tag,
+                    self._pil_to_tensor(image),
+                    global_step=step,
+                    dataformats="CHW",
+                )
+                self.tb_writer.add_text(
+                    f"{tag}_caption",
+                    caption,
+                    global_step=step,
+                )
+
+    def _close_loggers(self) -> None:
+        if self.tb_writer is not None:
+            self.tb_writer.close()
+            self.tb_writer = None
+        if self.use_wandb:
+            import wandb
+            wandb.finish()
+
     def train(self, resume_from: Optional[str] = None):
         """Run training."""
         start_epoch = 0
@@ -864,22 +968,40 @@ class SDTrainer:
         if resume_from is not None:
             self._load_checkpoint(resume_from)
 
-        for epoch in range(start_epoch, self.num_train_epochs):
-            logger.info(f"Epoch {epoch + 1}/{self.num_train_epochs}")
-            train_raw_loss = self._train_epoch(epoch)
-            logger.info(f"  Train raw loss: {train_raw_loss:.4f}")
+        try:
+            for epoch in range(start_epoch, self.num_train_epochs):
+                logger.info(f"Epoch {epoch + 1}/{self.num_train_epochs}")
+                train_raw_loss = self._train_epoch(epoch)
+                logger.info(f"  Train raw loss: {train_raw_loss:.4f}")
+                epoch_step = self._global_step(epoch, max(0, len(self.train_dataloader) - 1))
+                self._log_scalars(
+                    {
+                        "train/epoch_raw_loss": train_raw_loss,
+                        "train/epoch": epoch + 1,
+                    },
+                    step=epoch_step,
+                )
 
-            # Validate
-            if self.val_dataloader is not None:
-                val_loss = self._validate(epoch)
-                logger.info(f"  Val loss: {val_loss:.4f}")
+                # Validate
+                if self.val_dataloader is not None:
+                    val_loss = self._validate(epoch)
+                    logger.info(f"  Val loss: {val_loss:.4f}")
+                    self._log_scalars(
+                        {
+                            "val/loss": val_loss,
+                            "train/epoch": epoch + 1,
+                        },
+                        step=epoch_step,
+                    )
 
-            if self.visualize_every > 0 and self.num_visualizations > 0 and (epoch + 1) % self.visualize_every == 0:
-                self._save_visualizations(epoch)
+                if self.visualize_every > 0 and self.num_visualizations > 0 and (epoch + 1) % self.visualize_every == 0:
+                    self._save_visualizations(epoch)
 
-            # Save checkpoint
-            if (epoch + 1) % self.save_every == 0 or (epoch + 1) == self.num_train_epochs:
-                self._save_checkpoint(epoch)
+                # Save checkpoint
+                if (epoch + 1) % self.save_every == 0 or (epoch + 1) == self.num_train_epochs:
+                    self._save_checkpoint(epoch)
+        finally:
+            self._close_loggers()
 
     def _train_epoch(self, epoch: int) -> float:
         """Train for one epoch."""
@@ -983,20 +1105,18 @@ class SDTrainer:
                         num_batches,
                         raw_loss.item(),
                     )
-                if self.use_wandb:
-                    import wandb
-                    log_payload = {
-                        'train_raw_loss': raw_loss.item(),
-                        'epoch': epoch,
-                        'step': step,
-                    }
-                    if torch.is_tensor(sem_std):
-                        log_payload['reading_logits_sem_std_mean'] = sem_std.item()
-                    if torch.is_tensor(geom_std):
-                        log_payload['reading_logits_geom_std_mean'] = geom_std.item()
-                    if torch.is_tensor(geom_ratio):
-                        log_payload['reading_logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
-                    wandb.log(log_payload)
+                log_payload = {
+                    'train/raw_loss': raw_loss.item(),
+                    'train/lr': self.lr_scheduler.get_last_lr()[0],
+                    'train/epoch': epoch + 1,
+                }
+                if torch.is_tensor(sem_std):
+                    log_payload['reading/logits_sem_std_mean'] = sem_std.item()
+                if torch.is_tensor(geom_std):
+                    log_payload['reading/logits_geom_std_mean'] = geom_std.item()
+                if torch.is_tensor(geom_ratio):
+                    log_payload['reading/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
+                self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
         return total_raw_loss / num_batches
 
@@ -1148,6 +1268,8 @@ class SDTrainer:
 
         epoch_dir = self.visualization_dir / f"epoch_{epoch + 1:04d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
+        comparison_images = []
+        captions = []
 
         for idx in range(generated_images.shape[0]):
             frame_id = frame_ids[idx]
@@ -1158,8 +1280,18 @@ class SDTrainer:
                 target_images[idx],
             )
             comparison.save(epoch_dir / f"sample_{idx:02d}{frame_suffix}.png")
+            comparison_images.append(comparison)
+            caption = f"epoch={epoch + 1} sample={idx:02d}"
+            if frame_id is not None:
+                caption += f" frame={int(frame_id):010d}"
+            captions.append(caption)
 
         logger.info(f"Saved visualizations: {epoch_dir}")
+        self._log_visualizations(
+            comparison_images,
+            captions,
+            step=self._global_step(epoch, max(0, len(self.train_dataloader) - 1)),
+        )
 
     def _load_checkpoint(self, checkpoint_path: str):
         """Load from checkpoint."""
