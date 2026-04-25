@@ -240,6 +240,41 @@ def _load_perspective_calib(calib_path: Path) -> Dict[str, Any]:
 
 FISHEYE_CAMERAS = ("image_02", "image_03")
 
+FIXED_FIVE_VIEW_SPECS = (
+    {
+        "view_name": "front",
+        "mode_override": "front",
+    },
+    {
+        "view_name": "left_forward_45",
+        "mode_override": "fisheye_virtual",
+        "fisheye_camera_override": "image_02",
+        "fisheye_relative_yaw_deg_override": 45.0,
+        "vehicle_relative_yaw_deg_override": -45.0,
+    },
+    {
+        "view_name": "left_side",
+        "mode_override": "fisheye_virtual",
+        "fisheye_camera_override": "image_02",
+        "fisheye_relative_yaw_deg_override": 0.0,
+        "vehicle_relative_yaw_deg_override": -90.0,
+    },
+    {
+        "view_name": "right_forward_45",
+        "mode_override": "fisheye_virtual",
+        "fisheye_camera_override": "image_03",
+        "fisheye_relative_yaw_deg_override": -45.0,
+        "vehicle_relative_yaw_deg_override": 45.0,
+    },
+    {
+        "view_name": "right_side",
+        "mode_override": "fisheye_virtual",
+        "fisheye_camera_override": "image_03",
+        "fisheye_relative_yaw_deg_override": 0.0,
+        "vehicle_relative_yaw_deg_override": 90.0,
+    },
+)
+
 
 def _get_camera_height_m(camera_name: Optional[str]) -> float:
     if camera_name is None:
@@ -451,6 +486,11 @@ class Kitti360dDataset(Dataset):
       - front: read image_00 perspective directly.
       - fisheye_virtual: read image_02 or image_03 fisheye and synthesize a virtual perspective.
 
+    View sets:
+      - single: one sample per frame using the requested mode.
+      - fixed5: expand each frame to five fixed views:
+        front, left_forward_45, left_side, right_forward_45, right_side.
+
     Returned dict keys:
       - image: torch.float32 (3,H,W) in [0,1]
       - frame_id: int
@@ -490,13 +530,14 @@ class Kitti360dDataset(Dataset):
 
         # Reproducible per-item randomness (e.g. yaw sampling)
         seed: Optional[int] = None,
+        view_set: str = "single",
         virtual_size: Tuple[int, int] = (640, 256),
         front_resize: Optional[Tuple[int, int]] = (640, 256),
         front_center_crop: Optional[Tuple[int, int]] = None,
         return_bgr: bool = False,
     ):
         self.drives: List[Path] = [Path(drives)] if not isinstance(drives, list) else [Path(x) for x in drives]
-        self.mode = mode
+        self.mode = str(mode)
         self.yaw_mode = str(yaw_mode)
         self.exclude_frames = set(exclude_frames) if exclude_frames else set()
 
@@ -524,6 +565,7 @@ class Kitti360dDataset(Dataset):
         self.seed = seed
         self.rng = np.random.RandomState(seed) if seed is not None else None
         self.epoch = 0  # For DDP safety
+        self.view_set = str(view_set)
 
         self.front_resize = front_resize  # (W,H) if not None
         self.front_center_crop = front_center_crop  # (W,H) if not None
@@ -545,10 +587,14 @@ class Kitti360dDataset(Dataset):
         self._cam0_to_world_cache: Dict[str, Dict[int, np.ndarray]] = {}
         self._front_bev_xy_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
-        if self.mode not in {"front", "fisheye_virtual", "virtual"}:
+        if self.mode not in {"front", "fisheye_virtual"}:
             raise ValueError(f"Unknown mode: {self.mode}")
         if self.yaw_mode not in {"fisheye_relative", "vehicle_relative"}:
             raise ValueError(f"Unknown yaw_mode: {self.yaw_mode}")
+        if self.view_set not in {"single", "fixed5"}:
+            raise ValueError(f"Unknown view_set: {self.view_set}")
+        if self.view_set == "fixed5" and self.mode != "fisheye_virtual":
+            raise ValueError("view_set='fixed5' requires mode='fisheye_virtual'")
         # fisheye_camera can be auto-selected based on yaw; only validate when explicitly set
         if self.fisheye_camera is not None and self.fisheye_camera not in {"image_02", "image_03"}:
             raise ValueError(f"fisheye_camera must be image_02 or image_03, got {self.fisheye_camera}")
@@ -579,10 +625,36 @@ class Kitti360dDataset(Dataset):
             if self.exclude_frames:
                 ids = [fid for fid in ids if fid not in self.exclude_frames]
             for fid in ids:
-                self.samples.append(SampleIndex(drive_dir=d, frame_id=int(fid)))
+                if self.view_set == "fixed5":
+                    for spec in FIXED_FIVE_VIEW_SPECS:
+                        self.samples.append(
+                            SampleIndex(
+                                drive_dir=d,
+                                frame_id=int(fid),
+                                meta=dict(spec),
+                            )
+                        )
+                else:
+                    self.samples.append(SampleIndex(drive_dir=d, frame_id=int(fid)))
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _resolve_sample_mode(self, sample: SampleIndex) -> str:
+        mode = self.mode
+        if isinstance(sample.meta, dict):
+            mode = str(sample.meta.get("mode_override", mode))
+        if mode not in {"front", "fisheye_virtual"}:
+            raise ValueError(f"Unknown sample mode: {mode}")
+        return mode
+
+    @staticmethod
+    def _resolve_sample_view_name(sample: SampleIndex) -> Optional[str]:
+        if isinstance(sample.meta, dict):
+            view_name = sample.meta.get("view_name")
+            if view_name is not None:
+                return str(view_name)
+        return None
 
     def _read_front(self, drive_dir: Path, frame_id: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """Read front image_00 and return (img_bgr, K_original).
@@ -740,7 +812,15 @@ class Kitti360dDataset(Dataset):
 
     def _get_dummy_sample(self, s) -> Dict:
         """Return a zeroed-out sample dict for frames that failed to load."""
-        if self.mode == "front":
+        sample_mode = self._resolve_sample_mode(s)
+        view_name = self._resolve_sample_view_name(s)
+        meta = s.meta if isinstance(s.meta, dict) else {}
+        fisheye_camera_used = meta.get("fisheye_camera_override")
+        if fisheye_camera_used not in FISHEYE_CAMERAS:
+            fisheye_camera_used = self.fisheye_camera
+        fisheye_relative_yaw_used = meta.get("fisheye_relative_yaw_deg_override", self.fisheye_relative_yaw_deg)
+        vehicle_yaw_used = meta.get("vehicle_relative_yaw_deg_override", self.vehicle_relative_yaw_deg)
+        if sample_mode == "front":
             if self.front_resize is not None:
                 w, h = self.front_resize
             else:
@@ -748,7 +828,7 @@ class Kitti360dDataset(Dataset):
             physical_camera = "image_00"
         else:
             h, w = self.virtual_h, self.virtual_w
-            physical_camera = self.fisheye_camera
+            physical_camera = fisheye_camera_used
         camera_height_m = _get_camera_height_m(physical_camera)
         front_bev_xy = self._get_front_bev_xy(int(h), int(w))
         return {
@@ -768,14 +848,17 @@ class Kitti360dDataset(Dataset):
             "frame_id": s.frame_id,
             "drive": s.drive_dir.name,
             "meta": {
-                "mode": self.mode,
+                "mode": sample_mode,
+                "requested_mode": self.mode,
+                "view_set": self.view_set,
+                "view_name": view_name,
                 "yaw_mode": self.yaw_mode,
-                "fisheye_camera": self.fisheye_camera,
-                "fisheye_camera_used": self.fisheye_camera if self.mode != "front" else None,
-                "fisheye_relative_yaw_deg": self.fisheye_relative_yaw_deg if self.mode != "front" else None,
-                "fisheye_relative_yaw_deg_used": self.fisheye_relative_yaw_deg if self.mode != "front" else None,
-                "vehicle_relative_yaw_deg": self.vehicle_relative_yaw_deg if self.mode != "front" else None,
-                "vehicle_yaw_deg_used": self.vehicle_relative_yaw_deg if self.mode != "front" else None,
+                "fisheye_camera": fisheye_camera_used,
+                "fisheye_camera_used": fisheye_camera_used if sample_mode != "front" else None,
+                "fisheye_relative_yaw_deg": fisheye_relative_yaw_used if sample_mode != "front" else None,
+                "fisheye_relative_yaw_deg_used": fisheye_relative_yaw_used if sample_mode != "front" else None,
+                "vehicle_relative_yaw_deg": vehicle_yaw_used if sample_mode != "front" else None,
+                "vehicle_yaw_deg_used": vehicle_yaw_used if sample_mode != "front" else None,
                 "virtual_hfov_deg": self.virtual_hfov_deg,
                 "physical_camera": physical_camera,
                 "camera_height_m": camera_height_m,
@@ -809,6 +892,8 @@ class Kitti360dDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         s = self.samples[idx]
         drive_dir, frame_id = s.drive_dir, s.frame_id
+        sample_mode = self._resolve_sample_mode(s)
+        view_name = self._resolve_sample_view_name(s)
 
         # Optional deterministic overrides (provided by an outer wrapper dataset).
         # This avoids relying on internal RNG, and is DDP/worker safe.
@@ -824,7 +909,7 @@ class Kitti360dDataset(Dataset):
         vehicle_yaw_deg_item: Optional[float] = None
         fisheye_relative_yaw_deg_item: Optional[float] = None
 
-        if self.mode != "front":
+        if sample_mode != "front":
             explicit_fisheye_camera = None
             if fisheye_camera_override in FISHEYE_CAMERAS:
                 explicit_fisheye_camera = str(fisheye_camera_override)
@@ -906,7 +991,7 @@ class Kitti360dDataset(Dataset):
         T_pose_cam: Optional[np.ndarray] = None
         aug_meta: Dict[str, Any] = {}
 
-        if self.mode == "front":
+        if sample_mode == "front":
             img_bgr, K0 = self._read_front(drive_dir, frame_id)
             img_bgr, K, aug_meta = self._apply_resize_center_crop(
                 img_bgr,
@@ -955,7 +1040,7 @@ class Kitti360dDataset(Dataset):
                 img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         else:
             # Handle cases where image loading failed
-            h, w = self.front_resize if self.mode == 'front' else (self.virtual_h, self.virtual_w)
+            h, w = self.front_resize if sample_mode == 'front' else (self.virtual_h, self.virtual_w)
             img = np.zeros((h, w, 3), dtype=np.uint8)
 
         img_t = torch.from_numpy(img).to(torch.float32).permute(2, 0, 1) / 255.0
@@ -971,7 +1056,7 @@ class Kitti360dDataset(Dataset):
 
         K_t = None if K is None else torch.from_numpy(K).to(torch.float32)
         T_cam_to_world: Optional[np.ndarray] = None
-        physical_camera = "image_00" if self.mode == "front" else aug_meta.get("fisheye_camera_used", self.fisheye_camera)
+        physical_camera = "image_00" if sample_mode == "front" else aug_meta.get("fisheye_camera_used", self.fisheye_camera)
         camera_height_m = _get_camera_height_m(physical_camera)
 
         # Compose per-frame camera->world when possible.
@@ -986,7 +1071,7 @@ class Kitti360dDataset(Dataset):
 
                 # If we are generating a virtual perspective from fisheye, we must rotate the
                 # *camera frame* by the same R used in fisheye_to_virtual_perspective.
-                if self.mode in ["fisheye_virtual", "virtual"]:
+                if sample_mode == "fisheye_virtual":
                     cam_used = aug_meta.get("fisheye_camera_used")
                     fisheye_yaw_used = float(aug_meta.get("fisheye_relative_yaw_deg", 0.0))
 
@@ -1015,7 +1100,7 @@ class Kitti360dDataset(Dataset):
                 else:
                     T_cam_to_world = T_fisheye_to_world
 
-        elif T_cam0_to_world is not None and self.mode == "front":
+        elif T_cam0_to_world is not None and sample_mode == "front":
             # Fallback: front camera can still use cam0_to_world if provided
             T_cam_to_world = T_cam0_to_world
         T_pose_cam_t = None if T_pose_cam is None else torch.from_numpy(T_pose_cam).to(torch.float32)
@@ -1067,7 +1152,10 @@ class Kitti360dDataset(Dataset):
             "frame_id": frame_id,
             "drive": drive_dir.name,
             "meta": {
-                "mode": self.mode,
+                "mode": sample_mode,
+                "requested_mode": self.mode,
+                "view_set": self.view_set,
+                "view_name": view_name,
                 "yaw_mode": self.yaw_mode,
                 "fisheye_camera": aug_meta.get("fisheye_camera_used", self.fisheye_camera),
                 "fisheye_camera_used": aug_meta.get("fisheye_camera_used", self.fisheye_camera),
