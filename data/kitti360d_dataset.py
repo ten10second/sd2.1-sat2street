@@ -490,6 +490,7 @@ class Kitti360dDataset(Dataset):
       - single: one sample per frame using the requested mode.
       - fixed5: expand each frame to five fixed views:
         front, left_forward_45, left_side, right_forward_45, right_side.
+      - front_plus_random: expand each frame to front plus one random virtual fisheye view.
 
     Returned dict keys:
       - image: torch.float32 (3,H,W) in [0,1]
@@ -591,10 +592,10 @@ class Kitti360dDataset(Dataset):
             raise ValueError(f"Unknown mode: {self.mode}")
         if self.yaw_mode not in {"fisheye_relative", "vehicle_relative"}:
             raise ValueError(f"Unknown yaw_mode: {self.yaw_mode}")
-        if self.view_set not in {"single", "fixed5"}:
+        if self.view_set not in {"single", "fixed5", "front_plus_random"}:
             raise ValueError(f"Unknown view_set: {self.view_set}")
-        if self.view_set == "fixed5" and self.mode != "fisheye_virtual":
-            raise ValueError("view_set='fixed5' requires mode='fisheye_virtual'")
+        if self.view_set in {"fixed5", "front_plus_random"} and self.mode != "fisheye_virtual":
+            raise ValueError(f"view_set='{self.view_set}' requires mode='fisheye_virtual'")
         # fisheye_camera can be auto-selected based on yaw; only validate when explicitly set
         if self.fisheye_camera is not None and self.fisheye_camera not in {"image_02", "image_03"}:
             raise ValueError(f"fisheye_camera must be image_02 or image_03, got {self.fisheye_camera}")
@@ -634,6 +635,27 @@ class Kitti360dDataset(Dataset):
                                 meta=dict(spec),
                             )
                         )
+                elif self.view_set == "front_plus_random":
+                    self.samples.append(
+                        SampleIndex(
+                            drive_dir=d,
+                            frame_id=int(fid),
+                            meta={
+                                "view_name": "front",
+                                "mode_override": "front",
+                            },
+                        )
+                    )
+                    self.samples.append(
+                        SampleIndex(
+                            drive_dir=d,
+                            frame_id=int(fid),
+                            meta={
+                                "view_name": "random_side",
+                                "mode_override": "fisheye_virtual",
+                            },
+                        )
+                    )
                 else:
                     self.samples.append(SampleIndex(drive_dir=d, frame_id=int(fid)))
 

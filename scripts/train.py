@@ -208,8 +208,8 @@ def main():
     )
     parser.add_argument(
         "--view_set", type=str, default="single",
-        choices=["single", "fixed5"],
-        help="Per-frame view expansion for fisheye_virtual. 'fixed5' yields front, left_forward_45, left_side, right_forward_45, right_side.",
+        choices=["single", "fixed5", "front_plus_random"],
+        help="Per-frame view expansion for fisheye_virtual. 'fixed5' yields front plus four fixed side views; 'front_plus_random' yields front plus one random side view.",
     )
     parser.add_argument(
         "--vehicle_yaw_min_deg", type=float, default=60.0,
@@ -331,7 +331,7 @@ def main():
     train_dataset_kwargs = dict(common_dataset_kwargs)
     val_dataset_kwargs = dict(common_dataset_kwargs)
 
-    if args.dataset_mode != "front" and args.view_set == "single" and args.yaw_mode == "vehicle_relative":
+    if args.dataset_mode != "front" and args.view_set in {"single", "front_plus_random"} and args.yaw_mode == "vehicle_relative":
         train_dataset_kwargs.update({
             "random_vehicle_relative_yaw": True,
             "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
