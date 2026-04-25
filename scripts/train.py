@@ -213,11 +213,11 @@ def main():
     )
     parser.add_argument(
         "--vehicle_yaw_min_deg", type=float, default=60.0,
-        help="Minimum vehicle-relative yaw sampled for virtual-view training.",
+        help="Minimum absolute vehicle-relative yaw sampled for virtual-view training; random training samples from [-max,-min] U [min,max].",
     )
     parser.add_argument(
         "--vehicle_yaw_max_deg", type=float, default=120.0,
-        help="Maximum vehicle-relative yaw sampled for virtual-view training.",
+        help="Maximum absolute vehicle-relative yaw sampled for virtual-view training; random training samples from [-max,-min] U [min,max].",
     )
     parser.add_argument(
         "--guidance_scale", type=float, default=3.0,

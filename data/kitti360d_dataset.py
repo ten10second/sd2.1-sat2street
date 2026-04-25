@@ -921,7 +921,7 @@ class Kitti360dDataset(Dataset):
                     vehicle_yaw_deg_item = float(vehicle_relative_yaw_override_deg)
                 elif self.random_vehicle_relative_yaw:
                     rng = self.rng if self.rng is not None else None
-                    vehicle_yaw_deg_item = _sample_uniform_yaw(
+                    vehicle_yaw_deg_item = _sample_random_signed_yaw(
                         self.vehicle_yaw_min_deg,
                         self.vehicle_yaw_max_deg,
                         rng=rng,
