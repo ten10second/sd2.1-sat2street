@@ -224,7 +224,7 @@ def main():
         help="Guidance scale used for training visualizations. 1.0 disables CFG.",
     )
     parser.add_argument(
-        "--visualize_every", type=int, default=1,
+        "--visualize_every", type=int, default=10,
         help="Save fixed-sample visualization comparisons every N epochs. Set 0 to disable.",
     )
     parser.add_argument(
