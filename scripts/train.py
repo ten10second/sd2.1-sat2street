@@ -16,6 +16,7 @@ if str(_project_root) not in sys.path:
 import argparse
 import os
 import torch
+import torch.distributed as dist
 import numpy as np
 import random
 import logging
@@ -26,6 +27,7 @@ from typing import List, Tuple
 from models.sd_trainer import create_sd_model, load_model_checkpoint, SDTrainer
 from data.kitti360d_dataset import Kitti360dDataset
 from torch.utils.data import DataLoader, default_collate
+from torch.utils.data.distributed import DistributedSampler
 
 
 # Setup logging
@@ -42,6 +44,30 @@ logger = logging.getLogger(__name__)
 DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
+
+
+def _init_distributed(args) -> Tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if not distributed:
+        return False, rank, local_rank, world_size
+
+    if args.device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed CUDA training requested, but CUDA is not available")
+        torch.cuda.set_device(local_rank)
+        args.device = f"cuda:{local_rank}"
+
+    dist.init_process_group(backend="nccl" if args.device.startswith("cuda") else "gloo")
+    return True, rank, local_rank, world_size
+
+
+def _cleanup_distributed(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def _load_frame_ids(frames_file: Path) -> List[int]:
@@ -284,11 +310,16 @@ def main():
     )
 
     args = parser.parse_args()
+    distributed, rank, local_rank, world_size = _init_distributed(args)
+    is_main_process = rank == 0
 
     os.environ["HF_ENDPOINT"] = args.hf_endpoint
     os.environ["HF_HOME"] = args.hf_home
-    logger.info(f"HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
-    logger.info(f"HF_HOME={os.environ['HF_HOME']}")
+    if is_main_process:
+        logger.info(f"HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
+        logger.info(f"HF_HOME={os.environ['HF_HOME']}")
+        if distributed:
+            logger.info(f"Distributed training enabled: rank={rank}, local_rank={local_rank}, world_size={world_size}")
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         logger.warning("CUDA requested but not available, falling back to CPU")
@@ -304,17 +335,20 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    logger.info(f"Training configuration: {args}")
+    if is_main_process:
+        logger.info(f"Training configuration: {args}")
 
     # Load data
-    logger.info(f"Loading data from: {args.data_dir}")
+    if is_main_process:
+        logger.info(f"Loading data from: {args.data_dir}")
 
     data_path = Path(args.data_dir)
     split_yaml = Path(args.split_yaml) if args.split_yaml is not None else data_path / "train_test_split_config.yaml"
     train_dirs, train_frames, val_dirs, val_frames = _load_split_from_yaml(data_path, split_yaml)
 
-    logger.info(f"Loaded split file: {split_yaml}")
-    logger.info(f"Training on {len(train_dirs)} drives, validating on {len(val_dirs)} drives")
+    if is_main_process:
+        logger.info(f"Loaded split file: {split_yaml}")
+        logger.info(f"Training on {len(train_dirs)} drives, validating on {len(val_dirs)} drives")
 
     common_dataset_kwargs = dict(
         mode=args.dataset_mode,
@@ -355,11 +389,21 @@ def main():
         **val_dataset_kwargs,
     )
 
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=args.seed,
+        drop_last=True,
+    ) if distributed else None
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
@@ -375,10 +419,12 @@ def main():
         collate_fn=_safe_collate,
     )
 
-    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    if is_main_process:
+        logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     # Load model
-    logger.info("Loading model...")
+    if is_main_process:
+        logger.info("Loading model...")
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
@@ -388,21 +434,26 @@ def main():
         cond_drop_prob=args.cond_drop_prob,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":
-        logger.info(
+        if is_main_process:
+            logger.info(
             "Training keeps model weights in fp32; mixed precision is applied via autocast only"
-        )
+            )
     if hasattr(model.unet, "enable_gradient_checkpointing"):
         model.unet.enable_gradient_checkpointing()
-        logger.info("Enabled UNet gradient checkpointing")
+        if is_main_process:
+            logger.info("Enabled UNet gradient checkpointing")
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")
-        logger.info("Enabled UNet attention slicing")
+        if is_main_process:
+            logger.info("Enabled UNet attention slicing")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
-        logger.info("Enabled VAE slicing")
+        if is_main_process:
+            logger.info("Enabled VAE slicing")
 
     # Create trainer
-    logger.info("Creating trainer...")
+    if is_main_process:
+        logger.info("Creating trainer...")
     trainer = SDTrainer(
         model=model,
         train_dataloader=train_loader,
@@ -432,22 +483,30 @@ def main():
         visualization_inference_steps=args.visualization_inference_steps,
         visualization_guidance_scale=args.guidance_scale,
         visualization_seed=args.visualization_seed,
+        distributed=distributed,
+        local_rank=local_rank,
     )
 
     if args.init_checkpoint is not None:
-        logger.info(f"Initializing model weights from checkpoint: {args.init_checkpoint}")
+        if is_main_process:
+            logger.info(f"Initializing model weights from checkpoint: {args.init_checkpoint}")
         load_model_checkpoint(
-            trainer.model,
+            trainer.unwrapped_model,
             Path(args.init_checkpoint),
             args.device,
             allow_missing_prefixes=("unet.reading_blocks.",),
         )
 
     # Start training
-    logger.info("Starting training...")
-    trainer.train(resume_from=args.resume)
+    if is_main_process:
+        logger.info("Starting training...")
+    try:
+        trainer.train(resume_from=args.resume)
+    finally:
+        _cleanup_distributed(distributed)
 
-    logger.info("Training completed!")
+    if is_main_process:
+        logger.info("Training completed!")
 
 
 if __name__ == "__main__":

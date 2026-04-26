@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from diffusers import (
@@ -706,8 +708,15 @@ class SDTrainer:
         visualization_inference_steps: int = 20,
         visualization_guidance_scale: float = 1.0,
         visualization_seed: int = 42,
+        distributed: bool = False,
+        local_rank: int = 0,
     ):
         self.model = model.to(device)
+        self.distributed = bool(distributed)
+        self.local_rank = int(local_rank)
+        self.rank = dist.get_rank() if self.distributed and dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if self.distributed and dist.is_initialized() else 1
+        self.is_main_process = self.rank == 0
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.learning_rate = learning_rate
@@ -720,7 +729,7 @@ class SDTrainer:
         self.save_every = save_every
         self.log_every = log_every
         self.device = device
-        self.use_wandb = use_wandb
+        self.use_wandb = bool(use_wandb) and self.is_main_process
         self.project_name = project_name
         self.wandb_run_name = wandb_run_name
         self.wandb_entity = wandb_entity
@@ -733,7 +742,8 @@ class SDTrainer:
         self.visualization_guidance_scale = float(visualization_guidance_scale)
         self.visualization_seed = int(visualization_seed)
         self.visualization_dir = self.output_dir / "visualizations"
-        self.visualization_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main_process:
+            self.visualization_dir.mkdir(parents=True, exist_ok=True)
         self.tensorboard_log_dir = Path(tensorboard_log_dir) if tensorboard_log_dir is not None else self.output_dir / "tensorboard"
         self.tb_writer = None
         self.mixed_precision = None if mixed_precision is None else mixed_precision.lower()
@@ -750,17 +760,26 @@ class SDTrainer:
         )
 
         # Setup output dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main_process:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._barrier()
 
         # Reading blocks are created lazily on first forward. Materialize them before
         # building the optimizer so their parameters are actually trainable.
         self._materialize_lazy_condition_modules()
         self._ensure_trainable_params_fp32()
         self._assert_no_trainable_fp16_params()
+        if self.distributed:
+            self.model = DistributedDataParallel(
+                self.model,
+                device_ids=[self.local_rank] if self.device.startswith("cuda") else None,
+                output_device=self.local_rank if self.device.startswith("cuda") else None,
+                find_unused_parameters=True,
+            )
 
         # Setup optimizer
         self.optimizer = AdamW(
-            [p for p in model.parameters() if p.requires_grad],
+            [p for p in self.model.parameters() if p.requires_grad],
             lr=learning_rate,
             weight_decay=weight_decay,
         )
@@ -778,7 +797,7 @@ class SDTrainer:
         )
 
         # Setup wandb
-        if use_wandb:
+        if use_wandb and self.is_main_process:
             if not is_wandb_available():
                 raise ImportError("Please install wandb to use logging: pip install wandb")
             import wandb
@@ -789,7 +808,7 @@ class SDTrainer:
                 mode=wandb_mode,
                 config=run_config,
             )
-        if use_tensorboard:
+        if use_tensorboard and self.is_main_process:
             try:
                 from tensorboardX import SummaryWriter
             except ImportError as exc:
@@ -799,24 +818,42 @@ class SDTrainer:
             self.tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
             self.tb_writer = SummaryWriter(logdir=str(self.tensorboard_log_dir))
 
-        logger.info(f"[SDTrainer] Initialized")
-        logger.info(f"  Learning rate: {learning_rate}")
-        logger.info(f"  Num epochs: {num_train_epochs}")
-        logger.info(f"  Batch size: {train_dataloader.batch_size}")
-        logger.info(f"  Mixed precision: {self.mixed_precision or 'disabled'}")
-        logger.info(f"  Max grad norm: {self.max_grad_norm}")
-        if self.use_wandb:
-            logger.info(
-                f"  W&B logging: project={self.project_name}, "
-                f"run_name={self.wandb_run_name or 'auto'}, mode={self.wandb_mode}"
-            )
-        if self.tb_writer is not None:
-            logger.info(f"  TensorBoard log dir: {self.tensorboard_log_dir}")
-        if self.visualize_every > 0 and self.num_visualizations > 0:
-            logger.info(
-                f"  Visualization: every {self.visualize_every} epoch(s), "
-                f"{self.num_visualizations} sample(s), {self.visualization_inference_steps} denoise steps"
-            )
+        if self.is_main_process:
+            logger.info(f"[SDTrainer] Initialized")
+            logger.info(f"  Distributed: {self.distributed} (world_size={self.world_size})")
+            logger.info(f"  Learning rate: {learning_rate}")
+            logger.info(f"  Num epochs: {num_train_epochs}")
+            logger.info(f"  Batch size per process: {train_dataloader.batch_size}")
+            logger.info(f"  Mixed precision: {self.mixed_precision or 'disabled'}")
+            logger.info(f"  Max grad norm: {self.max_grad_norm}")
+            if self.use_wandb:
+                logger.info(
+                    f"  W&B logging: project={self.project_name}, "
+                    f"run_name={self.wandb_run_name or 'auto'}, mode={self.wandb_mode}"
+                )
+            if self.tb_writer is not None:
+                logger.info(f"  TensorBoard log dir: {self.tensorboard_log_dir}")
+            if self.visualize_every > 0 and self.num_visualizations > 0:
+                logger.info(
+                    f"  Visualization: every {self.visualize_every} epoch(s), "
+                    f"{self.num_visualizations} sample(s), {self.visualization_inference_steps} denoise steps"
+                )
+
+    @property
+    def unwrapped_model(self) -> SatelliteConditionedSDModel:
+        return self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+
+    def _barrier(self) -> None:
+        if self.distributed and dist.is_initialized():
+            dist.barrier()
+
+    def _reduce_mean(self, value: float, device: str) -> float:
+        if not self.distributed or not dist.is_initialized():
+            return float(value)
+        tensor = torch.tensor(float(value), device=device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor /= float(self.world_size)
+        return float(tensor.item())
 
     @torch.no_grad()
     def _materialize_lazy_condition_modules(self) -> None:
@@ -970,20 +1007,22 @@ class SDTrainer:
 
         try:
             for epoch in range(start_epoch, self.num_train_epochs):
-                logger.info(f"Epoch {epoch + 1}/{self.num_train_epochs}")
+                if self.is_main_process:
+                    logger.info(f"Epoch {epoch + 1}/{self.num_train_epochs}")
                 train_raw_loss = self._train_epoch(epoch)
-                logger.info(f"  Train raw loss: {train_raw_loss:.4f}")
                 epoch_step = self._global_step(epoch, max(0, len(self.train_dataloader) - 1))
-                self._log_scalars(
-                    {
-                        "train/epoch_raw_loss": train_raw_loss,
-                        "train/epoch": epoch + 1,
-                    },
-                    step=epoch_step,
-                )
+                if self.is_main_process:
+                    logger.info(f"  Train raw loss: {train_raw_loss:.4f}")
+                    self._log_scalars(
+                        {
+                            "train/epoch_raw_loss": train_raw_loss,
+                            "train/epoch": epoch + 1,
+                        },
+                        step=epoch_step,
+                    )
 
                 # Validate
-                if self.val_dataloader is not None:
+                if self.val_dataloader is not None and self.is_main_process:
                     val_loss = self._validate(epoch)
                     logger.info(f"  Val loss: {val_loss:.4f}")
                     self._log_scalars(
@@ -993,13 +1032,16 @@ class SDTrainer:
                         },
                         step=epoch_step,
                     )
+                self._barrier()
 
-                if self.visualize_every > 0 and self.num_visualizations > 0 and (epoch + 1) % self.visualize_every == 0:
+                if self.is_main_process and self.visualize_every > 0 and self.num_visualizations > 0 and (epoch + 1) % self.visualize_every == 0:
                     self._save_visualizations(epoch)
+                self._barrier()
 
                 # Save checkpoint
-                if (epoch + 1) % self.save_every == 0 or (epoch + 1) == self.num_train_epochs:
+                if self.is_main_process and ((epoch + 1) % self.save_every == 0 or (epoch + 1) == self.num_train_epochs):
                     self._save_checkpoint(epoch)
+                self._barrier()
         finally:
             self._close_loggers()
 
@@ -1010,7 +1052,15 @@ class SDTrainer:
         num_batches = len(self.train_dataloader)
         self.optimizer.zero_grad(set_to_none=True)
 
-        progress_bar = tqdm(self.train_dataloader, desc=f"Train Epoch {epoch+1}")
+        sampler = getattr(self.train_dataloader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+
+        progress_bar = tqdm(
+            self.train_dataloader,
+            desc=f"Train Epoch {epoch+1}",
+            disable=not self.is_main_process,
+        )
 
         for step, batch in enumerate(progress_bar):
             # Move data to device
@@ -1074,10 +1124,11 @@ class SDTrainer:
             geom_ratio = outputs.get('reading_logits_geom_to_sem_ratio_mean')
             if torch.is_tensor(geom_ratio):
                 postfix['geom/sem'] = f"{geom_ratio.item():.2f}"
-            progress_bar.set_postfix(postfix)
+            if self.is_main_process:
+                progress_bar.set_postfix(postfix)
 
             # Log
-            if (step + 1) % self.log_every == 0:
+            if self.is_main_process and (step + 1) % self.log_every == 0:
                 geom_std = outputs.get('reading_logits_geom_std_mean')
                 sem_std = outputs.get('reading_logits_sem_std_mean')
                 geom_ratio = outputs.get('reading_logits_geom_to_sem_ratio_mean')
@@ -1118,12 +1169,15 @@ class SDTrainer:
                     log_payload['reading/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
-        return total_raw_loss / num_batches
+        local_mean = total_raw_loss / max(1, num_batches)
+        return self._reduce_mean(local_mean, self.device)
 
     @torch.no_grad()
     def _validate(self, epoch: int) -> float:
         """Validate the model."""
-        self.model.eval()
+        eval_model = self.unwrapped_model
+        was_training = eval_model.training
+        eval_model.eval()
         total_loss = 0.0
 
         for batch in tqdm(self.val_dataloader, desc=f"Val Epoch {epoch+1}"):
@@ -1143,7 +1197,7 @@ class SDTrainer:
                 dtype=self.amp_dtype,
                 enabled=self.use_amp,
             ):
-                outputs = self.model(
+                outputs = eval_model(
                     sat_images,
                     target_images,
                     coords_map=coords_map,
@@ -1152,6 +1206,8 @@ class SDTrainer:
                 loss = outputs['loss']
             total_loss += loss.item()
 
+        if was_training:
+            eval_model.train()
         return total_loss / len(self.val_dataloader)
 
     def _save_checkpoint(self, epoch: int):
@@ -1161,7 +1217,7 @@ class SDTrainer:
 
         checkpoint = {
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': self.unwrapped_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.lr_scheduler.state_dict(),
         }
@@ -1252,9 +1308,10 @@ class SDTrainer:
         generator = torch.Generator(device=generator_device)
         generator.manual_seed(self.visualization_seed)
 
-        was_training = self.model.training
-        self.model.eval()
-        generated_images = self.model.generate(
+        eval_model = self.unwrapped_model
+        was_training = eval_model.training
+        eval_model.eval()
+        generated_images = eval_model.generate(
             sat_images,
             coords_map=coords_map,
             plucker_map=plucker_map,
@@ -1264,7 +1321,7 @@ class SDTrainer:
             generator=generator,
         )
         if was_training:
-            self.model.train()
+            eval_model.train()
 
         epoch_dir = self.visualization_dir / f"epoch_{epoch + 1:04d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
@@ -1296,7 +1353,7 @@ class SDTrainer:
     def _load_checkpoint(self, checkpoint_path: str):
         """Load from checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        load_model_state_dict(self.model, checkpoint['model_state_dict'])
+        load_model_state_dict(self.unwrapped_model, checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         logger.info(f"Checkpoint loaded: {checkpoint_path}")
