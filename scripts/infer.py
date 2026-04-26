@@ -52,6 +52,13 @@ FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = (
     ("yaw_p120", 120.0),
 )
 
+ABLATION_MODE_CONFIGS: Dict[str, Tuple[str, str]] = {
+    "normal": ("normal", "normal"),
+    "sat_zero": ("zero", "normal"),
+    "plucker_zero": ("normal", "zero"),
+    "sat_plucker_zero": ("zero", "zero"),
+}
+
 
 def _load_frame_ids(frames_file: Path) -> List[int]:
     frame_ids: List[int] = []
@@ -170,6 +177,25 @@ def _parse_args() -> argparse.Namespace:
         choices=["normal", "zero"],
         help="Use zero for satellite-conditioning ablation.",
     )
+    parser.add_argument(
+        "--plucker_condition_mode",
+        type=str,
+        default="normal",
+        choices=["normal", "zero"],
+        help="Use zero for Plucker-conditioning ablation.",
+    )
+    parser.add_argument(
+        "--ablation_modes",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=list(ABLATION_MODE_CONFIGS.keys()),
+        help=(
+            "Optional suite of ablations to run in one command. "
+            "When set, this overrides --sat_condition_mode and --plucker_condition_mode "
+            "and writes each ablation under a separate output subdirectory."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -192,6 +218,18 @@ def _view_token(view_name: str, yaw: Optional[float]) -> str:
         return view_name
     token = f"yaw_{yaw:g}".replace("-", "m").replace(".", "p")
     return token
+
+
+def _resolve_ablation_runs(args: argparse.Namespace) -> List[Tuple[Optional[str], str, str]]:
+    """Return (output_subdir, sat_condition_mode, plucker_condition_mode)."""
+    if args.ablation_modes is None:
+        return [(None, args.sat_condition_mode, args.plucker_condition_mode)]
+
+    runs: List[Tuple[Optional[str], str, str]] = []
+    for mode_name in args.ablation_modes:
+        sat_mode, plucker_mode = ABLATION_MODE_CONFIGS[mode_name]
+        runs.append((mode_name, sat_mode, plucker_mode))
+    return runs
 
 
 def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
@@ -528,12 +566,18 @@ def _generate_one(
     model,
     sample: Dict,
     args: argparse.Namespace,
+    sat_condition_mode: str,
+    plucker_condition_mode: str,
 ) -> torch.Tensor:
     sat_image = sample["sat"].unsqueeze(0).to(args.device)
     coords_map = sample.get("coords_map")
     coords_map = coords_map.unsqueeze(0).to(args.device) if coords_map is not None else None
     plucker_map = sample.get("plucker_map")
     plucker_map = plucker_map.unsqueeze(0).to(args.device) if plucker_map is not None else None
+    if plucker_condition_mode == "zero" and plucker_map is not None:
+        plucker_map = torch.zeros_like(plucker_map)
+    elif plucker_condition_mode != "normal":
+        raise ValueError(f"Unknown plucker_condition_mode: {plucker_condition_mode}")
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
 
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
@@ -548,7 +592,7 @@ def _generate_one(
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         generator=generator,
-        sat_condition_mode=args.sat_condition_mode,
+        sat_condition_mode=sat_condition_mode,
     )[0].cpu()
 
 
@@ -558,6 +602,9 @@ def _save_view_outputs(
     output_dir: Path,
     view_name: str,
     yaw: Optional[float],
+    ablation_mode: Optional[str],
+    sat_condition_mode: str,
+    plucker_condition_mode: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     gt_image = sample["image"]
@@ -584,6 +631,9 @@ def _save_view_outputs(
         "frame_id": int(sample["frame_id"]),
         "view_name": view_name,
         "vehicle_yaw_deg": None if yaw is None else float(yaw),
+        "ablation_mode": ablation_mode,
+        "sat_condition_mode": sat_condition_mode,
+        "plucker_condition_mode": plucker_condition_mode,
         "meta": sample.get("meta", {}),
     }
     with open(output_dir / "metadata.yaml", "w") as f:
@@ -630,26 +680,48 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
 
     output_root = Path(args.output_dir)
     base_sample = dataset.samples[sample_index]
-    sample_dir = output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_yaw_sweep"
+    ablation_runs = _resolve_ablation_runs(args)
 
-    for view_name, yaw in view_specs:
-        logger.info(f"Generating frame={base_sample.frame_id:010d}, view={view_name}, yaw={yaw}")
-        sample = _get_view_sample(dataset, sample_index, view_name, yaw)
-        generated = _generate_one(model, sample, args)
-        _save_view_outputs(sample, generated, sample_dir / _view_token(view_name, yaw), view_name, yaw)
+    for ablation_name, sat_mode, plucker_mode in ablation_runs:
+        active_output_root = output_root / ablation_name if ablation_name is not None else output_root
+        sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_yaw_sweep"
 
-    with open(sample_dir / "run_metadata.yaml", "w") as f:
-        yaml.safe_dump(
-            {
-                "checkpoint": str(Path(args.checkpoint).resolve()),
-                "checkpoint_epoch": checkpoint_meta.get("epoch"),
-                "mode": args.mode,
-                "views": [{"view_name": name, "vehicle_yaw_deg": yaw} for name, yaw in view_specs],
-            },
-            f,
-            sort_keys=False,
-        )
-    logger.info(f"Saved single-frame yaw sweep to: {sample_dir}")
+        for view_name, yaw in view_specs:
+            logger.info(
+                "Generating frame=%s, view=%s, yaw=%s, ablation=%s",
+                f"{base_sample.frame_id:010d}",
+                view_name,
+                yaw,
+                ablation_name or "custom",
+            )
+            sample = _get_view_sample(dataset, sample_index, view_name, yaw)
+            generated = _generate_one(model, sample, args, sat_mode, plucker_mode)
+            _save_view_outputs(
+                sample,
+                generated,
+                sample_dir / _view_token(view_name, yaw),
+                view_name,
+                yaw,
+                ablation_name,
+                sat_mode,
+                plucker_mode,
+            )
+
+        with open(sample_dir / "run_metadata.yaml", "w") as f:
+            yaml.safe_dump(
+                {
+                    "checkpoint": str(Path(args.checkpoint).resolve()),
+                    "checkpoint_epoch": checkpoint_meta.get("epoch"),
+                    "mode": args.mode,
+                    "ablation_mode": ablation_name,
+                    "sat_condition_mode": sat_mode,
+                    "plucker_condition_mode": plucker_mode,
+                    "views": [{"view_name": name, "vehicle_yaw_deg": yaw} for name, yaw in view_specs],
+                },
+                f,
+                sort_keys=False,
+            )
+        logger.info(f"Saved single-frame yaw sweep to: {sample_dir}")
 
 
 def run_split_fixed_views(args: argparse.Namespace) -> None:
@@ -669,37 +741,56 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
     model, checkpoint_meta = _load_model(args, materialize_sample)
 
     output_root = Path(args.output_dir)
-    progress = tqdm(sample_indices, desc="Split fixed-view inference")
-    for sample_index in progress:
-        base_sample = dataset.samples[sample_index]
-        frame_dir = output_root / base_sample.drive_dir.name / f"frame_{base_sample.frame_id:010d}"
-        for view_name, yaw in FIXED_VIEW_SPECS:
-            progress.set_postfix(frame=f"{base_sample.frame_id:010d}", view=view_name)
-            sample = _get_view_sample(dataset, sample_index, view_name, yaw)
-            generated = _generate_one(model, sample, args)
-            _save_view_outputs(sample, generated, frame_dir / _view_token(view_name, yaw), view_name, yaw)
+    ablation_runs = _resolve_ablation_runs(args)
+    for ablation_name, sat_mode, plucker_mode in ablation_runs:
+        active_output_root = output_root / ablation_name if ablation_name is not None else output_root
+        progress = tqdm(sample_indices, desc=f"Split fixed-view inference [{ablation_name or 'custom'}]")
+        for sample_index in progress:
+            base_sample = dataset.samples[sample_index]
+            frame_dir = active_output_root / base_sample.drive_dir.name / f"frame_{base_sample.frame_id:010d}"
+            for view_name, yaw in FIXED_VIEW_SPECS:
+                progress.set_postfix(
+                    frame=f"{base_sample.frame_id:010d}",
+                    view=view_name,
+                    ablation=ablation_name or "custom",
+                )
+                sample = _get_view_sample(dataset, sample_index, view_name, yaw)
+                generated = _generate_one(model, sample, args, sat_mode, plucker_mode)
+                _save_view_outputs(
+                    sample,
+                    generated,
+                    frame_dir / _view_token(view_name, yaw),
+                    view_name,
+                    yaw,
+                    ablation_name,
+                    sat_mode,
+                    plucker_mode,
+                )
 
-    with open(output_root / "run_metadata.yaml", "w") as f:
-        yaml.safe_dump(
-            {
-                "checkpoint": str(Path(args.checkpoint).resolve()),
-                "checkpoint_epoch": checkpoint_meta.get("epoch"),
-                "mode": args.mode,
-                "dataset_split": args.dataset_split,
-                "split_yaml": str(Path(args.split_yaml)),
-                "start_frame": args.start_frame,
-                "end_frame": args.end_frame,
-                "max_frames": args.max_frames,
-                "num_frames": len(sample_indices),
-                "fixed_views": [
-                    {"view_name": view_name, "vehicle_yaw_deg": yaw}
-                    for view_name, yaw in FIXED_VIEW_SPECS
-                ],
-            },
-            f,
-            sort_keys=False,
-        )
-    logger.info(f"Saved split fixed-view inference to: {output_root}")
+        with open(active_output_root / "run_metadata.yaml", "w") as f:
+            yaml.safe_dump(
+                {
+                    "checkpoint": str(Path(args.checkpoint).resolve()),
+                    "checkpoint_epoch": checkpoint_meta.get("epoch"),
+                    "mode": args.mode,
+                    "dataset_split": args.dataset_split,
+                    "split_yaml": str(Path(args.split_yaml)),
+                    "start_frame": args.start_frame,
+                    "end_frame": args.end_frame,
+                    "max_frames": args.max_frames,
+                    "num_frames": len(sample_indices),
+                    "ablation_mode": ablation_name,
+                    "sat_condition_mode": sat_mode,
+                    "plucker_condition_mode": plucker_mode,
+                    "fixed_views": [
+                        {"view_name": view_name, "vehicle_yaw_deg": yaw}
+                        for view_name, yaw in FIXED_VIEW_SPECS
+                    ],
+                },
+                f,
+                sort_keys=False,
+            )
+        logger.info(f"Saved split fixed-view inference to: {active_output_root}")
 
 
 def main() -> None:
