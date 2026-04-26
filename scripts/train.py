@@ -414,7 +414,7 @@ def main():
         warmup_epochs=args.warmup,
         gradient_accumulation_steps=args.gradient_accumulation,
         output_dir=args.output_dir,
-        save_every=10,
+        save_every=50,
         log_every=100,
         device=args.device,
         use_wandb=args.use_wandb,
