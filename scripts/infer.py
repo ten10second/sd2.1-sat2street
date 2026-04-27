@@ -56,6 +56,7 @@ ABLATION_MODE_CONFIGS: Dict[str, Tuple[str, str]] = {
     "normal": ("normal", "normal"),
     "sat_zero": ("zero", "normal"),
     "plucker_zero": ("normal", "zero"),
+    "plucker_none": ("normal", "none"),
     "sat_plucker_zero": ("zero", "zero"),
 }
 
@@ -181,8 +182,8 @@ def _parse_args() -> argparse.Namespace:
         "--plucker_condition_mode",
         type=str,
         default="normal",
-        choices=["normal", "zero"],
-        help="Use zero for Plucker-conditioning ablation.",
+        choices=["normal", "zero", "none"],
+        help="Use zero or none for Plucker-conditioning ablation.",
     )
     parser.add_argument(
         "--ablation_modes",
@@ -576,6 +577,8 @@ def _generate_one(
     plucker_map = plucker_map.unsqueeze(0).to(args.device) if plucker_map is not None else None
     if plucker_condition_mode == "zero" and plucker_map is not None:
         plucker_map = torch.zeros_like(plucker_map)
+    elif plucker_condition_mode == "none":
+        plucker_map = None
     elif plucker_condition_mode != "normal":
         raise ValueError(f"Unknown plucker_condition_mode: {plucker_condition_mode}")
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
