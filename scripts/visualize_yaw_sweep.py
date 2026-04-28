@@ -296,6 +296,8 @@ def _materialize_lazy_modules(
     model,
     sat_images: torch.Tensor,
     coords_map: Optional[torch.Tensor],
+    coords_valid_mask: Optional[torch.Tensor],
+    plucker_map: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
     sat_encoded = model.encode_satellite(sat_images, coords_map)
@@ -322,6 +324,8 @@ def _materialize_lazy_modules(
         sat_tokens=sat_tokens,
         sat_xy=sat_xy,
         front_bev_xy=coords_map,
+        front_bev_valid_mask=coords_valid_mask,
+        front_plucker=plucker_map,
         return_attn_map=False,
     )
 
@@ -369,8 +373,12 @@ def main() -> None:
     model.eval()
 
     coords_map_90 = sample_90["coords_map"].unsqueeze(0).to(args.device)
-    logger.info("Materializing lazy reading blocks before loading checkpoint")
-    _materialize_lazy_modules(model, sat_image, coords_map_90, target_size)
+    coords_valid_mask_90 = sample_90.get("coords_valid_mask")
+    coords_valid_mask_90 = coords_valid_mask_90.unsqueeze(0).to(args.device) if coords_valid_mask_90 is not None else None
+    plucker_map_90 = sample_90.get("plucker_map")
+    plucker_map_90 = plucker_map_90.unsqueeze(0).to(args.device) if plucker_map_90 is not None else None
+    logger.info("Materializing lazy transport blocks before loading checkpoint")
+    _materialize_lazy_modules(model, sat_image, coords_map_90, coords_valid_mask_90, plucker_map_90, target_size)
 
     load_model_checkpoint(
         model,
@@ -396,6 +404,8 @@ def main() -> None:
         sample = _get_sample_with_vehicle_yaw(dataset, sample_index, yaw)
         real_image = sample["image"]
         coords_map = sample["coords_map"].unsqueeze(0).to(args.device)
+        coords_valid_mask = sample.get("coords_valid_mask")
+        coords_valid_mask = coords_valid_mask.unsqueeze(0).to(args.device) if coords_valid_mask is not None else None
         plucker_map = sample["plucker_map"].unsqueeze(0).to(args.device)
 
         generator = torch.Generator(device=generator_device)
@@ -403,6 +413,7 @@ def main() -> None:
         generated = model.generate(
             sat_image,
             coords_map=coords_map,
+            coords_valid_mask=coords_valid_mask,
             plucker_map=plucker_map,
             target_size=target_size,
             num_inference_steps=args.inference_steps,

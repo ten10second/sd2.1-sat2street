@@ -20,7 +20,7 @@ try:
 except ImportError:
     from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
 
-from models.unet.satellite_reading_block import SatelliteReadingBlock
+from models.unet.geometric_transport_reading import GeometricTransportReadingBlock
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
@@ -45,30 +45,29 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         self.supports_satellite_reading = True
         self.use_satellite_reading = use_satellite_reading
-        self.reading_injection_sites = reading_injection_sites or ["down2", "mid"]
+        self.reading_injection_sites = reading_injection_sites or ["mid", "up0", "up1"]
         sat_in_dim = int(self.config.cross_attention_dim or 768)
         self.reading_block_config = {
             "num_heads": 8,
             "head_dim": 64,
-            "geo_ratio": 0.5,
-            "rope_base": 10000.0,
-            "lambda_geo": 1.0,
-            "lambda_geom": 1.0,
-            "geom_hidden_dim": 128,
-            "geom_head_dim": 16,
-            "gate_hidden_ratio": 0.25,
-            "use_geom_bias": True,
-            "use_gated_residual": True,
+            "lambda_geo": 8.0,
+            "compatibility_scale": 0.1,
+            "sigma_min": 0.03,
+            "sigma_max": 0.35,
+            "invalid_conf_loss_weight": 0.05,
+            "plucker_dropout_prob": 0.3,
         }
         if reading_block_config is not None:
             self.reading_block_config.update(reading_block_config)
 
-        self.reading_blocks = nn.ModuleDict()
+        self.plucker_dropout_prob = float(self.reading_block_config.get("plucker_dropout_prob", 0.0))
+        self.transport_blocks = nn.ModuleDict()
         self._conditioning_context: Dict[str, Any] = {}
         self._reading_hook_handles = []
         self._attn2_sat_hook_handles = []
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
         self.last_reading_stats: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.last_reading_losses: Dict[str, Dict[str, torch.Tensor]] = {}
 
         self._register_attn2_sat_hooks(sat_in_dim=sat_in_dim)
         if self.use_satellite_reading:
@@ -117,37 +116,33 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 return self.up_blocks[index]
         return None
 
-    def _get_or_create_reading_block(
+    def _get_or_create_transport_block(
         self,
         site: str,
         front_feat: torch.Tensor,
         sat_tokens: torch.Tensor,
-    ) -> SatelliteReadingBlock:
-        if site in self.reading_blocks:
-            block = self.reading_blocks[site]
+    ) -> GeometricTransportReadingBlock:
+        if site in self.transport_blocks:
+            block = self.transport_blocks[site]
             block_param = next(block.parameters(), None)
             if block_param is not None and block_param.device != front_feat.device:
                 block = block.to(device=front_feat.device)
-                self.reading_blocks[site] = block
+                self.transport_blocks[site] = block
             return block
 
-        block = SatelliteReadingBlock(
+        block = GeometricTransportReadingBlock(
             front_dim=front_feat.shape[1],
             sat_in_dim=sat_tokens.shape[-1],
             num_heads=self.reading_block_config["num_heads"],
             head_dim=self.reading_block_config["head_dim"],
-            geo_ratio=self.reading_block_config["geo_ratio"],
-            rope_base=self.reading_block_config["rope_base"],
             lambda_geo=self.reading_block_config["lambda_geo"],
-            lambda_geom=self.reading_block_config["lambda_geom"],
-            geom_hidden_dim=self.reading_block_config["geom_hidden_dim"],
-            geom_head_dim=self.reading_block_config["geom_head_dim"],
-            gate_hidden_ratio=self.reading_block_config["gate_hidden_ratio"],
-            use_geom_bias=self.reading_block_config["use_geom_bias"],
-            use_gated_residual=self.reading_block_config["use_gated_residual"],
+            compatibility_scale=self.reading_block_config["compatibility_scale"],
+            sigma_min=self.reading_block_config["sigma_min"],
+            sigma_max=self.reading_block_config["sigma_max"],
+            invalid_conf_loss_weight=self.reading_block_config["invalid_conf_loss_weight"],
         )
         block = block.to(device=front_feat.device)
-        self.reading_blocks[site] = block
+        self.transport_blocks[site] = block
         return block
 
     def _prepare_front_bev_xy(
@@ -228,6 +223,49 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         return None
 
+    def _prepare_front_bev_valid_mask(
+        self,
+        front_bev_valid_mask: Any,
+        site: str,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if front_bev_valid_mask is None:
+            return None
+
+        if isinstance(front_bev_valid_mask, dict):
+            site_mask = front_bev_valid_mask.get(site)
+            if site_mask is None:
+                site_mask = front_bev_valid_mask.get("default")
+            return self._prepare_front_bev_valid_mask(site_mask, site, height, width, device)
+
+        if not torch.is_tensor(front_bev_valid_mask):
+            return None
+
+        mask = front_bev_valid_mask.to(device=device, dtype=torch.float32)
+
+        if mask.ndim == 2:
+            if mask.shape[1] == height * width:
+                return mask > 0.5
+            return None
+
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            if mask.shape[1] == height * width:
+                return mask.squeeze(-1) > 0.5
+            return None
+
+        if mask.ndim == 4 and mask.shape[1] == 1:
+            resized = F.interpolate(mask, size=(height, width), mode="nearest")
+            return resized.reshape(mask.shape[0], height * width) > 0.5
+
+        if mask.ndim == 4 and mask.shape[-1] == 1:
+            mask_chw = mask.permute(0, 3, 1, 2)
+            resized = F.interpolate(mask_chw, size=(height, width), mode="nearest")
+            return resized.reshape(mask.shape[0], height * width) > 0.5
+
+        return None
+
     @staticmethod
     def _feature_condition_mask(condition_mask: torch.Tensor, front_feat: torch.Tensor) -> torch.Tensor:
         if condition_mask.ndim != 1 or condition_mask.shape[0] != front_feat.shape[0]:
@@ -294,6 +332,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             sat_tokens = self._conditioning_context.get("sat_tokens")
             sat_xy = self._conditioning_context.get("sat_xy")
             raw_front_bev_xy = self._conditioning_context.get("front_bev_xy")
+            raw_front_bev_valid_mask = self._conditioning_context.get("front_bev_valid_mask")
             raw_front_plucker = self._conditioning_context.get("front_plucker")
             condition_mask = self._conditioning_context.get("condition_mask")
             if sat_tokens is None or sat_xy is None or raw_front_bev_xy is None:
@@ -309,6 +348,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             )
             if front_bev_xy is None:
                 return output
+            front_bev_valid_mask = self._prepare_front_bev_valid_mask(
+                raw_front_bev_valid_mask,
+                site,
+                front_feat.shape[2],
+                front_feat.shape[3],
+                front_feat.device,
+            )
             front_plucker = self._prepare_front_plucker(
                 raw_front_plucker,
                 site,
@@ -318,12 +364,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 front_feat.dtype,
             )
 
-            block = self._get_or_create_reading_block(site, front_feat, sat_tokens)
+            block = self._get_or_create_transport_block(site, front_feat, sat_tokens)
             block_output = block(
                 front_feat=front_feat,
                 sat_tokens=sat_tokens.to(device=front_feat.device, dtype=front_feat.dtype),
                 sat_xy=sat_xy.to(device=front_feat.device, dtype=front_feat.dtype),
                 front_bev_xy=front_bev_xy,
+                front_bev_valid_mask=front_bev_valid_mask,
                 front_plucker=front_plucker,
                 return_attn_map=self._conditioning_context.get("return_attn_map", False),
             )
@@ -344,6 +391,9 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                         detached_stats[key] = value.detach()
                 if detached_stats:
                     self._conditioning_context.setdefault("reading_stats", {})[site] = detached_stats
+            losses = block_output.get("losses")
+            if losses:
+                self._conditioning_context.setdefault("reading_losses", {})[site] = losses
 
             if is_tuple:
                 return (updated, *output_tail)
@@ -359,6 +409,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         sat_tokens: Optional[torch.Tensor] = None,
         sat_xy: Optional[torch.Tensor] = None,
         front_bev_xy: Optional[torch.Tensor] = None,
+        front_bev_valid_mask: Optional[torch.Tensor] = None,
         front_plucker: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
         return_attn_map: bool = False,
@@ -374,6 +425,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             sat_tokens: (B, Ns, Cs) - Pre-encoded satellite tokens
             sat_xy: (B, Ns, 2) - Satellite token BEV coordinates
             front_bev_xy: (B, Nf, 2) - Frontview pixel BEV coordinates
+            front_bev_valid_mask: (B, 1, H, W) or (B, Nf) - Valid ground-projection mask
             front_plucker: (B, 6, H, W) or (B, Nf, 6) - Per-pixel Plucker ray map
             condition_mask: (B,) - Per-sample mask controlling whether reading injection is enabled
             return_attn_map: Whether to return attention maps
@@ -409,17 +461,20 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 "sat_tokens": inferred_sat_tokens,
                 "sat_xy": inferred_sat_xy,
                 "front_bev_xy": front_bev_xy,
+                "front_bev_valid_mask": front_bev_valid_mask,
                 "front_plucker": front_plucker,
                 "condition_mask": inferred_condition_mask,
                 "return_attn_map": return_attn_map,
                 "attn_maps": {},
                 "reading_stats": {},
+                "reading_losses": {},
             }
         else:
             self._conditioning_context = {}
 
         self.last_attn_maps = {}
         self.last_reading_stats = {}
+        self.last_reading_losses = {}
 
         try:
             output = super().forward(
@@ -435,6 +490,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         if enable_reading:
             self.last_attn_maps = self._conditioning_context.get("attn_maps", {})
             self.last_reading_stats = self._conditioning_context.get("reading_stats", {})
+            self.last_reading_losses = self._conditioning_context.get("reading_losses", {})
 
         # Keep the conditioning context alive after a successful forward so
         # gradient checkpointing can re-run hooked submodules during backward

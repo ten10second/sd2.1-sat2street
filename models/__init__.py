@@ -11,3 +11,4 @@ from .unet.continuous_xy_georope import ContinuousXYGeoRoPE
 from .unet.satellite_reading_attention import SatelliteReadingAttention
 from .unet.gated_residual_inject import GatedResidualInject
 from .unet.satellite_reading_block import SatelliteReadingBlock
+from .unet.geometric_transport_reading import GeometricTransportReadingBlock

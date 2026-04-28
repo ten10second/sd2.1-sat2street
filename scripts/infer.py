@@ -306,6 +306,7 @@ def _coords_to_satellite_pixels(
 
 def _coords_map_to_satellite_pixels(
     coords_map: Optional[torch.Tensor],
+    coords_valid_mask: Optional[torch.Tensor],
     sat_width: int,
     sat_height: int,
 ) -> Tuple[List[Tuple[float, float]], Optional[Tuple[float, float, float, float]]]:
@@ -322,11 +323,25 @@ def _coords_map_to_satellite_pixels(
     else:
         return [], None
 
+    if coords_valid_mask is not None and torch.is_tensor(coords_valid_mask):
+        mask = coords_valid_mask.detach().cpu().to(torch.float32)
+        if mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask.reshape(-1)
+        elif mask.ndim == 2:
+            mask = mask.reshape(-1)
+        elif mask.ndim == 1:
+            pass
+        else:
+            mask = None
+        if mask is not None and mask.shape[0] == coords.shape[0]:
+            coords = coords[mask > 0.5]
+
     return _coords_to_satellite_pixels(coords, sat_width, sat_height)
 
 
 def _coords_map_to_fov_polygon(
     coords_map: Optional[torch.Tensor],
+    coords_valid_mask: Optional[torch.Tensor],
     sat_width: int,
     sat_height: int,
 ) -> List[Tuple[float, float]]:
@@ -345,6 +360,31 @@ def _coords_map_to_fov_polygon(
     if height < 2 or width < 2:
         return []
 
+    if coords_valid_mask is not None and torch.is_tensor(coords_valid_mask):
+        valid = coords_valid_mask.detach().cpu().to(torch.float32)
+        if valid.ndim == 3 and valid.shape[0] == 1:
+            valid_hw = valid[0]
+        elif valid.ndim == 2:
+            valid_hw = valid
+        else:
+            valid_hw = None
+    else:
+        valid_hw = None
+
+    if valid_hw is not None and valid_hw.shape == coords_hw.shape[:2]:
+        coords_flat = coords_hw.reshape(-1, 2)
+        valid_flat = valid_hw.reshape(-1) > 0.5
+        points, bbox = _coords_to_satellite_pixels(coords_flat[valid_flat], sat_width, sat_height)
+        if bbox is None:
+            return []
+        left_px, top_px, right_px, bottom_px = bbox
+        return [
+            (left_px, top_px),
+            (right_px, top_px),
+            (right_px, bottom_px),
+            (left_px, bottom_px),
+        ]
+
     top = coords_hw[0, :, :]
     right = coords_hw[:, width - 1, :]
     bottom = torch.flip(coords_hw[height - 1, :, :], dims=[0])
@@ -353,7 +393,7 @@ def _coords_map_to_fov_polygon(
     points, _ = _coords_to_satellite_pixels(boundary, sat_width, sat_height)
 
     if len(points) < 3:
-        all_points, bbox = _coords_map_to_satellite_pixels(coords_hw, sat_width, sat_height)
+        all_points, bbox = _coords_map_to_satellite_pixels(coords_hw, None, sat_width, sat_height)
         if bbox is None:
             return []
         left_px, top_px, right_px, bottom_px = bbox
@@ -369,13 +409,14 @@ def _coords_map_to_fov_polygon(
 def _draw_satellite_coverage(
     sat_image: torch.Tensor,
     coords_map: Optional[torch.Tensor],
+    coords_valid_mask: Optional[torch.Tensor],
     view_name: str,
     yaw: Optional[float],
 ) -> Image.Image:
     image = _tensor_to_pil(sat_image).convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
     width, height = image.size
-    polygon = _coords_map_to_fov_polygon(coords_map, width, height)
+    polygon = _coords_map_to_fov_polygon(coords_map, coords_valid_mask, width, height)
 
     # Ego vehicle is at the satellite crop center by construction.
     center = (width / 2.0, height / 2.0)
@@ -499,6 +540,8 @@ def _materialize_lazy_modules(
     sat_images = sample["sat"].unsqueeze(0).to(device)
     coords_map = sample.get("coords_map")
     coords_map = coords_map.unsqueeze(0).to(device) if coords_map is not None else None
+    coords_valid_mask = sample.get("coords_valid_mask")
+    coords_valid_mask = coords_valid_mask.unsqueeze(0).to(device) if coords_valid_mask is not None else None
     plucker_map = sample.get("plucker_map")
     plucker_map = plucker_map.unsqueeze(0).to(device) if plucker_map is not None else None
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
@@ -527,6 +570,7 @@ def _materialize_lazy_modules(
         sat_tokens=sat_tokens,
         sat_xy=sat_xy,
         front_bev_xy=coords_map,
+        front_bev_valid_mask=coords_valid_mask,
         front_plucker=plucker_map,
         return_attn_map=False,
     )
@@ -555,7 +599,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     model.to(args.device)
     model.eval()
 
-    logger.info("Materializing lazy reading blocks before loading checkpoint")
+    logger.info("Materializing lazy transport blocks before loading checkpoint")
     _materialize_lazy_modules(model, materialize_sample, args.device)
     checkpoint_meta = load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()
@@ -573,6 +617,8 @@ def _generate_one(
     sat_image = sample["sat"].unsqueeze(0).to(args.device)
     coords_map = sample.get("coords_map")
     coords_map = coords_map.unsqueeze(0).to(args.device) if coords_map is not None else None
+    coords_valid_mask = sample.get("coords_valid_mask")
+    coords_valid_mask = coords_valid_mask.unsqueeze(0).to(args.device) if coords_valid_mask is not None else None
     plucker_map = sample.get("plucker_map")
     plucker_map = plucker_map.unsqueeze(0).to(args.device) if plucker_map is not None else None
     if plucker_condition_mode == "zero" and plucker_map is not None:
@@ -590,6 +636,7 @@ def _generate_one(
     return model.generate(
         sat_image,
         coords_map=coords_map,
+        coords_valid_mask=coords_valid_mask,
         plucker_map=plucker_map,
         target_size=target_size,
         num_inference_steps=args.num_inference_steps,
@@ -615,6 +662,7 @@ def _save_view_outputs(
     sat_overlay = _draw_satellite_coverage(
         sample["sat"],
         sample.get("coords_map"),
+        sample.get("coords_valid_mask"),
         view_name,
         yaw,
     ).resize((sat_resized.shape[-1], sat_resized.shape[-2]), resample=Image.BILINEAR)

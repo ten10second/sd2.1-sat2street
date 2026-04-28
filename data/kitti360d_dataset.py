@@ -310,7 +310,8 @@ def compute_camera_bev_xy(
     sat_w: int = 512,
     sat_h: int = 512,
     cam_height: float = DEFAULT_CAMERA_HEIGHT_M,
-) -> torch.Tensor:
+    return_valid_mask: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Project camera rays to the ground plane and return normalized BEV xy.
 
     If ``T_imu_to_world`` is provided, the BEV coordinates are centered on the IMU
@@ -353,7 +354,12 @@ def compute_camera_bev_xy(
     bev_y_norm[invalid] = 0.0
 
     bev_xy = np.stack([bev_x_norm, bev_y_norm], axis=0).reshape(2, height, width)
-    return torch.from_numpy(bev_xy).to(torch.float32).contiguous()
+    bev_xy_t = torch.from_numpy(bev_xy).to(torch.float32).contiguous()
+    valid_mask = (~invalid).astype(np.float32).reshape(1, height, width)
+    valid_mask_t = torch.from_numpy(valid_mask).to(torch.float32).contiguous()
+    if return_valid_mask:
+        return bev_xy_t, valid_mask_t
+    return bev_xy_t
 
 
 def compute_plucker_map(
@@ -853,6 +859,7 @@ class Kitti360dDataset(Dataset):
             physical_camera = fisheye_camera_used
         camera_height_m = _get_camera_height_m(physical_camera)
         front_bev_xy = self._get_front_bev_xy(int(h), int(w))
+        front_bev_valid_mask = torch.zeros(1, h, w, dtype=torch.float32)
         return {
             "image": torch.zeros(3, h, w, dtype=torch.float32),
             "sat": torch.zeros(3, self.sat_size[1], self.sat_size[0], dtype=torch.float32),
@@ -861,6 +868,8 @@ class Kitti360dDataset(Dataset):
             "camera_height_m": camera_height_m,
             "front_bev_xy": front_bev_xy,
             "coords_map": front_bev_xy,
+            "front_bev_valid_mask": front_bev_valid_mask,
+            "coords_valid_mask": front_bev_valid_mask,
             "plucker_map": torch.zeros(6, h, w, dtype=torch.float32),
             "K": torch.eye(3, dtype=torch.float32),
             "T_pose_cam": torch.eye(4, dtype=torch.float32),
@@ -1133,7 +1142,7 @@ class Kitti360dDataset(Dataset):
             return self._get_dummy_sample(s)
 
         if K is not None and T_cam_to_world is not None:
-            front_bev_xy = compute_camera_bev_xy(
+            front_bev_xy, front_bev_valid_mask = compute_camera_bev_xy(
                 K=K,
                 T_cam_to_world=T_cam_to_world,
                 T_imu_to_world=T_imu_to_world,
@@ -1143,6 +1152,7 @@ class Kitti360dDataset(Dataset):
                 sat_w=self.sat_size[0],
                 sat_h=self.sat_size[1],
                 cam_height=camera_height_m,
+                return_valid_mask=True,
             )
             plucker_map = compute_plucker_map(
                 K=K,
@@ -1155,6 +1165,7 @@ class Kitti360dDataset(Dataset):
             )
         else:
             front_bev_xy = self._get_front_bev_xy(int(img.shape[0]), int(img.shape[1]))
+            front_bev_valid_mask = torch.zeros(1, int(img.shape[0]), int(img.shape[1]), dtype=torch.float32)
             plucker_map = torch.zeros(6, int(img.shape[0]), int(img.shape[1]), dtype=torch.float32)
 
         return {
@@ -1165,6 +1176,8 @@ class Kitti360dDataset(Dataset):
             "camera_height_m": camera_height_m,
             "front_bev_xy": front_bev_xy,
             "coords_map": front_bev_xy,
+            "front_bev_valid_mask": front_bev_valid_mask,
+            "coords_valid_mask": front_bev_valid_mask,
             "plucker_map": plucker_map,
             "K": K_t,  # (3,3) after resize/crop, or virtual K in fisheye mode
             "T_pose_cam": T_pose_cam_t,  # (4,4) camera pose (prefer cam->world if available)

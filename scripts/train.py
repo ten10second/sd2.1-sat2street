@@ -494,7 +494,8 @@ def main():
             trainer.unwrapped_model,
             Path(args.init_checkpoint),
             args.device,
-            allow_missing_prefixes=("unet.reading_blocks.",),
+            allow_missing_prefixes=("unet.transport_blocks.",),
+            allow_unexpected_prefixes=("unet.reading_blocks.",),
         )
 
     # Start training
