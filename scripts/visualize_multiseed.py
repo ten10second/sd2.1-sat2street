@@ -302,45 +302,6 @@ def _stack_panel_rows(rows: Sequence[Image.Image], spacing: int = 8) -> Image.Im
     return canvas
 
 
-@torch.no_grad()
-def _materialize_lazy_modules(
-    model,
-    sat_images: torch.Tensor,
-    coords_map: Optional[torch.Tensor],
-    coords_valid_mask: Optional[torch.Tensor],
-    plucker_map: Optional[torch.Tensor],
-    target_size: Tuple[int, int],
-) -> None:
-    sat_encoded = model.encode_satellite(sat_images, coords_map)
-    if isinstance(sat_encoded, tuple):
-        sat_tokens, sat_xy = sat_encoded
-    else:
-        sat_tokens = sat_encoded
-        sat_xy = None
-
-    vae_scale_factor = model._get_vae_scale_factor()
-    latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
-    latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
-    latents = torch.randn(
-        (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
-        device=sat_images.device,
-        dtype=sat_tokens.dtype,
-    )
-    timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
-
-    model.unet(
-        latents,
-        timestep,
-        encoder_hidden_states=None,
-        sat_tokens=sat_tokens,
-        sat_xy=sat_xy,
-        front_bev_xy=coords_map,
-        front_bev_valid_mask=coords_valid_mask,
-        front_plucker=plucker_map,
-        return_attn_map=False,
-    )
-
-
 def main() -> None:
     args = _parse_args()
 
@@ -389,15 +350,11 @@ def main() -> None:
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
     )
-    if hasattr(model.unet, "set_attention_slice"):
-        model.unet.set_attention_slice("auto")
+    logger.info("Skipped UNet attention slicing because custom GeoRoPE attn2 processors must stay installed")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
     model.to(args.device)
     model.eval()
-
-    logger.info("Materializing lazy transport blocks before loading checkpoint")
-    _materialize_lazy_modules(model, sat_image, coords_map, coords_valid_mask, plucker_map, target_size)
 
     checkpoint_meta = load_model_checkpoint(
         model,

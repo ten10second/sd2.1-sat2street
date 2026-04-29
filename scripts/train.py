@@ -442,10 +442,8 @@ def main():
         model.unet.enable_gradient_checkpointing()
         if is_main_process:
             logger.info("Enabled UNet gradient checkpointing")
-    if hasattr(model.unet, "set_attention_slice"):
-        model.unet.set_attention_slice("auto")
-        if is_main_process:
-            logger.info("Enabled UNet attention slicing")
+    if is_main_process:
+        logger.info("Skipped UNet attention slicing because custom GeoRoPE attn2 processors must stay installed")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
         if is_main_process:

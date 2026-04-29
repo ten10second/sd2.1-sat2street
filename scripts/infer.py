@@ -565,52 +565,7 @@ def _filter_sample_indices(
     return indices
 
 
-@torch.no_grad()
-def _materialize_lazy_modules(
-    model,
-    sample: Dict,
-    device: str,
-) -> None:
-    sat_images = sample["sat"].unsqueeze(0).to(device)
-    coords_map = sample.get("coords_map")
-    coords_map = coords_map.unsqueeze(0).to(device) if coords_map is not None else None
-    coords_valid_mask = sample.get("coords_valid_mask")
-    coords_valid_mask = coords_valid_mask.unsqueeze(0).to(device) if coords_valid_mask is not None else None
-    plucker_map = sample.get("plucker_map")
-    plucker_map = plucker_map.unsqueeze(0).to(device) if plucker_map is not None else None
-    target_size = tuple(int(x) for x in sample["image"].shape[-2:])
-
-    sat_encoded = model.encode_satellite(sat_images, coords_map)
-    if isinstance(sat_encoded, tuple):
-        sat_tokens, sat_xy = sat_encoded
-    else:
-        sat_tokens = sat_encoded
-        sat_xy = None
-
-    vae_scale_factor = model._get_vae_scale_factor()
-    latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
-    latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
-    latents = torch.randn(
-        (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
-        device=sat_images.device,
-        dtype=sat_tokens.dtype,
-    )
-    timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
-
-    model.unet(
-        latents,
-        timestep,
-        encoder_hidden_states=None,
-        sat_tokens=sat_tokens,
-        sat_xy=sat_xy,
-        front_bev_xy=coords_map,
-        front_bev_valid_mask=coords_valid_mask,
-        front_plucker=plucker_map,
-        return_attn_map=False,
-    )
-
-
-def _load_model(args: argparse.Namespace, materialize_sample: Dict):
+def _load_model(args: argparse.Namespace):
     model_torch_dtype = None
     if args.device.startswith("cuda") and args.mixed_precision == "fp16":
         model_torch_dtype = torch.float16
@@ -626,15 +581,12 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
     )
-    if hasattr(model.unet, "set_attention_slice"):
-        model.unet.set_attention_slice("auto")
+    logger.info("Skipped UNet attention slicing because custom GeoRoPE attn2 processors must stay installed")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
     model.to(args.device)
     model.eval()
 
-    logger.info("Materializing lazy transport blocks before loading checkpoint")
-    _materialize_lazy_modules(model, materialize_sample, args.device)
     checkpoint_meta = load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()
     return model, checkpoint_meta
@@ -760,8 +712,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
         view_specs.append(("front", None))
     view_specs.extend((_view_token("yaw", yaw), float(yaw)) for yaw in yaws)
 
-    materialize_sample = _get_view_sample(dataset, sample_index, *view_specs[0])
-    model, checkpoint_meta = _load_model(args, materialize_sample)
+    model, checkpoint_meta = _load_model(args)
 
     output_root = Path(args.output_dir)
     base_sample = dataset.samples[sample_index]
@@ -822,8 +773,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
     dataset = _build_base_dataset(drives, frames, args.seed)
     sample_indices = _filter_sample_indices(dataset, args.start_frame, args.end_frame, args.max_frames)
 
-    materialize_sample = _get_view_sample(dataset, sample_indices[0], *FIXED_VIEW_SPECS[0])
-    model, checkpoint_meta = _load_model(args, materialize_sample)
+    model, checkpoint_meta = _load_model(args)
 
     output_root = Path(args.output_dir)
     ablation_runs = _resolve_ablation_runs(args)

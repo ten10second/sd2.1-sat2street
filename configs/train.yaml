@@ -49,19 +49,15 @@ model:
     dropout: 0.1
     use_relative_pos: true
 
-  # Geometric transport reading block
+  # GeoRoPE satellite attn2 conditioning
   reading_block:
-    enable: false
+    enable: true
     injection_sites: ['down2', 'down3', 'mid', 'up0', 'up1']
-    num_heads: 8
-    head_dim: 64
-    lambda_geo: 8.0
-    compatibility_scale: 0.1
-    sigma_min: 0.03
-    sigma_max: 0.35
+    sat_in_dim: 768
+    geo_ratio: 1.0
+    rope_base: 10000.0
     invalid_conf_loss_weight: 0.05
     plucker_dropout_prob: 0.3
-    use_attn2_sat_route: false
 
 # 训练配置
 training:

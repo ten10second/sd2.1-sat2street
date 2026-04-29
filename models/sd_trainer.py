@@ -28,7 +28,7 @@ import logging
 from PIL import Image
 
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
-from models.sd_model import SatelliteConditionedUNet
+from models.sd_model import DEFAULT_SATELLITE_EMBED_DIM, SatelliteConditionedUNet
 
 
 logger = logging.getLogger(__name__)
@@ -132,45 +132,6 @@ def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> 
     return snapshot_dirs[-1]
 
 
-@torch.no_grad()
-def _materialize_lazy_modules(
-    model: "SatelliteConditionedSDModel",
-    sat_images: torch.Tensor,
-    coords_map: Optional[torch.Tensor],
-    coords_valid_mask: Optional[torch.Tensor],
-    plucker_map: Optional[torch.Tensor],
-    target_size: Tuple[int, int],
-) -> None:
-    sat_encoded = model.encode_satellite(sat_images, coords_map)
-    if isinstance(sat_encoded, tuple):
-        sat_tokens, sat_xy = sat_encoded
-    else:
-        sat_tokens = sat_encoded
-        sat_xy = None
-
-    vae_scale_factor = model._get_vae_scale_factor()
-    latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
-    latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
-    latents = torch.randn(
-        (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
-        device=sat_images.device,
-        dtype=sat_tokens.dtype,
-    )
-    timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
-
-    model.unet(
-        latents,
-        timestep,
-        encoder_hidden_states=None,
-        sat_tokens=sat_tokens,
-        sat_xy=sat_xy,
-        front_bev_xy=coords_map,
-        front_bev_valid_mask=coords_valid_mask,
-        front_plucker=plucker_map,
-        return_attn_map=False,
-    )
-
-
 class SatelliteConditionedSDModel(nn.Module):
     """
     Stable Diffusion model conditioned on satellite images with coordinate encoding.
@@ -201,7 +162,7 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Satellite encoder
         if satellite_encoder is None:
-            sat_embed_dim = int(unet.config.cross_attention_dim or 768)
+            sat_embed_dim = DEFAULT_SATELLITE_EMBED_DIM
             sat_num_heads = 12
             if sat_embed_dim % sat_num_heads != 0:
                 if sat_embed_dim % 64 == 0:
@@ -220,6 +181,13 @@ class SatelliteConditionedSDModel(nn.Module):
             )
         else:
             self.satellite_encoder = satellite_encoder
+        sat_embed_dim = int(getattr(self.satellite_encoder, "embed_dim", DEFAULT_SATELLITE_EMBED_DIM))
+        for name, processor in getattr(self.unet, "attn_processors", {}).items():
+            processor_sat_dim = getattr(processor, "sat_in_dim", None)
+            if processor_sat_dim is not None and int(processor_sat_dim) != sat_embed_dim:
+                raise ValueError(
+                    f"Satellite encoder embed_dim={sat_embed_dim} does not match {name} sat_in_dim={processor_sat_dim}"
+                )
 
         # Freeze base layers
         if freeze_base:
@@ -227,11 +195,10 @@ class SatelliteConditionedSDModel(nn.Module):
             for param in self.vae.parameters():
                 param.requires_grad = False
 
-            # Freeze the pretrained UNet backbone. Transport blocks are created
-            # lazily after this and remain trainable.
-            use_attn2_sat_route = bool(getattr(self.unet, "use_attn2_sat_route", False))
+            # Freeze the pretrained UNet backbone. Geometry-aware attention
+            # processors are the only trainable U-Net-side conditioning modules.
             for name, param in self.unet.named_parameters():
-                if use_attn2_sat_route and (".attn2.to_k." in name or ".attn2.to_v." in name):
+                if ".attn2.processor." in name:
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -243,15 +210,15 @@ class SatelliteConditionedSDModel(nn.Module):
         logger.info(f"[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
         logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
-        trainable_attn2_kv = sum(
+        trainable_attn2_processors = sum(
             p.numel()
             for n, p in self.unet.named_parameters()
-            if p.requires_grad and ('.attn2.to_k.' in n or '.attn2.to_v.' in n)
+            if p.requires_grad and ".attn2.processor." in n
         )
-        logger.info(f"  Trainable attn2 k/v params: {trainable_attn2_kv}")
+        logger.info(f"  Trainable GeoRoPE attn2 processor params: {trainable_attn2_processors}")
         logger.info(
-            "  Main attn2 route: %s",
-            "satellite tokens" if bool(getattr(self.unet, "use_attn2_sat_route", False)) else "disabled",
+            "  GeoRoPE satellite attn2 processors: %d",
+            len(getattr(self.unet, "georope_attn_processor_names", [])),
         )
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
@@ -650,7 +617,23 @@ def create_sd_model(
         **component_load_kwargs,
     )
 
-    reading_cfg = reading_block_config or {}
+    reading_cfg = dict(reading_block_config or {})
+    requested_sat_embed_dim = int(
+        reading_cfg.get('sat_in_dim', reading_cfg.get('satellite_embed_dim', DEFAULT_SATELLITE_EMBED_DIM))
+    )
+    sat_num_heads = 12
+    if requested_sat_embed_dim % sat_num_heads != 0:
+        if requested_sat_embed_dim % 64 == 0:
+            sat_num_heads = requested_sat_embed_dim // 64
+        else:
+            for candidate in range(min(sat_num_heads, requested_sat_embed_dim), 0, -1):
+                if requested_sat_embed_dim % candidate == 0:
+                    sat_num_heads = candidate
+                    break
+    satellite_encoder = SatelliteConditionEncoder(embed_dim=requested_sat_embed_dim, num_heads=sat_num_heads)
+    sat_embed_dim = int(getattr(satellite_encoder, "embed_dim", DEFAULT_SATELLITE_EMBED_DIM))
+    reading_cfg["sat_in_dim"] = sat_embed_dim
+
     configured_sites = reading_injection_sites
     if configured_sites is None and reading_cfg.get('injection_sites') is not None:
         configured_sites = tuple(reading_cfg.get('injection_sites'))
@@ -658,15 +641,11 @@ def create_sd_model(
         use_satellite_reading=reading_cfg.get('enable', True),
         reading_injection_sites=list(configured_sites) if configured_sites is not None else None,
         reading_block_config={
-            'num_heads': reading_cfg.get('num_heads', 8),
-            'head_dim': reading_cfg.get('head_dim', 64),
-            'lambda_geo': reading_cfg.get('lambda_geo', 8.0),
-            'compatibility_scale': reading_cfg.get('compatibility_scale', 0.1),
-            'sigma_min': reading_cfg.get('sigma_min', 0.03),
-            'sigma_max': reading_cfg.get('sigma_max', 0.35),
+            'sat_in_dim': sat_embed_dim,
+            'geo_ratio': reading_cfg.get('geo_ratio', 1.0),
+            'rope_base': reading_cfg.get('rope_base', 10000.0),
             'invalid_conf_loss_weight': reading_cfg.get('invalid_conf_loss_weight', 0.05),
             'plucker_dropout_prob': reading_cfg.get('plucker_dropout_prob', 0.3),
-            'use_attn2_sat_route': reading_cfg.get('use_attn2_sat_route', False),
         },
         **base_unet.config,
     )
@@ -687,6 +666,7 @@ def create_sd_model(
         unet=unet,
         vae=vae,
         noise_scheduler=noise_scheduler,
+        satellite_encoder=satellite_encoder,
         freeze_base=freeze_base,
         cond_drop_prob=cond_drop_prob,
     )
@@ -788,9 +768,6 @@ class SDTrainer:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         self._barrier()
 
-        # Reading blocks are created lazily on first forward. Materialize them before
-        # building the optimizer so their parameters are actually trainable.
-        self._materialize_lazy_condition_modules()
         self._ensure_trainable_params_fp32()
         self._assert_no_trainable_fp16_params()
         if self.distributed:
@@ -878,51 +855,6 @@ class SDTrainer:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         tensor /= float(self.world_size)
         return float(tensor.item())
-
-    @torch.no_grad()
-    def _materialize_lazy_condition_modules(self) -> None:
-        unet = getattr(self.model, "unet", None)
-        if unet is None or not getattr(unet, "use_satellite_reading", False):
-            return
-        if len(getattr(unet, "transport_blocks", {})) > 0:
-            return
-
-        try:
-            batch = next(iter(self.train_dataloader))
-        except StopIteration:
-            logger.warning("Skipped lazy module materialization because the training dataloader is empty")
-            return
-
-        sat_images = batch.get("sat")
-        target_images = batch.get("image")
-        if sat_images is None or target_images is None:
-            logger.warning("Skipped lazy module materialization because batch is missing 'sat' or 'image'")
-            return
-
-        sat_images = sat_images[:1].to(self.device)
-        coords_map = batch.get("coords_map")
-        if coords_map is not None:
-            coords_map = coords_map[:1].to(self.device)
-        coords_valid_mask = batch.get("coords_valid_mask")
-        if coords_valid_mask is not None:
-            coords_valid_mask = coords_valid_mask[:1].to(self.device)
-        plucker_map = batch.get("plucker_map")
-        if plucker_map is not None:
-            plucker_map = plucker_map[:1].to(self.device)
-        target_size = tuple(int(x) for x in target_images.shape[-2:])
-
-        was_training = self.model.training
-        self.model.eval()
-        _materialize_lazy_modules(self.model, sat_images, coords_map, coords_valid_mask, plucker_map, target_size)
-        if was_training:
-            self.model.train()
-
-        condition_blocks = getattr(unet, "transport_blocks", nn.ModuleDict())
-        reading_param_count = sum(p.numel() for p in condition_blocks.parameters())
-        logger.info(
-            f"Materialized {len(condition_blocks)} transport block(s) before optimizer init "
-            f"({reading_param_count} parameters)"
-        )
 
     def _ensure_trainable_params_fp32(self) -> None:
         fp16_params = []
@@ -1156,34 +1088,36 @@ class SDTrainer:
 
             total_raw_loss += raw_loss.item()
             postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
-            transport_conf = outputs.get('reading_transport_confidence_mean')
-            if torch.is_tensor(transport_conf):
-                postfix['conf'] = f"{transport_conf.item():.2f}"
+            reading_conf = outputs.get('reading_confidence_mean')
+            if torch.is_tensor(reading_conf):
+                postfix['conf'] = f"{reading_conf.item():.2f}"
             if self.is_main_process:
                 progress_bar.set_postfix(postfix)
 
             # Log
             if self.is_main_process and (step + 1) % self.log_every == 0:
-                transport_conf = outputs.get('reading_transport_confidence_mean')
-                valid_conf = outputs.get('reading_transport_valid_confidence_mean')
-                invalid_conf = outputs.get('reading_transport_invalid_confidence_mean')
-                sigma_mean = outputs.get('reading_transport_sigma_mean')
-                if all(torch.is_tensor(v) for v in (transport_conf, valid_conf, invalid_conf, sigma_mean)):
+                reading_conf = outputs.get('reading_confidence_mean')
+                valid_conf = outputs.get('reading_valid_confidence_mean')
+                invalid_conf = outputs.get('reading_invalid_confidence_mean')
+                entropy_mean = outputs.get('reading_georope_attn_entropy_mean')
+                gate_mean = outputs.get('reading_gate_mean_mean')
+                if all(torch.is_tensor(v) for v in (reading_conf, valid_conf, invalid_conf, entropy_mean, gate_mean)):
                     site_ratio_parts = []
                     for site, site_stats in outputs.get('reading_stats_by_site', {}).items():
-                        conf = site_stats.get('transport_confidence')
+                        conf = site_stats.get('confidence')
                         if torch.is_tensor(conf):
                             site_ratio_parts.append(f"{site}={conf.item():.3f}")
                     site_ratio_text = f" ({', '.join(site_ratio_parts)})" if site_ratio_parts else ""
                     logger.info(
-                        "Train step %d/%d: raw_loss=%.6f conf=%.4f valid_conf=%.4f invalid_conf=%.4f sigma=%.4f%s",
+                        "Train step %d/%d: raw_loss=%.6f conf=%.4f valid_conf=%.4f invalid_conf=%.4f gate=%.4f entropy=%.4f%s",
                         step + 1,
                         num_batches,
                         raw_loss.item(),
-                        transport_conf.item(),
+                        reading_conf.item(),
                         valid_conf.item(),
                         invalid_conf.item(),
-                        sigma_mean.item(),
+                        gate_mean.item(),
+                        entropy_mean.item(),
                         site_ratio_text,
                     )
                 else:
@@ -1200,14 +1134,16 @@ class SDTrainer:
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
                     'train/epoch': epoch + 1,
                 }
-                if torch.is_tensor(transport_conf):
-                    log_payload['reading/transport_confidence_mean'] = transport_conf.item()
+                if torch.is_tensor(reading_conf):
+                    log_payload['reading/confidence_mean'] = reading_conf.item()
                 if torch.is_tensor(valid_conf):
-                    log_payload['reading/transport_valid_confidence_mean'] = valid_conf.item()
+                    log_payload['reading/valid_confidence_mean'] = valid_conf.item()
                 if torch.is_tensor(invalid_conf):
-                    log_payload['reading/transport_invalid_confidence_mean'] = invalid_conf.item()
-                if torch.is_tensor(sigma_mean):
-                    log_payload['reading/transport_sigma_mean'] = sigma_mean.item()
+                    log_payload['reading/invalid_confidence_mean'] = invalid_conf.item()
+                if torch.is_tensor(entropy_mean):
+                    log_payload['reading/georope_attn_entropy_mean'] = entropy_mean.item()
+                if torch.is_tensor(gate_mean):
+                    log_payload['reading/gate_mean'] = gate_mean.item()
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
         local_mean = total_raw_loss / max(1, num_batches)
