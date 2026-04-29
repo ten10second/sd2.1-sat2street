@@ -778,7 +778,8 @@ class SDTrainer:
             if self.mixed_precision == "bf16"
             else None
         )
-        self.scaler = torch.cuda.amp.GradScaler(
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
             enabled=self.use_amp and self.amp_dtype == torch.float16
         )
 

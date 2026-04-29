@@ -424,7 +424,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         Args:
             sample: (B, 4, H, W) - Noisy latent representation
             timestep: (B,) or (1,) - Current timestep
-            encoder_hidden_states: Optional legacy argument, ignored by attn2 hooks
+            encoder_hidden_states: Optional text/context states for the base U-Net cross-attention.
             sat_tokens: (B, Ns, Cs) - Pre-encoded satellite tokens
             sat_xy: (B, Ns, 2) - Satellite token BEV coordinates
             front_bev_xy: (B, Nf, 2) - Frontview pixel BEV coordinates
@@ -450,6 +450,22 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                     f"condition_mask must be [B], got {list(inferred_condition_mask.shape)} for batch {sample.shape[0]}"
                 )
             inferred_condition_mask = inferred_condition_mask.to(device=sample.device, dtype=torch.bool)
+
+        cross_attention_dim = int(self.config.cross_attention_dim or 1024)
+        if encoder_hidden_states is None:
+            encoder_hidden_states = sample.new_zeros((sample.shape[0], 1, cross_attention_dim))
+        else:
+            encoder_hidden_states = encoder_hidden_states.to(device=sample.device, dtype=sample.dtype)
+            if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[0] != sample.shape[0]:
+                raise ValueError(
+                    "encoder_hidden_states must be [B, N, C], got "
+                    f"{list(encoder_hidden_states.shape)} for batch {sample.shape[0]}"
+                )
+            if encoder_hidden_states.shape[-1] != cross_attention_dim:
+                raise ValueError(
+                    f"encoder_hidden_states last dim must match cross_attention_dim={cross_attention_dim}, "
+                    f"got {encoder_hidden_states.shape[-1]}"
+                )
 
         enable_sat_condition = inferred_sat_tokens is not None
         enable_reading = (
