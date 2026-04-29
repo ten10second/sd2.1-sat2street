@@ -304,6 +304,43 @@ def _coords_to_satellite_pixels(
     return points, bbox
 
 
+def _convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    unique_points = sorted(set((float(x), float(y)) for x, y in points))
+    if len(unique_points) <= 2:
+        return unique_points
+
+    def cross(o: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for point in unique_points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+
+    upper: List[Tuple[float, float]] = []
+    for point in reversed(unique_points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+
+    return lower[:-1] + upper[:-1]
+
+
+def _valid_boundary_mask(valid_hw: torch.Tensor) -> torch.Tensor:
+    valid = valid_hw > 0.5
+    up = torch.zeros_like(valid)
+    down = torch.zeros_like(valid)
+    left = torch.zeros_like(valid)
+    right = torch.zeros_like(valid)
+    up[1:, :] = valid[:-1, :]
+    down[:-1, :] = valid[1:, :]
+    left[:, 1:] = valid[:, :-1]
+    right[:, :-1] = valid[:, 1:]
+    interior = valid & up & down & left & right
+    return valid & ~interior
+
+
 def _coords_map_to_satellite_pixels(
     coords_map: Optional[torch.Tensor],
     coords_valid_mask: Optional[torch.Tensor],
@@ -372,18 +409,15 @@ def _coords_map_to_fov_polygon(
         valid_hw = None
 
     if valid_hw is not None and valid_hw.shape == coords_hw.shape[:2]:
-        coords_flat = coords_hw.reshape(-1, 2)
-        valid_flat = valid_hw.reshape(-1) > 0.5
-        points, bbox = _coords_to_satellite_pixels(coords_flat[valid_flat], sat_width, sat_height)
-        if bbox is None:
+        boundary = _valid_boundary_mask(valid_hw)
+        coords_boundary = coords_hw[boundary]
+        if coords_boundary.shape[0] < 3:
+            coords_boundary = coords_hw[valid_hw > 0.5]
+        points, _ = _coords_to_satellite_pixels(coords_boundary, sat_width, sat_height)
+        hull = _convex_hull(points)
+        if len(hull) < 3:
             return []
-        left_px, top_px, right_px, bottom_px = bbox
-        return [
-            (left_px, top_px),
-            (right_px, top_px),
-            (right_px, bottom_px),
-            (left_px, bottom_px),
-        ]
+        return hull
 
     top = coords_hw[0, :, :]
     right = coords_hw[:, width - 1, :]

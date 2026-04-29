@@ -79,49 +79,21 @@ def _aggregate_reading_losses(
     return total, aggregated
 
 
-def _filter_compatible_keys(keys: Sequence[str], allowed_prefixes: Sequence[str]) -> Sequence[str]:
-    if not allowed_prefixes:
-        return list(keys)
-    return [
-        key
-        for key in keys
-        if not any(key.startswith(prefix) for prefix in allowed_prefixes)
-    ]
-
-
 def load_model_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
-    *,
-    allow_missing_prefixes: Sequence[str] = (),
-    allow_unexpected_prefixes: Sequence[str] = (),
-) -> Tuple[Sequence[str], Sequence[str]]:
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    filtered_missing = _filter_compatible_keys(missing_keys, allow_missing_prefixes)
-    filtered_unexpected = _filter_compatible_keys(unexpected_keys, allow_unexpected_prefixes)
-    if filtered_missing:
-        raise RuntimeError(f"Missing keys when loading checkpoint: {filtered_missing}")
-    if filtered_unexpected:
-        raise RuntimeError(f"Unexpected keys when loading checkpoint: {filtered_unexpected}")
-    return missing_keys, unexpected_keys
+) -> None:
+    model.load_state_dict(state_dict, strict=True)
 
 
 def load_model_checkpoint(
     model: nn.Module,
     checkpoint_path: Path,
     device: str,
-    *,
-    allow_missing_prefixes: Sequence[str] = (),
-    allow_unexpected_prefixes: Sequence[str] = (),
 ) -> Dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-    load_model_state_dict(
-        model,
-        state_dict,
-        allow_missing_prefixes=allow_missing_prefixes,
-        allow_unexpected_prefixes=allow_unexpected_prefixes,
-    )
+    load_model_state_dict(model, state_dict)
     return checkpoint if isinstance(checkpoint, dict) else {}
 
 
@@ -255,10 +227,11 @@ class SatelliteConditionedSDModel(nn.Module):
             for param in self.vae.parameters():
                 param.requires_grad = False
 
-            # Freeze the pretrained UNet backbone. Satellite-specific modules are
-            # trained separately to preserve the SD prior and avoid scene drift.
+            # Freeze the pretrained UNet backbone. Transport blocks are created
+            # lazily after this and remain trainable.
+            use_attn2_sat_route = bool(getattr(self.unet, "use_attn2_sat_route", False))
             for name, param in self.unet.named_parameters():
-                if ".attn2.to_k." in name or ".attn2.to_v." in name:
+                if use_attn2_sat_route and (".attn2.to_k." in name or ".attn2.to_v." in name):
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -270,11 +243,16 @@ class SatelliteConditionedSDModel(nn.Module):
         logger.info(f"[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
         logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
-        logger.info(
-            f"  Trainable attn2 k/v params: "
-            f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and ('.attn2.to_k.' in n or '.attn2.to_v.' in n))}"
+        trainable_attn2_kv = sum(
+            p.numel()
+            for n, p in self.unet.named_parameters()
+            if p.requires_grad and ('.attn2.to_k.' in n or '.attn2.to_v.' in n)
         )
-        logger.info("  Main attn2 route: satellite tokens")
+        logger.info(f"  Trainable attn2 k/v params: {trainable_attn2_kv}")
+        logger.info(
+            "  Main attn2 route: %s",
+            "satellite tokens" if bool(getattr(self.unet, "use_attn2_sat_route", False)) else "disabled",
+        )
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
     def encode_satellite(self, sat_images: torch.Tensor, coords_map: torch.Tensor = None) -> torch.Tensor:
@@ -688,6 +666,7 @@ def create_sd_model(
             'sigma_max': reading_cfg.get('sigma_max', 0.35),
             'invalid_conf_loss_weight': reading_cfg.get('invalid_conf_loss_weight', 0.05),
             'plucker_dropout_prob': reading_cfg.get('plucker_dropout_prob', 0.3),
+            'use_attn2_sat_route': reading_cfg.get('use_attn2_sat_route', False),
         },
         **base_unet.config,
     )

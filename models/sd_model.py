@@ -45,7 +45,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         self.supports_satellite_reading = True
         self.use_satellite_reading = use_satellite_reading
-        self.reading_injection_sites = reading_injection_sites or ["mid", "up0", "up1"]
+        self.reading_injection_sites = reading_injection_sites or ["down2", "down3", "mid", "up0", "up1"]
         sat_in_dim = int(self.config.cross_attention_dim or 768)
         self.reading_block_config = {
             "num_heads": 8,
@@ -56,11 +56,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "sigma_max": 0.35,
             "invalid_conf_loss_weight": 0.05,
             "plucker_dropout_prob": 0.3,
+            "use_attn2_sat_route": False,
         }
         if reading_block_config is not None:
             self.reading_block_config.update(reading_block_config)
 
         self.plucker_dropout_prob = float(self.reading_block_config.get("plucker_dropout_prob", 0.0))
+        self.use_attn2_sat_route = bool(self.reading_block_config.get("use_attn2_sat_route", False))
         self.transport_blocks = nn.ModuleDict()
         self._conditioning_context: Dict[str, Any] = {}
         self._reading_hook_handles = []
@@ -69,7 +71,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.last_reading_stats: Dict[str, Dict[str, torch.Tensor]] = {}
         self.last_reading_losses: Dict[str, Dict[str, torch.Tensor]] = {}
 
-        self._register_attn2_sat_hooks(sat_in_dim=sat_in_dim)
+        if self.use_attn2_sat_route:
+            self._register_attn2_sat_hooks(sat_in_dim=sat_in_dim)
         if self.use_satellite_reading:
             self._register_reading_hooks()
 
