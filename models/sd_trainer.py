@@ -775,7 +775,7 @@ class SDTrainer:
                 self.model,
                 device_ids=[self.local_rank] if self.device.startswith("cuda") else None,
                 output_device=self.local_rank if self.device.startswith("cuda") else None,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
             )
 
         # Setup optimizer
