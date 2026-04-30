@@ -56,7 +56,7 @@ class ContinuousXYGeoRoPE(nn.Module):
         sin = freqs.sin().unsqueeze(1)
         return tensor * cos + self._rotate_half(tensor) * sin
 
-    def _apply(self, tensor: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
+    def _apply_rope(self, tensor: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
         if tensor.ndim != 4:
             raise ValueError(f"Expected tensor [B,H,N,D], got {list(tensor.shape)}")
         if xy.ndim != 3 or xy.shape[-1] != 2:
@@ -79,4 +79,4 @@ class ContinuousXYGeoRoPE(nn.Module):
         q_xy: torch.Tensor,
         k_xy: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._apply(q, q_xy), self._apply(k, k_xy)
+        return self._apply_rope(q, q_xy), self._apply_rope(k, k_xy)
