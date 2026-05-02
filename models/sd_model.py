@@ -6,20 +6,13 @@ Custom Stable Diffusion implementation with satellite condition encoder.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Any, Dict, Optional
 
-from diffusers import StableDiffusionPipeline
 try:
     from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 except ImportError:
     from diffusers.models.unet_2d_condition import UNet2DConditionModel
-
-try:
-    from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
-except ImportError:
-    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
-from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
-from models.unet.satellite_style_adapter import SatelliteStyleAdapter
 
 DEFAULT_SATELLITE_EMBED_DIM = 768
 
@@ -52,19 +45,134 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "view_geo_target_sigma": 0.20,
             "view_geo_loss_weight": 0.1,
             "view_gate_hidden_dim": 256,
-            "save_attention_heatmap": True,
+            "save_attention_heatmap": False,
             "heatmap_max_tokens": 16,
+            "view_injection_sites": ("down2", "down3", "mid", "up0", "up1"),
+            "view_modulation_scale": 0.4,
         }
         if reading_block_config is not None:
             self.reading_block_config.update(reading_block_config)
         self.plucker_dropout_prob = float(self.reading_block_config.get("plucker_dropout_prob", 0.0))
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
+        self.view_injection_sites = tuple(self.reading_block_config.get("view_injection_sites", ("down2", "down3", "mid", "up0", "up1")))
+        self.view_modulation_scale = float(self.reading_block_config.get("view_modulation_scale", 0.4))
+        self.view_condition_in_dim = int(
+            self.config.cross_attention_dim or self.reading_block_config.get("sat_in_dim", DEFAULT_SATELLITE_EMBED_DIM)
+        )
+        self._view_condition_projs = nn.ModuleDict(self._build_view_condition_projs())
+        self._view_condition_handles = []
+        self._view_condition_map: Optional[torch.Tensor] = None
+        self._register_view_condition_hooks()
+
+    @staticmethod
+    def _build_view_proj(view_in_dim: int, out_channels: int) -> nn.Module:
+        hidden_dim = max(out_channels, view_in_dim // 2)
+        return nn.Sequential(
+            nn.Conv2d(view_in_dim, hidden_dim, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1),
+        )
+
+    def _get_view_injection_modules(self) -> Dict[str, Optional[nn.Module]]:
+        down_blocks = list(getattr(self, "down_blocks", []))
+        up_blocks = list(getattr(self, "up_blocks", []))
+        return {
+            "down2": down_blocks[2] if len(down_blocks) > 2 else None,
+            "down3": down_blocks[3] if len(down_blocks) > 3 else None,
+            "mid": getattr(self, "mid_block", None),
+            "up0": up_blocks[0] if len(up_blocks) > 0 else None,
+            "up1": up_blocks[1] if len(up_blocks) > 1 else None,
+        }
+
+    @staticmethod
+    def _infer_module_out_channels(module: nn.Module) -> int:
+        resnets = getattr(module, "resnets", None)
+        if resnets:
+            resnet = resnets[-1]
+            out_channels = getattr(resnet, "out_channels", None)
+            if isinstance(out_channels, int):
+                return out_channels
+            conv2 = getattr(resnet, "conv2", None)
+            out_channels = getattr(conv2, "out_channels", None)
+            if isinstance(out_channels, int):
+                return out_channels
+
+        for attr_name in ("downsamplers", "upsamplers"):
+            samplers = getattr(module, attr_name, None)
+            if samplers:
+                sampler = samplers[-1]
+                conv = getattr(sampler, "conv", None)
+                out_channels = getattr(conv, "out_channels", None)
+                if isinstance(out_channels, int):
+                    return out_channels
+
+        raise ValueError(f"Unable to infer output channels for module {type(module).__name__}")
+
+    def _build_view_condition_projs(self) -> Dict[str, nn.Module]:
+        projs: Dict[str, nn.Module] = {}
+        for name in self.view_injection_sites:
+            module = self._get_view_injection_modules().get(str(name))
+            if module is None:
+                continue
+            out_channels = self._infer_module_out_channels(module)
+            projs[str(name)] = self._build_view_proj(self.view_condition_in_dim, out_channels)
+        return projs
+
+    def _apply_view_condition(self, hidden_states: torch.Tensor, name: str) -> torch.Tensor:
+        if self._view_condition_map is None:
+            return hidden_states
+        if name not in self._view_condition_projs:
+            return hidden_states
+        view_map = self._view_condition_map
+        if view_map.shape[0] != hidden_states.shape[0]:
+            return hidden_states
+        view_map = F.interpolate(
+            view_map.to(device=hidden_states.device, dtype=hidden_states.dtype),
+            size=hidden_states.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        proj = self._view_condition_projs[name]
+        proj_param = next(proj.parameters(), None)
+        proj_dtype = proj_param.dtype if proj_param is not None else hidden_states.dtype
+        delta = proj(view_map.to(dtype=proj_dtype)).to(dtype=hidden_states.dtype)
+        delta = delta * self.view_modulation_scale
+        return hidden_states + delta
+
+    def _make_view_condition_hook(self, name: str):
+        def hook(_module, _inputs, output):
+            if isinstance(output, tuple):
+                if not output:
+                    return output
+                first = output[0]
+                if torch.is_tensor(first):
+                    modulated = self._apply_view_condition(first, name)
+                    return (modulated, *output[1:])
+                return output
+            if torch.is_tensor(output):
+                return self._apply_view_condition(output, name)
+            return output
+        return hook
+
+    def _register_view_condition_hooks(self) -> None:
+        for handle in self._view_condition_handles:
+            handle.remove()
+        self._view_condition_handles = []
+
+        block_map = self._get_view_injection_modules()
+        for name in self.view_injection_sites:
+            module = block_map.get(str(name))
+            if module is None:
+                continue
+            handle = module.register_forward_hook(self._make_view_condition_hook(str(name)))
+            self._view_condition_handles.append(handle)
 
     def forward(
         self,
         sample: torch.FloatTensor,
         timestep: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
+        view_condition_map: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         cross_attention_dim = int(self.config.cross_attention_dim or 1024)
@@ -84,209 +192,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 )
 
         self.last_attn_maps = {}
-        return super().forward(
-            sample=sample,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            **kwargs,
-        )
-
-
-class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
-    """
-    Stable Diffusion pipeline with satellite condition support.
-
-    Args:
-        satellite_encoder: Satellite condition encoder
-        **kwargs: Additional arguments for StableDiffusionPipeline
-    """
-
-    def __init__(
-        self,
-        satellite_encoder: nn.Module,
-        satellite_style_adapter: Optional[nn.Module] = None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-
-        self.satellite_encoder = satellite_encoder
-        self.satellite_encoder.eval()
-        self.satellite_style_adapter = satellite_style_adapter
-        if self.satellite_style_adapter is not None:
-            self.satellite_style_adapter.eval()
-
-    def _encode_satellite_images(self, sat_images: torch.Tensor):
-        """Encode satellite images to embeddings."""
-        with torch.no_grad():
-            sat_emb = self.satellite_encoder(sat_images)
-        return sat_emb
-
-    def _encode_satellite_style(self, sat_emb: torch.Tensor) -> torch.Tensor:
-        if self.satellite_style_adapter is None:
-            cross_attention_dim = int(self.unet.config.cross_attention_dim or sat_emb.shape[-1])
-            return sat_emb.new_zeros((sat_emb.shape[0], 4, cross_attention_dim))
-        with torch.no_grad():
-            return self.satellite_style_adapter(sat_emb)
-
-    def __call__(
-        self,
-        sat_images: torch.Tensor,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        negative_prompt: Optional[str] = None,
-        **kwargs,
-    ):
-        """
-        Generate frontview images from satellite images.
-
-        Args:
-            sat_images: (B, 3, H_sat, W_sat) or (3, H_sat, W_sat) - Satellite images
-            num_inference_steps: Number of diffusion steps
-            guidance_scale: Guidance scale for classifier-free guidance
-            negative_prompt: Negative prompt for guidance
-            **kwargs: Additional arguments
-
-        Returns:
-            output: StableDiffusionPipelineOutput
-        """
-        # Handle single image input
-        if sat_images.ndim == 3:
-            sat_images = sat_images.unsqueeze(0)
-
-        # Move to device
-        sat_images = sat_images.to(self.device)
-
-        # Encode satellite images
-        sat_emb = self._encode_satellite_images(sat_images)
-        style_tokens = self._encode_satellite_style(sat_emb)
-
-        # Encode negative prompt
-        negative_emb = None
-        if negative_prompt is not None:
-            negative_emb = self._encode_prompt(negative_prompt, sat_images.shape[0])
-
-        # Encode positive prompt (we use empty prompt for now)
-        positive_emb = self._encode_prompt("", sat_images.shape[0])
-
-        # Concatenate embeddings
-        encoder_hidden_states = torch.cat([positive_emb, style_tokens], dim=1)
-        if negative_emb is not None:
-            negative_emb = torch.cat([negative_emb, torch.zeros_like(style_tokens)], dim=1)
-
-        # Call super().__call__
-        return super().__call__(
-            prompt=None,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            negative_prompt=negative_prompt,
-            encoder_hidden_states=encoder_hidden_states,
-            negative_prompt_embeds=negative_emb,
-            **kwargs,
-        )
-
-
-def load_sd_model(
-    base_model: str = 'stabilityai/stable-diffusion-2-1',
-    freeze_base: bool = True,
-    reading_block_config: Optional[Dict[str, Any]] = None,
-) -> SatelliteConditionedSDPipeline:
-    """
-    Load Stable Diffusion model with satellite conditioning support.
-
-    Args:
-        base_model: Base model name from Hugging Face hub
-        freeze_base: Whether to freeze base Stable Diffusion layers
-
-    Returns:
-        pipeline: Satellite-conditioned Stable Diffusion pipeline
-    """
-    # Load base model
-    pipeline = StableDiffusionPipeline.from_pretrained(base_model)
-
-    base_unet = pipeline.unet
-
-    reading_cfg = dict(reading_block_config or {})
-    sat_embed_dim = int(reading_cfg.get("sat_in_dim", DEFAULT_SATELLITE_EMBED_DIM))
-    reading_cfg["sat_in_dim"] = sat_embed_dim
-    sat_num_heads = 12
-    if sat_embed_dim % sat_num_heads != 0:
-        sat_num_heads = sat_embed_dim // 64 if sat_embed_dim % 64 == 0 else 1
-
-    # Create satellite encoder (separate from UNet)
-    satellite_encoder = SatelliteConditionEncoder(embed_dim=sat_embed_dim, num_heads=sat_num_heads)
-    cross_attention_dim = int(base_unet.config.cross_attention_dim or 1024)
-    style_num_tokens = int(reading_cfg.get("style_num_tokens", 4))
-    style_num_heads = int(reading_cfg.get("style_num_heads", 8))
-    if sat_embed_dim % style_num_heads != 0:
-        if sat_embed_dim % 64 == 0:
-            style_num_heads = sat_embed_dim // 64
-        else:
-            style_num_heads = 1
-            for candidate in range(min(style_num_heads, sat_embed_dim), 0, -1):
-                if sat_embed_dim % candidate == 0:
-                    style_num_heads = candidate
-                    break
-    satellite_style_adapter = SatelliteStyleAdapter(
-        sat_in_dim=sat_embed_dim,
-        out_dim=cross_attention_dim,
-        num_tokens=style_num_tokens,
-        num_heads=style_num_heads,
-        scale=float(reading_cfg.get("style_scale", 0.5)),
-    )
-
-    # Replace UNet with satellite-conditioned version
-    pipeline.unet = SatelliteConditionedUNet(
-        reading_block_config={
-            'sat_in_dim': sat_embed_dim,
-            'plucker_dropout_prob': reading_cfg.get('plucker_dropout_prob', 0.3),
-            'style_num_tokens': reading_cfg.get('style_num_tokens', 4),
-            'style_num_heads': reading_cfg.get('style_num_heads', 8),
-            'style_scale': reading_cfg.get('style_scale', 0.5),
-            'view_grid_h': reading_cfg.get('view_grid_h', 8),
-            'view_grid_w': reading_cfg.get('view_grid_w', 20),
-            'view_query_dim': reading_cfg.get('view_query_dim', sat_embed_dim),
-            'view_num_heads': reading_cfg.get('view_num_heads', 8),
-            'view_scale': reading_cfg.get('view_scale', 1.0),
-            'view_geo_bias_weight': reading_cfg.get('view_geo_bias_weight', 1.0),
-            'view_geo_sigma': reading_cfg.get('view_geo_sigma', 0.35),
-            'view_local_topk': reading_cfg.get('view_local_topk', 25),
-            'view_geo_target_sigma': reading_cfg.get('view_geo_target_sigma', 0.20),
-            'view_geo_loss_weight': reading_cfg.get('view_geo_loss_weight', 0.1),
-            'view_gate_hidden_dim': reading_cfg.get('view_gate_hidden_dim', 256),
-            'save_attention_heatmap': reading_cfg.get('save_attention_heatmap', True),
-            'heatmap_max_tokens': reading_cfg.get('heatmap_max_tokens', 16),
-        },
-        **base_unet.config,
-    )
-
-    # Load weights from base model
-    pipeline.unet.load_state_dict(base_unet.state_dict(), strict=False)
-
-    if freeze_base:
-        # Freeze most layers of the base model
-        for param in pipeline.vae.parameters():
-            param.requires_grad = False
-        for param in pipeline.text_encoder.parameters():
-            param.requires_grad = False
-        for param in pipeline.unet.parameters():
-            param.requires_grad = False
-
-        # Unfreeze top layers
-        for param in pipeline.unet.up_blocks[-1].parameters():
-            param.requires_grad = True
-        for param in pipeline.unet.mid_block.parameters():
-            param.requires_grad = True
-
-    return SatelliteConditionedSDPipeline(
-        satellite_encoder=satellite_encoder,
-        satellite_style_adapter=satellite_style_adapter,
-        vae=pipeline.vae,
-        text_encoder=pipeline.text_encoder,
-        tokenizer=pipeline.tokenizer,
-        unet=pipeline.unet,
-        scheduler=pipeline.scheduler,
-        safety_checker=pipeline.safety_checker,
-        feature_extractor=pipeline.feature_extractor,
-        image_encoder=None,
-        requires_safety_checker=pipeline.requires_safety_checker,
-    )
+        self._view_condition_map = view_condition_map
+        try:
+            return super().forward(
+                sample=sample,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                **kwargs,
+            )
+        finally:
+            self._view_condition_map = None

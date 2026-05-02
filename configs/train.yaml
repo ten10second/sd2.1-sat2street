@@ -53,22 +53,24 @@ model:
   reading_block:
     enable: true
     sat_in_dim: 768
-    style_num_tokens: 4
+    style_num_tokens: 8
     style_num_heads: 8
-    style_scale: 0.5
+    style_scale: 1.0
     view_grid_h: 8
     view_grid_w: 20
     view_query_dim: 768
     view_num_heads: 8
-    view_scale: 1.0
+    view_scale: 0.4
     view_geo_bias_weight: 1.0
     view_geo_sigma: 0.35
     view_local_topk: 25
     view_geo_target_sigma: 0.20
-    view_geo_loss_weight: 0.1
+    view_geo_loss_weight: 0.01
     view_gate_hidden_dim: 256
-    save_attention_heatmap: true
+    save_attention_heatmap: false
     heatmap_max_tokens: 16
+    view_injection_sites: [down2, down3, mid, up0, up1]
+    view_modulation_scale: 0.4
     plucker_dropout_prob: 0.3
 
 # 训练配置

@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 
 class ViewAwareSatelliteAdapter(nn.Module):
-    """Query local satellite world tokens with target-view geometry tokens."""
+    """Query local satellite world tokens and return a spatial view-conditioning map."""
 
     def __init__(
         self,
@@ -245,6 +245,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
         if condition_mask is not None:
             token_gate = token_gate * condition_mask.to(device=device, dtype=dtype).view(batch, 1, 1)
         view_tokens = view_tokens * token_gate
+        view_map = view_tokens.reshape(batch, self.grid_h, self.grid_w, self.out_dim).permute(0, 3, 1, 2).contiguous()
 
         entropy = -(local_attn_mean * local_attn_mean.clamp_min(1e-8).log()).sum(dim=-1)
         entropy = (entropy * valid_tokens.squeeze(-1).float()).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
@@ -274,4 +275,4 @@ class ViewAwareSatelliteAdapter(nn.Module):
             "nearest_geo_dist": nearest_geo_dist.detach(),
             "geo_kl": geo_kl.detach(),
         }
-        return view_tokens
+        return view_map
