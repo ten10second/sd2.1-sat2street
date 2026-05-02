@@ -223,17 +223,17 @@ def main():
         help="Optional checkpoint used to initialize model weights before training.",
     )
     parser.add_argument(
-        "--dataset_mode", type=str, default="front",
+        "--dataset_mode", type=str, default="fisheye_virtual",
         choices=["front", "fisheye_virtual"],
         help="Dataset view mode used for training/validation.",
     )
     parser.add_argument(
-        "--yaw_mode", type=str, default="fisheye_relative",
+        "--yaw_mode", type=str, default="vehicle_relative",
         choices=["fisheye_relative", "vehicle_relative"],
         help="Yaw semantics for virtual fisheye views.",
     )
     parser.add_argument(
-        "--view_set", type=str, default="single",
+        "--view_set", type=str, default="grouped_front_fixed_yaw5",
         choices=["single", "fixed5", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"],
         help="Per-frame view expansion for fisheye_virtual. 'grouped_front_fixed_yaw5' returns front plus yaw -120/-60/60/120 as one grouped sample.",
     )

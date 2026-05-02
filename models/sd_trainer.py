@@ -30,7 +30,6 @@ from PIL import Image
 
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import DEFAULT_SATELLITE_EMBED_DIM, SatelliteConditionedUNet
-from models.unet.satellite_style_adapter import SatelliteStyleAdapter
 from models.unet.view_aware_satellite_adapter import ViewAwareSatelliteAdapter
 
 
@@ -166,7 +165,13 @@ def load_model_state_dict(
     state_dict: Dict[str, torch.Tensor],
 ) -> None:
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing_prefixes = ("unet._view_condition_projs.",)
+    allowed_missing_prefixes = (
+        "unet._view_condition_projs.",
+        "view_satellite_adapter.token_pool_query",
+        "view_satellite_adapter.token_pool_query_norm.",
+        "view_satellite_adapter.token_pool_attn.",
+        "view_satellite_adapter.token_out.",
+    )
     missing = [key for key in incompatible.missing_keys if not key.startswith(allowed_missing_prefixes)]
     unexpected = list(incompatible.unexpected_keys)
     if missing or unexpected:
@@ -176,7 +181,7 @@ def load_model_state_dict(
         )
     if incompatible.missing_keys:
         logger.warning(
-            "Checkpoint missing view-condition projection weights; using freshly initialized projections for: %s",
+            "Checkpoint missing view-condition or unified-reader weights; using freshly initialized modules for: %s",
             ", ".join(incompatible.missing_keys),
         )
 
@@ -279,26 +284,9 @@ class SatelliteConditionedSDModel(nn.Module):
         sat_embed_dim = int(getattr(self.satellite_encoder, "embed_dim", DEFAULT_SATELLITE_EMBED_DIM))
 
         adapter_cfg = dict(getattr(self.unet, "reading_block_config", {}) or {})
-        style_num_tokens = int(adapter_cfg.get("style_num_tokens", 4))
-        style_num_heads = int(adapter_cfg.get("style_num_heads", 8))
-        if sat_embed_dim % style_num_heads != 0:
-            if sat_embed_dim % 64 == 0:
-                style_num_heads = sat_embed_dim // 64
-            else:
-                style_num_heads = 1
-                for candidate in range(min(style_num_heads, sat_embed_dim), 0, -1):
-                    if sat_embed_dim % candidate == 0:
-                        style_num_heads = candidate
-                        break
-        style_scale = float(adapter_cfg.get("style_scale", 0.5))
         cross_attention_dim = int(getattr(self.unet.config, "cross_attention_dim", 1024) or 1024)
-        self.satellite_style_adapter = SatelliteStyleAdapter(
-            sat_in_dim=sat_embed_dim,
-            out_dim=cross_attention_dim,
-            num_tokens=style_num_tokens,
-            num_heads=style_num_heads,
-            scale=style_scale,
-        )
+        token_pool_num_tokens = int(adapter_cfg.get("token_pool_num_tokens", 8))
+        token_pool_num_heads = int(adapter_cfg.get("token_pool_num_heads", 8))
         view_query_dim = int(adapter_cfg.get("view_query_dim", sat_embed_dim))
         view_num_heads = int(adapter_cfg.get("view_num_heads", 8))
         if view_query_dim % view_num_heads != 0:
@@ -320,10 +308,14 @@ class SatelliteConditionedSDModel(nn.Module):
             local_topk=int(adapter_cfg.get("view_local_topk", 25)),
             geo_target_sigma=float(adapter_cfg.get("view_geo_target_sigma", 0.20)),
             gate_hidden_dim=int(adapter_cfg.get("view_gate_hidden_dim", 256)),
+            token_pool_num_tokens=token_pool_num_tokens,
+            token_pool_num_heads=token_pool_num_heads,
+            token_scale=float(adapter_cfg.get("token_scale", 1.0)),
             save_attention_heatmap=bool(adapter_cfg.get("save_attention_heatmap", True)),
             heatmap_max_tokens=int(adapter_cfg.get("heatmap_max_tokens", 16)),
         )
         self.view_geo_loss_weight = float(adapter_cfg.get("view_geo_loss_weight", 0.1))
+        self.scene_consistency_weight = float(adapter_cfg.get("scene_consistency_weight", 0.0))
 
         # Freeze base layers
         if freeze_base:
@@ -340,31 +332,25 @@ class SatelliteConditionedSDModel(nn.Module):
         # Satellite encoder is always trainable
         for param in self.satellite_encoder.parameters():
             param.requires_grad = True
-        for param in self.satellite_style_adapter.parameters():
-            param.requires_grad = True
         for param in self.view_satellite_adapter.parameters():
             param.requires_grad = True
 
         logger.info(f"[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
         logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
-        logger.info(f"  Satellite style adapter params: {sum(p.numel() for p in self.satellite_style_adapter.parameters())}")
         logger.info(f"  View-aware satellite adapter params: {sum(p.numel() for p in self.view_satellite_adapter.parameters())}")
+        logger.info(f"  Scene consistency weight: {self.scene_consistency_weight}")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
-    def encode_satellite(self, sat_images: torch.Tensor, coords_map: torch.Tensor = None) -> torch.Tensor:
-        """Encode satellite images to embeddings."""
+    def encode_scene_memory(
+        self,
+        sat_images: torch.Tensor,
+        coords_map: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode satellite images into a shared scene memory."""
         return self.satellite_encoder(sat_images, coords_map, return_sat_xy=True)
 
-    def encode_satellite_style(
-        self,
-        sat_tokens: torch.Tensor,
-        condition_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Encode low-capacity global style tokens for the native cross-attn path."""
-        return self.satellite_style_adapter(sat_tokens, condition_mask=condition_mask)
-
-    def encode_satellite_view(
+    def read_scene_with_pose(
         self,
         sat_tokens: torch.Tensor,
         sat_xy: torch.Tensor,
@@ -372,7 +358,7 @@ class SatelliteConditionedSDModel(nn.Module):
         coords_valid_mask: Optional[torch.Tensor],
         plucker_map: Optional[torch.Tensor],
         condition_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         return self.view_satellite_adapter(
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
@@ -380,14 +366,8 @@ class SatelliteConditionedSDModel(nn.Module):
             plucker=plucker_map,
             valid_mask=coords_valid_mask,
             condition_mask=condition_mask,
+            return_dict=True,
         )
-
-    def encode_style_tokens(
-        self,
-        sat_tokens: torch.Tensor,
-        condition_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.encode_satellite_style(sat_tokens, condition_mask=condition_mask)
 
     @staticmethod
     def _normalize_images_for_vae(images: torch.Tensor) -> torch.Tensor:
@@ -420,6 +400,25 @@ class SatelliteConditionedSDModel(nn.Module):
         batch, views = tensor.shape[:2]
         return tensor.reshape(batch * views, *tensor.shape[2:])
 
+    def _compute_scene_consistency_loss(
+        self,
+        readout_tokens: torch.Tensor,
+        grouped_views: bool,
+        batch_size: int,
+        num_views: int,
+    ) -> torch.Tensor:
+        if (not grouped_views) or self.scene_consistency_weight <= 0.0:
+            return readout_tokens.new_zeros(())
+        if readout_tokens.ndim != 3:
+            return readout_tokens.new_zeros(())
+
+        pooled = readout_tokens.mean(dim=1)
+        pooled = pooled.reshape(batch_size, num_views, pooled.shape[-1])
+        pooled = F.normalize(pooled, dim=-1)
+        anchor = pooled[:, :1, :]
+        similarities = (pooled[:, 1:, :] * anchor).sum(dim=-1)
+        return (1.0 - similarities).mean()
+
     def forward(
         self,
         sat_images: torch.Tensor,
@@ -447,7 +446,7 @@ class SatelliteConditionedSDModel(nn.Module):
         device = sat_images.device
 
         # Encode satellite images
-        sat_encoded = self.encode_satellite(sat_images, coords_map)
+        sat_encoded = self.encode_scene_memory(sat_images, coords_map)
         if isinstance(sat_encoded, tuple):
             sat_tokens, sat_xy = sat_encoded
         else:
@@ -478,11 +477,7 @@ class SatelliteConditionedSDModel(nn.Module):
             coords_valid_mask = self._flatten_grouped_views(coords_valid_mask)
             plucker_for_unet = self._flatten_grouped_views(plucker_for_unet)
 
-        encoder_hidden_states = self.encode_style_tokens(
-            sat_tokens=sat_tokens,
-            condition_mask=condition_mask,
-        )
-        view_condition_map = self.encode_satellite_view(
+        reader_outputs = self.read_scene_with_pose(
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
             coords_map=coords_map,
@@ -490,6 +485,8 @@ class SatelliteConditionedSDModel(nn.Module):
             plucker_map=plucker_for_unet,
             condition_mask=condition_mask,
         )
+        encoder_hidden_states = reader_outputs["readout_tokens"]
+        view_condition_map = reader_outputs["readout_map"]
 
         # Encode target images to latents
         with torch.no_grad():
@@ -529,22 +526,33 @@ class SatelliteConditionedSDModel(nn.Module):
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
         diffusion_loss = F.mse_loss(model_pred, target, reduction="mean")
-        view_geo_kl = self.view_satellite_adapter.last_stats.get("geo_kl")
-        if torch.is_tensor(view_geo_kl):
-            geo_loss = view_geo_kl.to(diffusion_loss.device)
-        else:
+        geo_loss = reader_outputs.get("geo_loss")
+        if not torch.is_tensor(geo_loss):
             geo_loss = diffusion_loss.new_zeros(())
+        else:
+            geo_loss = geo_loss.to(diffusion_loss.device)
+        scene_consistency_loss = self._compute_scene_consistency_loss(
+            readout_tokens=encoder_hidden_states,
+            grouped_views=grouped_views,
+            batch_size=B,
+            num_views=num_views,
+        ).to(diffusion_loss.device)
         view_stats = {
             f"view_{key}": value.to(diffusion_loss.device)
             for key, value in self.view_satellite_adapter.last_stats.items()
             if torch.is_tensor(value)
         }
-        loss = diffusion_loss + self.view_geo_loss_weight * geo_loss
+        loss = (
+            diffusion_loss
+            + self.view_geo_loss_weight * geo_loss
+            + self.scene_consistency_weight * scene_consistency_loss
+        )
 
         return {
             'loss': loss,
             'diffusion_loss': diffusion_loss,
             'view_geo_loss': geo_loss,
+            'scene_consistency_loss': scene_consistency_loss,
             'model_pred': model_pred,
             'target': target,
             **view_stats,
@@ -624,7 +632,7 @@ class SatelliteConditionedSDModel(nn.Module):
         device = sat_images.device
 
         # Encode satellite images
-        sat_encoded = self.encode_satellite(sat_images, coords_map)
+        sat_encoded = self.encode_scene_memory(sat_images, coords_map)
         if isinstance(sat_encoded, tuple):
             sat_tokens, sat_xy = sat_encoded
         else:
@@ -641,11 +649,7 @@ class SatelliteConditionedSDModel(nn.Module):
             raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
         if sat_xy is None:
             raise ValueError("Satellite encoder must return sat_xy for view-aware conditioning")
-        encoder_hidden_states = self.encode_style_tokens(
-            sat_tokens=sat_tokens,
-            condition_mask=condition_mask,
-        )
-        view_condition_map = self.encode_satellite_view(
+        reader_outputs = self.read_scene_with_pose(
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
             coords_map=coords_map,
@@ -653,6 +657,8 @@ class SatelliteConditionedSDModel(nn.Module):
             plucker_map=plucker_map,
             condition_mask=condition_mask,
         )
+        encoder_hidden_states = reader_outputs["readout_tokens"]
+        view_condition_map = reader_outputs["readout_map"]
 
         image_h, image_w = self._infer_generation_size(coords_map=coords_map, target_size=target_size)
         vae_scale_factor = self._get_vae_scale_factor()
@@ -805,9 +811,6 @@ def create_sd_model(
         reading_block_config={
             'sat_in_dim': sat_embed_dim,
             'plucker_dropout_prob': reading_cfg.get('plucker_dropout_prob', 0.3),
-            'style_num_tokens': reading_cfg.get('style_num_tokens', 4),
-            'style_num_heads': reading_cfg.get('style_num_heads', 8),
-            'style_scale': reading_cfg.get('style_scale', 0.5),
             'view_grid_h': reading_cfg.get('view_grid_h', 8),
             'view_grid_w': reading_cfg.get('view_grid_w', 20),
             'view_query_dim': reading_cfg.get('view_query_dim', sat_embed_dim),
@@ -819,6 +822,10 @@ def create_sd_model(
             'view_geo_target_sigma': reading_cfg.get('view_geo_target_sigma', 0.20),
             'view_geo_loss_weight': reading_cfg.get('view_geo_loss_weight', 0.1),
             'view_gate_hidden_dim': reading_cfg.get('view_gate_hidden_dim', 256),
+            'token_pool_num_tokens': reading_cfg.get('token_pool_num_tokens', 8),
+            'token_pool_num_heads': reading_cfg.get('token_pool_num_heads', 8),
+            'token_scale': reading_cfg.get('token_scale', 1.0),
+            'scene_consistency_weight': reading_cfg.get('scene_consistency_weight', 0.0),
             'save_attention_heatmap': reading_cfg.get('save_attention_heatmap', False),
             'heatmap_max_tokens': reading_cfg.get('heatmap_max_tokens', 16),
         },
@@ -1296,8 +1303,11 @@ class SDTrainer:
             total_raw_loss += raw_loss.item()
             postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
             view_gate = outputs.get('view_gate_mean')
+            scene_consistency_loss = outputs.get('scene_consistency_loss')
             if torch.is_tensor(view_gate):
                 postfix['view_gate'] = f"{view_gate.item():.2f}"
+            if torch.is_tensor(scene_consistency_loss) and self.scene_consistency_weight > 0.0:
+                postfix['scene_cons'] = f"{scene_consistency_loss.item():.3f}"
             if self.is_main_process:
                 progress_bar.set_postfix(postfix)
 
@@ -1310,13 +1320,15 @@ class SDTrainer:
                 view_nearest_geo_dist = outputs.get('view_nearest_geo_dist')
                 view_geo_loss = outputs.get('view_geo_loss')
                 view_geo_kl = outputs.get('view_geo_kl')
+                scene_consistency_loss = outputs.get('scene_consistency_loss')
                 if all(torch.is_tensor(v) for v in (view_valid_ratio, view_gate, view_entropy)):
                     logger.info(
-                        "Train step %d/%d: raw_loss=%.6f geo_loss=%.6f view_gate=%.4f view_valid=%.4f view_entropy=%.4f view_geo=%.4f nearest_geo=%.4f",
+                        "Train step %d/%d: raw_loss=%.6f geo_loss=%.6f scene_cons=%.6f view_gate=%.4f view_valid=%.4f view_entropy=%.4f view_geo=%.4f nearest_geo=%.4f",
                         step + 1,
                         num_batches,
                         raw_loss.item(),
                         view_geo_loss.item() if torch.is_tensor(view_geo_loss) else float("nan"),
+                        scene_consistency_loss.item() if torch.is_tensor(scene_consistency_loss) else float("nan"),
                         view_gate.item(),
                         view_valid_ratio.item(),
                         view_entropy.item(),
@@ -1334,6 +1346,7 @@ class SDTrainer:
                     'train/raw_loss': raw_loss.item(),
                     'train/diffusion_loss': outputs.get('diffusion_loss', raw_loss).item(),
                     'train/view_geo_loss': view_geo_loss.item() if torch.is_tensor(view_geo_loss) else 0.0,
+                    'train/scene_consistency_loss': scene_consistency_loss.item() if torch.is_tensor(scene_consistency_loss) else 0.0,
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
                     'train/epoch': epoch + 1,
                 }
@@ -1362,6 +1375,7 @@ class SDTrainer:
                     "raw_loss": raw_loss.item(),
                     "diffusion_loss": outputs.get('diffusion_loss', raw_loss).item(),
                     "view_geo_loss": view_geo_loss.item() if torch.is_tensor(view_geo_loss) else None,
+                    "scene_consistency_loss": scene_consistency_loss.item() if torch.is_tensor(scene_consistency_loss) else None,
                     "lr": self.lr_scheduler.get_last_lr()[0],
                     "view_valid_ratio": view_valid_ratio.item() if torch.is_tensor(view_valid_ratio) else None,
                     "view_gate_mean": view_gate.item() if torch.is_tensor(view_gate) else None,

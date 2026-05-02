@@ -1,11 +1,11 @@
 """
-View-aware satellite token adapter.
+View-aware satellite scene reader.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -13,7 +13,13 @@ import torch.nn.functional as F
 
 
 class ViewAwareSatelliteAdapter(nn.Module):
-    """Query local satellite world tokens and return a spatial view-conditioning map."""
+    """
+    Query local satellite scene memory with pose-conditioned queries.
+
+    The reader keeps the previous map output for backward compatibility, while
+    also exposing unified readout tokens so cross-attention and feature-map
+    conditioning can come from the same scene readout.
+    """
 
     def __init__(
         self,
@@ -29,6 +35,9 @@ class ViewAwareSatelliteAdapter(nn.Module):
         local_topk: int = 25,
         geo_target_sigma: float = 0.20,
         gate_hidden_dim: int = 256,
+        token_pool_num_tokens: int = 8,
+        token_pool_num_heads: Optional[int] = None,
+        token_scale: float = 1.0,
         save_attention_heatmap: bool = True,
         heatmap_max_tokens: int = 16,
     ):
@@ -47,6 +56,13 @@ class ViewAwareSatelliteAdapter(nn.Module):
             raise ValueError(f"geo_target_sigma must be positive, got {geo_target_sigma}")
         if local_topk <= 0:
             raise ValueError(f"local_topk must be positive, got {local_topk}")
+        if token_pool_num_tokens <= 0:
+            raise ValueError(f"token_pool_num_tokens must be positive, got {token_pool_num_tokens}")
+        token_pool_num_heads = int(token_pool_num_heads or num_heads)
+        if query_dim % token_pool_num_heads != 0:
+            raise ValueError(
+                f"query_dim must be divisible by token_pool_num_heads, got {query_dim}/{token_pool_num_heads}"
+            )
 
         self.sat_in_dim = int(sat_in_dim)
         self.out_dim = int(out_dim)
@@ -60,8 +76,13 @@ class ViewAwareSatelliteAdapter(nn.Module):
         self.geo_sigma = float(geo_sigma)
         self.local_topk = int(local_topk)
         self.geo_target_sigma = float(geo_target_sigma)
+        self.token_pool_num_tokens = int(token_pool_num_tokens)
+        self.token_pool_num_heads = int(token_pool_num_heads)
+        self.token_scale = float(token_scale)
         self.save_attention_heatmap = bool(save_attention_heatmap)
         self.heatmap_max_tokens = int(max(1, heatmap_max_tokens))
+        self.scale = float(scale)
+        self.map_scale = float(scale)
 
         self.query_mlp = nn.Sequential(
             nn.Linear(9, query_dim),
@@ -88,17 +109,35 @@ class ViewAwareSatelliteAdapter(nn.Module):
             nn.Linear(query_dim, out_dim),
             nn.LayerNorm(out_dim),
         )
+        self.token_pool_query = nn.Parameter(
+            torch.randn(self.token_pool_num_tokens, query_dim) / math.sqrt(query_dim)
+        )
+        self.token_pool_query_norm = nn.LayerNorm(query_dim)
+        self.token_pool_attn = nn.MultiheadAttention(
+            embed_dim=query_dim,
+            num_heads=self.token_pool_num_heads,
+            batch_first=True,
+        )
+        self.token_out = nn.Sequential(
+            nn.LayerNorm(query_dim),
+            nn.Linear(query_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
         self.gate_mlp = nn.Sequential(
             nn.Linear(query_dim + 9, gate_hidden_dim),
             nn.LayerNorm(gate_hidden_dim),
             nn.SiLU(),
             nn.Linear(gate_hidden_dim, 1),
         )
-        self.last_stats: dict[str, torch.Tensor] = {}
+        self.last_stats: Dict[str, torch.Tensor] = {}
         self.last_attention_heatmap: Optional[torch.Tensor] = None
         self.last_attention_index: Optional[torch.Tensor] = None
         self.last_sat_xy: Optional[torch.Tensor] = None
         self.last_view_xy: Optional[torch.Tensor] = None
+        self.last_query_tokens: Optional[torch.Tensor] = None
+        self.last_readout_tokens: Optional[torch.Tensor] = None
+        self.last_readout_map: Optional[torch.Tensor] = None
+        self.last_readout_tokens_raw: Optional[torch.Tensor] = None
 
     @staticmethod
     def _as_bchw_map(
@@ -124,14 +163,14 @@ class ViewAwareSatelliteAdapter(nn.Module):
         return None
 
     @staticmethod
-    def _pool_map(x: torch.Tensor, size: tuple[int, int], mode: str = "bilinear") -> torch.Tensor:
+    def _pool_map(x: torch.Tensor, size: Tuple[int, int], mode: str = "bilinear") -> torch.Tensor:
         if mode == "nearest":
             pooled = F.interpolate(x, size=size, mode=mode)
         else:
             pooled = F.interpolate(x, size=size, mode=mode, align_corners=False)
         return pooled.permute(0, 2, 3, 1).reshape(x.shape[0], size[0] * size[1], x.shape[1])
 
-    def _build_query_features(
+    def _build_pose_query_inputs(
         self,
         front_bev_xy: Optional[torch.Tensor],
         plucker: Optional[torch.Tensor],
@@ -139,7 +178,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         batch: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         size = (self.grid_h, self.grid_w)
 
         xy_map = self._as_bchw_map(front_bev_xy, 2, device, dtype)
@@ -162,29 +201,17 @@ class ViewAwareSatelliteAdapter(nn.Module):
 
         return xy_tokens, plucker_tokens, valid_tokens
 
-    def forward(
+    def _build_query_features(
         self,
-        sat_tokens: torch.Tensor,
-        sat_xy: torch.Tensor,
         front_bev_xy: Optional[torch.Tensor],
         plucker: Optional[torch.Tensor],
-        valid_mask: Optional[torch.Tensor] = None,
-        condition_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if sat_tokens.ndim != 3 or sat_tokens.shape[-1] != self.sat_in_dim:
-            raise ValueError(
-                f"sat_tokens must be [B,N,{self.sat_in_dim}], got {list(sat_tokens.shape)}"
-            )
-        if sat_xy.ndim != 3 or sat_xy.shape[:2] != sat_tokens.shape[:2] or sat_xy.shape[-1] != 2:
-            raise ValueError(
-                f"sat_xy must be [B,{sat_tokens.shape[1]},2], got {list(sat_xy.shape)}"
-            )
-
-        batch = sat_tokens.shape[0]
-        device = sat_tokens.device
-        dtype = sat_tokens.dtype
-
-        xy_tokens, plucker_tokens, valid_tokens = self._build_query_features(
+        valid_mask: Optional[torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+        batch: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Backward-compatible wrapper used by older call sites/tests.
+        return self._build_pose_query_inputs(
             front_bev_xy=front_bev_xy,
             plucker=plucker,
             valid_mask=valid_mask,
@@ -192,12 +219,34 @@ class ViewAwareSatelliteAdapter(nn.Module):
             dtype=dtype,
             batch=batch,
         )
-        query_input = torch.cat([xy_tokens, plucker_tokens, valid_tokens], dim=-1)
-        query = self.query_mlp(query_input)
 
-        world = self.world_proj(self.sat_norm(sat_tokens)) + self.world_xy_proj(sat_xy.to(device=device, dtype=dtype))
+    def _encode_pose_queries(
+        self,
+        xy_tokens: torch.Tensor,
+        plucker_tokens: torch.Tensor,
+        valid_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        query_input = torch.cat([xy_tokens, plucker_tokens, valid_tokens], dim=-1)
+        query_tokens = self.query_mlp(query_input)
+        return query_input, query_tokens
+
+    def _read_scene_locally(
+        self,
+        scene_tokens: torch.Tensor,
+        scene_xy: torch.Tensor,
+        pose_query_tokens: torch.Tensor,
+        query_xy_tokens: torch.Tensor,
+        valid_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch = scene_tokens.shape[0]
+        device = scene_tokens.device
+        dtype = scene_tokens.dtype
+
+        world = self.world_proj(self.sat_norm(scene_tokens)) + self.world_xy_proj(
+            scene_xy.to(device=device, dtype=dtype)
+        )
         q, k, v = F._in_projection_packed(
-            query,
+            pose_query_tokens,
             world,
             world,
             self.attn.in_proj_weight,
@@ -207,8 +256,10 @@ class ViewAwareSatelliteAdapter(nn.Module):
         k = k.reshape(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        geo_dist2 = (xy_tokens[:, :, None, :] - sat_xy.to(device=device, dtype=dtype)[:, None, :, :]).pow(2).sum(dim=-1)
-        local_topk = min(self.local_topk, sat_tokens.shape[1])
+        geo_dist2 = (
+            query_xy_tokens[:, :, None, :] - scene_xy.to(device=device, dtype=dtype)[:, None, :, :]
+        ).pow(2).sum(dim=-1)
+        local_topk = min(self.local_topk, scene_tokens.shape[1])
         local_dist2, local_index = torch.topk(geo_dist2, k=local_topk, dim=-1, largest=False)
 
         head_index = local_index[:, None, :, :].expand(-1, self.num_heads, -1, -1)
@@ -223,10 +274,10 @@ class ViewAwareSatelliteAdapter(nn.Module):
             local_geo_bias = -self.geo_bias_weight * local_dist2 / (self.geo_sigma ** 2 + 1e-6)
             logits = logits + local_geo_bias.unsqueeze(1)
         attn_weights = torch.softmax(logits.float(), dim=-1).to(dtype=dtype)
-        view_tokens = (attn_weights.unsqueeze(-1) * local_v).sum(dim=3)
-        view_tokens = view_tokens.transpose(1, 2).reshape(batch, -1, self.query_dim)
-        view_tokens = self.attn.out_proj(view_tokens)
-        view_tokens = self.out(view_tokens) * self.scale
+
+        readout_tokens_raw = (attn_weights.unsqueeze(-1) * local_v).sum(dim=3)
+        readout_tokens_raw = readout_tokens_raw.transpose(1, 2).reshape(batch, -1, self.query_dim)
+        readout_tokens_raw = self.attn.out_proj(readout_tokens_raw)
 
         local_attn_mean = attn_weights.float().mean(dim=1)
         local_geo_target = torch.softmax(
@@ -237,23 +288,125 @@ class ViewAwareSatelliteAdapter(nn.Module):
             local_geo_target
             * (local_geo_target.clamp_min(1e-8).log() - local_attn_mean.clamp_min(1e-8).log())
         ).sum(dim=-1)
-        geo_kl = (geo_kl * valid_tokens.squeeze(-1).float()).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
+        geo_kl = (
+            geo_kl * valid_tokens.squeeze(-1).float()
+        ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
+        return readout_tokens_raw, geo_kl, local_attn_mean, local_index
 
-        gate_input = torch.cat([query, query_input], dim=-1)
+    def _apply_query_gate(
+        self,
+        readout_tokens_raw: torch.Tensor,
+        pose_query_tokens: torch.Tensor,
+        query_input: torch.Tensor,
+        valid_tokens: torch.Tensor,
+        condition_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        gate_input = torch.cat([pose_query_tokens, query_input], dim=-1)
         token_gate = torch.sigmoid(self.gate_mlp(gate_input))
         token_gate = token_gate * valid_tokens
         if condition_mask is not None:
-            token_gate = token_gate * condition_mask.to(device=device, dtype=dtype).view(batch, 1, 1)
-        view_tokens = view_tokens * token_gate
-        view_map = view_tokens.reshape(batch, self.grid_h, self.grid_w, self.out_dim).permute(0, 3, 1, 2).contiguous()
+            token_gate = token_gate * condition_mask.to(
+                device=readout_tokens_raw.device,
+                dtype=readout_tokens_raw.dtype,
+            ).view(readout_tokens_raw.shape[0], 1, 1)
+        return readout_tokens_raw * token_gate, token_gate
+
+    def _pool_readout_tokens(
+        self,
+        readout_tokens_raw: torch.Tensor,
+    ) -> torch.Tensor:
+        batch = readout_tokens_raw.shape[0]
+        token_queries = self.token_pool_query.unsqueeze(0).expand(batch, -1, -1)
+        token_queries = self.token_pool_query_norm(token_queries)
+        pooled_tokens, _ = self.token_pool_attn(
+            token_queries,
+            readout_tokens_raw,
+            readout_tokens_raw,
+            need_weights=False,
+        )
+        return self.token_out(pooled_tokens) * self.token_scale
+
+    def _build_readout_map(
+        self,
+        readout_tokens_raw: torch.Tensor,
+    ) -> torch.Tensor:
+        readout_map_tokens = self.out(readout_tokens_raw) * self.map_scale
+        return readout_map_tokens.reshape(
+            readout_tokens_raw.shape[0],
+            self.grid_h,
+            self.grid_w,
+            self.out_dim,
+        ).permute(0, 3, 1, 2).contiguous()
+
+    def read_scene(
+        self,
+        sat_tokens: torch.Tensor,
+        sat_xy: torch.Tensor,
+        front_bev_xy: Optional[torch.Tensor],
+        plucker: Optional[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+        condition_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if sat_tokens.ndim != 3 or sat_tokens.shape[-1] != self.sat_in_dim:
+            raise ValueError(
+                f"sat_tokens must be [B,N,{self.sat_in_dim}], got {list(sat_tokens.shape)}"
+            )
+        if sat_xy.ndim != 3 or sat_xy.shape[:2] != sat_tokens.shape[:2] or sat_xy.shape[-1] != 2:
+            raise ValueError(
+                f"sat_xy must be [B,{sat_tokens.shape[1]},2], got {list(sat_xy.shape)}"
+            )
+
+        batch = sat_tokens.shape[0]
+        device = sat_tokens.device
+        dtype = sat_tokens.dtype
+
+        xy_tokens, plucker_tokens, valid_tokens = self._build_pose_query_inputs(
+            front_bev_xy=front_bev_xy,
+            plucker=plucker,
+            valid_mask=valid_mask,
+            device=device,
+            dtype=dtype,
+            batch=batch,
+        )
+        query_input, query_tokens = self._encode_pose_queries(
+            xy_tokens=xy_tokens,
+            plucker_tokens=plucker_tokens,
+            valid_tokens=valid_tokens,
+        )
+        readout_tokens_raw, geo_kl, local_attn_mean, local_index = self._read_scene_locally(
+            scene_tokens=sat_tokens,
+            scene_xy=sat_xy,
+            pose_query_tokens=query_tokens,
+            query_xy_tokens=xy_tokens,
+            valid_tokens=valid_tokens,
+        )
+        readout_tokens_raw, token_gate = self._apply_query_gate(
+            readout_tokens_raw=readout_tokens_raw,
+            pose_query_tokens=query_tokens,
+            query_input=query_input,
+            valid_tokens=valid_tokens,
+            condition_mask=condition_mask,
+        )
+        readout_tokens = self._pool_readout_tokens(readout_tokens_raw)
+        readout_map = self._build_readout_map(readout_tokens_raw)
 
         entropy = -(local_attn_mean * local_attn_mean.clamp_min(1e-8).log()).sum(dim=-1)
-        entropy = (entropy * valid_tokens.squeeze(-1).float()).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
-        local_geo_dist = local_dist2.float().sqrt()
+        entropy = (
+            entropy * valid_tokens.squeeze(-1).float()
+        ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
+        local_geo_dist = torch.gather(
+            (xy_tokens[:, :, None, :] - sat_xy.to(device=device, dtype=dtype)[:, None, :, :]).pow(2).sum(dim=-1).sqrt(),
+            dim=-1,
+            index=local_index,
+        ).float()
         attn_geo_dist = (local_attn_mean * local_geo_dist).sum(dim=-1)
-        attn_geo_dist = (attn_geo_dist * valid_tokens.squeeze(-1).float()).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
+        attn_geo_dist = (
+            attn_geo_dist * valid_tokens.squeeze(-1).float()
+        ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
         nearest_geo_dist = local_geo_dist[..., 0]
-        nearest_geo_dist = (nearest_geo_dist * valid_tokens.squeeze(-1).float()).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
+        nearest_geo_dist = (
+            nearest_geo_dist * valid_tokens.squeeze(-1).float()
+        ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
 
         if self.save_attention_heatmap:
             keep_tokens = min(self.heatmap_max_tokens, local_attn_mean.shape[1])
@@ -267,6 +420,10 @@ class ViewAwareSatelliteAdapter(nn.Module):
             self.last_sat_xy = None
             self.last_view_xy = None
 
+        self.last_query_tokens = query_tokens.detach().cpu()
+        self.last_readout_tokens = readout_tokens.detach().cpu()
+        self.last_readout_map = readout_map.detach().cpu()
+        self.last_readout_tokens_raw = readout_tokens_raw.detach().cpu()
         self.last_stats = {
             "valid_ratio": valid_tokens.float().mean().detach(),
             "gate_mean": token_gate.float().mean().detach(),
@@ -275,4 +432,32 @@ class ViewAwareSatelliteAdapter(nn.Module):
             "nearest_geo_dist": nearest_geo_dist.detach(),
             "geo_kl": geo_kl.detach(),
         }
-        return view_map
+        return {
+            "readout_tokens": readout_tokens,
+            "readout_map": readout_map,
+            "query_tokens": query_tokens,
+            "readout_tokens_raw": readout_tokens_raw,
+            "geo_loss": geo_kl,
+        }
+
+    def forward(
+        self,
+        sat_tokens: torch.Tensor,
+        sat_xy: torch.Tensor,
+        front_bev_xy: Optional[torch.Tensor],
+        plucker: Optional[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+        condition_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        outputs = self.read_scene(
+            sat_tokens=sat_tokens,
+            sat_xy=sat_xy,
+            front_bev_xy=front_bev_xy,
+            plucker=plucker,
+            valid_mask=valid_mask,
+            condition_mask=condition_mask,
+        )
+        if return_dict:
+            return outputs
+        return outputs["readout_map"]

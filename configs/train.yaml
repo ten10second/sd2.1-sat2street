@@ -15,7 +15,9 @@ data:
   image_size: [256, 256]
   sat_size: 512
   resolution: 0.2
-  mode: 'front'
+  mode: 'fisheye_virtual'
+  yaw_mode: 'vehicle_relative'
+  view_set: 'grouped_front_fixed_yaw5'
   front_resize: [640, 256]
 
 # 模型配置
@@ -53,9 +55,6 @@ model:
   reading_block:
     enable: true
     sat_in_dim: 768
-    style_num_tokens: 8
-    style_num_heads: 8
-    style_scale: 1.0
     view_grid_h: 8
     view_grid_w: 20
     view_query_dim: 768
@@ -67,6 +66,10 @@ model:
     view_geo_target_sigma: 0.20
     view_geo_loss_weight: 0.01
     view_gate_hidden_dim: 256
+    token_pool_num_tokens: 8
+    token_pool_num_heads: 8
+    token_scale: 1.0
+    scene_consistency_weight: 0.01
     save_attention_heatmap: false
     heatmap_max_tokens: 16
     view_injection_sites: [down2, down3, mid, up0, up1]
