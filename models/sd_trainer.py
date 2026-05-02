@@ -965,6 +965,10 @@ class SDTrainer:
                 find_unused_parameters=True,
             )
 
+        self.scene_consistency_weight = float(
+            getattr(self.unwrapped_model, "scene_consistency_weight", 0.0)
+        )
+
         # Setup optimizer
         self.optimizer = AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
@@ -1014,6 +1018,7 @@ class SDTrainer:
             logger.info(f"  Batch size per process: {train_dataloader.batch_size}")
             logger.info(f"  Mixed precision: {self.mixed_precision or 'disabled'}")
             logger.info(f"  Max grad norm: {self.max_grad_norm}")
+            logger.info(f"  Scene consistency weight: {self.scene_consistency_weight}")
             if self.use_wandb:
                 logger.info(
                     f"  W&B logging: project={self.project_name}, "
