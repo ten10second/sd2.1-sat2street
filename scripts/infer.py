@@ -61,6 +61,20 @@ ABLATION_MODE_CONFIGS: Dict[str, Tuple[str, str]] = {
 }
 
 
+def _load_reading_block_config(config_path: Path) -> Dict[str, object]:
+    if not config_path.is_file():
+        return {}
+    with config_path.open("r") as f:
+        config_data = yaml.safe_load(f) or {}
+    if not isinstance(config_data, dict):
+        return {}
+    model_cfg = config_data.get("model", {})
+    if not isinstance(model_cfg, dict):
+        return {}
+    reading_block = model_cfg.get("reading_block", {})
+    return reading_block if isinstance(reading_block, dict) else {}
+
+
 def _load_frame_ids(frames_file: Path) -> List[int]:
     frame_ids: List[int] = []
     for line in frames_file.read_text().splitlines():
@@ -166,9 +180,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--base_model", type=str, default=DEFAULT_SD21_BASE_REPO)
     parser.add_argument("--base_model_revision", type=str, default=None)
+    parser.add_argument("--config", type=str, default="configs/inference.yaml")
     parser.add_argument("--hf_endpoint", type=str, default=DEFAULT_HF_ENDPOINT)
     parser.add_argument("--hf_home", type=str, default=str(DEFAULT_HF_HOME))
     parser.add_argument(
@@ -567,21 +582,24 @@ def _filter_sample_indices(
 
 def _load_model(args: argparse.Namespace):
     model_torch_dtype = None
-    if args.device.startswith("cuda") and args.mixed_precision == "fp16":
-        model_torch_dtype = torch.float16
-    elif args.device.startswith("cuda") and args.mixed_precision == "bf16":
-        model_torch_dtype = torch.bfloat16
+    if args.mixed_precision != "no":
+        logger.warning(
+            "Ignoring --mixed_precision=%s for inference because the current "
+            "condition adapters are kept in fp32; loading all modules in fp32.",
+            args.mixed_precision,
+        )
 
     logger.info("Loading model")
+    reading_block_cfg = _load_reading_block_config(Path(args.config))
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        reading_block_config={"enable": True},
+        reading_block_config=reading_block_cfg,
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
     )
-    logger.info("Skipped UNet attention slicing because custom GeoRoPE attn2 processors must stay installed")
+    logger.info("UNet uses native cross-attention with precomputed scene/view condition tokens")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
     model.to(args.device)

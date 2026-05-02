@@ -497,6 +497,9 @@ class Kitti360dDataset(Dataset):
       - fixed5: expand each frame to five fixed views:
         front, left_forward_45, left_side, right_forward_45, right_side.
       - front_plus_random: expand each frame to front plus one random virtual fisheye view.
+      - grouped_front_plus_random: return front plus one random virtual fisheye view in one sample.
+      - grouped_front_plus_random4: return front plus four random virtual fisheye views in one sample.
+      - grouped_front_fixed_yaw5: return front plus fixed vehicle-relative yaw views [-120, -60, 60, 120].
 
     Returned dict keys:
       - image: torch.float32 (3,H,W) in [0,1]
@@ -598,9 +601,9 @@ class Kitti360dDataset(Dataset):
             raise ValueError(f"Unknown mode: {self.mode}")
         if self.yaw_mode not in {"fisheye_relative", "vehicle_relative"}:
             raise ValueError(f"Unknown yaw_mode: {self.yaw_mode}")
-        if self.view_set not in {"single", "fixed5", "front_plus_random"}:
+        if self.view_set not in {"single", "fixed5", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"}:
             raise ValueError(f"Unknown view_set: {self.view_set}")
-        if self.view_set in {"fixed5", "front_plus_random"} and self.mode != "fisheye_virtual":
+        if self.view_set in {"fixed5", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"} and self.mode != "fisheye_virtual":
             raise ValueError(f"view_set='{self.view_set}' requires mode='fisheye_virtual'")
         # fisheye_camera can be auto-selected based on yaw; only validate when explicitly set
         if self.fisheye_camera is not None and self.fisheye_camera not in {"image_02", "image_03"}:
@@ -662,11 +665,103 @@ class Kitti360dDataset(Dataset):
                             },
                         )
                     )
+                elif self.view_set == "grouped_front_plus_random":
+                    self.samples.append(
+                        SampleIndex(
+                            drive_dir=d,
+                            frame_id=int(fid),
+                            meta={
+                                "view_name": "front_plus_random_group",
+                                "grouped_views": [
+                                    {
+                                        "view_name": "front",
+                                        "mode_override": "front",
+                                    },
+                                    {
+                                        "view_name": "random_side",
+                                        "mode_override": "fisheye_virtual",
+                                    },
+                                ],
+                            },
+                        )
+                    )
+                elif self.view_set == "grouped_front_plus_random4":
+                    grouped_views = [
+                        {
+                            "view_name": "front",
+                            "mode_override": "front",
+                        }
+                    ]
+                    grouped_views.extend(
+                        {
+                            "view_name": f"random_side_{view_idx}",
+                            "mode_override": "fisheye_virtual",
+                        }
+                        for view_idx in range(4)
+                    )
+                    self.samples.append(
+                        SampleIndex(
+                            drive_dir=d,
+                            frame_id=int(fid),
+                            meta={
+                                "view_name": "front_plus_random4_group",
+                                "grouped_views": grouped_views,
+                            },
+                        )
+                    )
+                elif self.view_set == "grouped_front_fixed_yaw5":
+                    grouped_views = [
+                        {
+                            "view_name": "front",
+                            "mode_override": "front",
+                        }
+                    ]
+                    grouped_views.extend(
+                        {
+                            "view_name": f"yaw_{int(yaw_deg):+d}",
+                            "mode_override": "fisheye_virtual",
+                            "vehicle_relative_yaw_deg_override": float(yaw_deg),
+                        }
+                        for yaw_deg in (-120.0, -60.0, 60.0, 120.0)
+                    )
+                    self.samples.append(
+                        SampleIndex(
+                            drive_dir=d,
+                            frame_id=int(fid),
+                            meta={
+                                "view_name": "front_fixed_yaw5_group",
+                                "grouped_views": grouped_views,
+                            },
+                        )
+                    )
                 else:
                     self.samples.append(SampleIndex(drive_dir=d, frame_id=int(fid)))
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    @staticmethod
+    def _stack_grouped_samples(samples: List[Dict]) -> Dict:
+        grouped: Dict[str, Any] = {}
+        for key in samples[0].keys():
+            values = [sample[key] for sample in samples]
+            if all(torch.is_tensor(value) for value in values):
+                grouped[key] = torch.stack(values, dim=0)
+            elif key == "sat_available":
+                grouped[key] = torch.tensor([bool(value) for value in values], dtype=torch.bool)
+            else:
+                grouped[key] = values
+        grouped["sat"] = samples[0]["sat"]
+        grouped["sat_available"] = bool(all(sample.get("sat_available", False) for sample in samples))
+        grouped["frame_id"] = samples[0]["frame_id"]
+        grouped["drive"] = samples[0]["drive"]
+        grouped["meta"] = {
+            "grouped": True,
+            "num_views": len(samples),
+            "view_names": [sample.get("meta", {}).get("view_name") for sample in samples],
+            "views": [sample.get("meta", {}) for sample in samples],
+        }
+        return grouped
 
     def _resolve_sample_mode(self, sample: SampleIndex) -> str:
         mode = self.mode
@@ -922,6 +1017,23 @@ class Kitti360dDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict:
         s = self.samples[idx]
+        if isinstance(s.meta, dict) and isinstance(s.meta.get("grouped_views"), list):
+            samples = []
+            for view_meta in s.meta["grouped_views"]:
+                samples.append(
+                    self._get_single_sample(
+                        SampleIndex(
+                            drive_dir=s.drive_dir,
+                            frame_id=s.frame_id,
+                            meta=dict(view_meta),
+                        )
+                    )
+                )
+            return self._stack_grouped_samples(samples)
+
+        return self._get_single_sample(s)
+
+    def _get_single_sample(self, s: SampleIndex) -> Dict:
         drive_dir, frame_id = s.drive_dir, s.frame_id
         sample_mode = self._resolve_sample_mode(s)
         view_name = self._resolve_sample_view_name(s)

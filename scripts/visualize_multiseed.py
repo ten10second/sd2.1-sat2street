@@ -161,7 +161,7 @@ def _parse_args() -> argparse.Namespace:
         help="Device to use (cuda or cpu)",
     )
     parser.add_argument(
-        "--mixed_precision", type=str, default="fp16",
+        "--mixed_precision", type=str, default="no",
         choices=["no", "fp16", "bf16"],
         help="Precision mode used to load the model",
     )
@@ -336,10 +336,12 @@ def main() -> None:
     target_size = tuple(int(x) for x in real_image.shape[-2:])
 
     model_torch_dtype = None
-    if args.device.startswith("cuda") and args.mixed_precision == "fp16":
-        model_torch_dtype = torch.float16
-    elif args.device.startswith("cuda") and args.mixed_precision == "bf16":
-        model_torch_dtype = torch.bfloat16
+    if args.mixed_precision != "no":
+        logger.warning(
+            "Ignoring --mixed_precision=%s for inference because the current "
+            "condition adapters are kept in fp32; loading all modules in fp32.",
+            args.mixed_precision,
+        )
 
     logger.info("Loading model")
     model = create_sd_model(
@@ -350,7 +352,7 @@ def main() -> None:
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
     )
-    logger.info("Skipped UNet attention slicing because custom GeoRoPE attn2 processors must stay installed")
+    logger.info("UNet uses native cross-attention with precomputed scene/view condition tokens")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
     model.to(args.device)

@@ -234,8 +234,8 @@ def main():
     )
     parser.add_argument(
         "--view_set", type=str, default="single",
-        choices=["single", "fixed5", "front_plus_random"],
-        help="Per-frame view expansion for fisheye_virtual. 'fixed5' yields front plus four fixed side views; 'front_plus_random' yields front plus one random side view.",
+        choices=["single", "fixed5", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"],
+        help="Per-frame view expansion for fisheye_virtual. 'grouped_front_fixed_yaw5' returns front plus yaw -120/-60/60/120 as one grouped sample.",
     )
     parser.add_argument(
         "--vehicle_yaw_min_deg", type=float, default=60.0,
@@ -310,6 +310,11 @@ def main():
     )
 
     args = parser.parse_args()
+    config_data = {}
+    config_path = Path(args.config)
+    if config_path.is_file():
+        with config_path.open("r") as f:
+            config_data = yaml.safe_load(f) or {}
     distributed, rank, local_rank, world_size = _init_distributed(args)
     is_main_process = rank == 0
 
@@ -338,6 +343,11 @@ def main():
     if is_main_process:
         logger.info(f"Training configuration: {args}")
 
+    reading_block_cfg = (
+        config_data.get("model", {}).get("reading_block", {})
+        if isinstance(config_data, dict) else {}
+    )
+
     # Load data
     if is_main_process:
         logger.info(f"Loading data from: {args.data_dir}")
@@ -365,7 +375,7 @@ def main():
     train_dataset_kwargs = dict(common_dataset_kwargs)
     val_dataset_kwargs = dict(common_dataset_kwargs)
 
-    if args.dataset_mode != "front" and args.view_set in {"single", "front_plus_random"} and args.yaw_mode == "vehicle_relative":
+    if args.dataset_mode != "front" and args.view_set in {"single", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4"} and args.yaw_mode == "vehicle_relative":
         train_dataset_kwargs.update({
             "random_vehicle_relative_yaw": True,
             "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
@@ -428,7 +438,7 @@ def main():
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        reading_block_config={"enable": True},
+        reading_block_config=reading_block_cfg,
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
@@ -443,7 +453,7 @@ def main():
         if is_main_process:
             logger.info("Enabled UNet gradient checkpointing")
     if is_main_process:
-        logger.info("Skipped UNet attention slicing because custom GeoRoPE attn2 processors must stay installed")
+        logger.info("UNet uses native cross-attention with precomputed scene/view condition tokens")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
         if is_main_process:

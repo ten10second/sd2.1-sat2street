@@ -6,7 +6,7 @@ Custom Stable Diffusion implementation with satellite condition encoder.
 
 import torch
 import torch.nn as nn
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from diffusers import StableDiffusionPipeline
 try:
@@ -18,154 +18,55 @@ try:
     from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 except ImportError:
     from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
-from models.unet.georope_satellite_attn_processor import GeoRoPESatelliteAttnProcessor
+from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
+from models.unet.satellite_style_adapter import SatelliteStyleAdapter
 
 DEFAULT_SATELLITE_EMBED_DIM = 768
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
-    """
-    UNet2DConditionModel with satellite condition support.
-
-    Args:
-        use_satellite_reading: Whether to use GeoRoPE satellite attn2 processors
-        reading_injection_sites: Which U-Net blocks receive GeoRoPE satellite attn2 processors
-        reading_block_config: Configuration for GeoRoPE satellite attn2 processors
-        **kwargs: Additional arguments for UNet2DConditionModel
-    """
+    """UNet2DConditionModel wrapper that only accepts native encoder_hidden_states."""
 
     def __init__(
         self,
-        use_satellite_reading: bool = True,
-        reading_injection_sites: Optional[List[str]] = None,
         reading_block_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        self.supports_satellite_reading = True
-        self.use_satellite_reading = use_satellite_reading
-        self.reading_injection_sites = reading_injection_sites or ["down2", "down3", "mid", "up0", "up1"]
+        self.supports_satellite_reading = False
+        self.use_satellite_reading = False
         self.reading_block_config = {
             "sat_in_dim": DEFAULT_SATELLITE_EMBED_DIM,
-            "geo_ratio": 1.0,
-            "rope_base": 10000.0,
-            "invalid_conf_loss_weight": 0.05,
             "plucker_dropout_prob": 0.3,
+            "style_num_tokens": 4,
+            "style_num_heads": 8,
+            "style_scale": 0.5,
+            "view_grid_h": 8,
+            "view_grid_w": 20,
+            "view_query_dim": DEFAULT_SATELLITE_EMBED_DIM,
+            "view_num_heads": 8,
+            "view_scale": 1.0,
+            "view_geo_bias_weight": 1.0,
+            "view_geo_sigma": 0.35,
+            "view_local_topk": 25,
+            "view_geo_target_sigma": 0.20,
+            "view_geo_loss_weight": 0.1,
+            "view_gate_hidden_dim": 256,
+            "save_attention_heatmap": True,
+            "heatmap_max_tokens": 16,
         }
         if reading_block_config is not None:
             self.reading_block_config.update(reading_block_config)
-
-        sat_in_dim = int(self.reading_block_config["sat_in_dim"])
         self.plucker_dropout_prob = float(self.reading_block_config.get("plucker_dropout_prob", 0.0))
-        self._conditioning_context: Dict[str, Any] = {}
-        self.georope_attn_processor_names: List[str] = []
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
-        self.last_reading_stats: Dict[str, Dict[str, torch.Tensor]] = {}
-        self.last_reading_losses: Dict[str, Dict[str, torch.Tensor]] = {}
-
-        if self.use_satellite_reading:
-            self._register_georope_satellite_processors(sat_in_dim=sat_in_dim)
-
-    def _get_conditioning_context(self) -> Dict[str, Any]:
-        return self._conditioning_context
-
-    @staticmethod
-    def _processor_matches_site(processor_name: str, site: str) -> bool:
-        if site == "mid":
-            return processor_name.startswith("mid_block.") and ".attn2.processor" in processor_name
-        if site.startswith("down"):
-            return processor_name.startswith(f"down_blocks.{site[4:]}.") and ".attn2.processor" in processor_name
-        if site.startswith("up"):
-            return processor_name.startswith(f"up_blocks.{site[2:]}.") and ".attn2.processor" in processor_name
-        return False
-
-    def _register_georope_satellite_processors(self, sat_in_dim: int) -> None:
-        processors = dict(self.attn_processors)
-        module_by_processor_name = {
-            f"{name}.processor": module
-            for name, module in self.named_modules()
-            if hasattr(module, "set_processor") and name
-        }
-        selected_sites = tuple(self.reading_injection_sites)
-        for processor_name in list(processors.keys()):
-            if not any(self._processor_matches_site(processor_name, site) for site in selected_sites):
-                continue
-            if ".attn2.processor" not in processor_name:
-                continue
-            attn_module = module_by_processor_name.get(processor_name)
-            if attn_module is None:
-                continue
-            hidden_size = int(getattr(attn_module, "inner_dim", 0))
-            num_heads = int(getattr(attn_module, "heads", 0))
-            if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads != 0:
-                raise ValueError(f"Cannot infer attention dimensions for {processor_name}")
-            processors[processor_name] = GeoRoPESatelliteAttnProcessor(
-                name=processor_name.replace(".processor", ""),
-                hidden_size=hidden_size,
-                sat_in_dim=sat_in_dim,
-                num_heads=num_heads,
-                head_dim=hidden_size // num_heads,
-                context_provider=self._get_conditioning_context,
-                geo_ratio=float(self.reading_block_config.get("geo_ratio", 1.0)),
-                rope_base=float(self.reading_block_config.get("rope_base", 10000.0)),
-                invalid_conf_loss_weight=float(self.reading_block_config.get("invalid_conf_loss_weight", 0.05)),
-            )
-            self.georope_attn_processor_names.append(processor_name)
-        if not self.georope_attn_processor_names:
-            raise ValueError(
-                "No attn2 processors matched reading_injection_sites="
-                f"{list(self.reading_injection_sites)}"
-            )
-        self.set_attn_processor(processors)
 
     def forward(
         self,
         sample: torch.FloatTensor,
         timestep: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
-        sat_tokens: Optional[torch.Tensor] = None,
-        sat_xy: Optional[torch.Tensor] = None,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        front_bev_valid_mask: Optional[torch.Tensor] = None,
-        front_plucker: Optional[torch.Tensor] = None,
-        condition_mask: Optional[torch.Tensor] = None,
-        return_attn_map: bool = False,
         **kwargs,
     ):
-        """
-        Forward pass with satellite conditioning.
-
-        Args:
-            sample: (B, 4, H, W) - Noisy latent representation
-            timestep: (B,) or (1,) - Current timestep
-            encoder_hidden_states: Optional text/context states for the base U-Net cross-attention.
-            sat_tokens: (B, Ns, Cs) - Pre-encoded satellite tokens
-            sat_xy: (B, Ns, 2) - Satellite token BEV coordinates
-            front_bev_xy: (B, Nf, 2) - Frontview pixel BEV coordinates
-            front_bev_valid_mask: (B, 1, H, W) or (B, Nf) - Valid ground-projection mask
-            front_plucker: (B, 6, H, W) or (B, Nf, 6) - Per-pixel Plucker ray map
-            condition_mask: (B,) - Per-sample mask controlling whether reading injection is enabled
-            return_attn_map: Whether to return attention maps
-
-        Returns:
-            noise_pred: (B, 4, H, W) - Predicted noise
-        """
-        inferred_sat_tokens = sat_tokens
-        inferred_sat_xy = sat_xy
-        inferred_condition_mask = condition_mask
-
-        if inferred_sat_tokens is not None and inferred_sat_tokens.ndim != 3:
-            raise ValueError("sat_tokens must be [B, Ns, Cs]")
-        if inferred_sat_xy is not None and (inferred_sat_xy.ndim != 3 or inferred_sat_xy.shape[-1] != 2):
-            raise ValueError("sat_xy must be [B, Ns, 2]")
-        if inferred_condition_mask is not None:
-            if inferred_condition_mask.ndim != 1 or inferred_condition_mask.shape[0] != sample.shape[0]:
-                raise ValueError(
-                    f"condition_mask must be [B], got {list(inferred_condition_mask.shape)} for batch {sample.shape[0]}"
-                )
-            inferred_condition_mask = inferred_condition_mask.to(device=sample.device, dtype=torch.bool)
-
         cross_attention_dim = int(self.config.cross_attention_dim or 1024)
         if encoder_hidden_states is None:
             encoder_hidden_states = sample.new_zeros((sample.shape[0], 1, cross_attention_dim))
@@ -182,55 +83,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                     f"got {encoder_hidden_states.shape[-1]}"
                 )
 
-        enable_sat_condition = inferred_sat_tokens is not None
-        enable_reading = (
-            self.use_satellite_reading
-            and enable_sat_condition
-            and inferred_sat_xy is not None
-            and front_bev_xy is not None
-        )
-
-        if enable_sat_condition:
-            self._conditioning_context = {
-                "sat_tokens": inferred_sat_tokens,
-                "sat_xy": inferred_sat_xy,
-                "front_bev_xy": front_bev_xy,
-                "front_bev_valid_mask": front_bev_valid_mask,
-                "front_plucker": front_plucker,
-                "condition_mask": inferred_condition_mask,
-                "latent_hw": (int(sample.shape[-2]), int(sample.shape[-1])),
-                "return_attn_map": return_attn_map,
-                "attn_maps": {},
-                "reading_stats": {},
-                "reading_losses": {},
-            }
-        else:
-            self._conditioning_context = {}
-
         self.last_attn_maps = {}
-        self.last_reading_stats = {}
-        self.last_reading_losses = {}
-
-        try:
-            output = super().forward(
-                sample=sample,
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                **kwargs,
-            )
-        except Exception:
-            self._conditioning_context = {}
-            raise
-
-        if enable_reading:
-            self.last_attn_maps = self._conditioning_context.get("attn_maps", {})
-            self.last_reading_stats = self._conditioning_context.get("reading_stats", {})
-            self.last_reading_losses = self._conditioning_context.get("reading_losses", {})
-
-        # Keep the conditioning context alive after a successful forward so
-        # gradient checkpointing can re-run hooked submodules during backward
-        # with the same satellite inputs. The next forward overwrites it.
-        return output
+        return super().forward(
+            sample=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            **kwargs,
+        )
 
 
 class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
@@ -245,18 +104,29 @@ class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
     def __init__(
         self,
         satellite_encoder: nn.Module,
+        satellite_style_adapter: Optional[nn.Module] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self.satellite_encoder = satellite_encoder
         self.satellite_encoder.eval()
+        self.satellite_style_adapter = satellite_style_adapter
+        if self.satellite_style_adapter is not None:
+            self.satellite_style_adapter.eval()
 
     def _encode_satellite_images(self, sat_images: torch.Tensor):
         """Encode satellite images to embeddings."""
         with torch.no_grad():
             sat_emb = self.satellite_encoder(sat_images)
         return sat_emb
+
+    def _encode_satellite_style(self, sat_emb: torch.Tensor) -> torch.Tensor:
+        if self.satellite_style_adapter is None:
+            cross_attention_dim = int(self.unet.config.cross_attention_dim or sat_emb.shape[-1])
+            return sat_emb.new_zeros((sat_emb.shape[0], 4, cross_attention_dim))
+        with torch.no_grad():
+            return self.satellite_style_adapter(sat_emb)
 
     def __call__(
         self,
@@ -288,6 +158,7 @@ class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
 
         # Encode satellite images
         sat_emb = self._encode_satellite_images(sat_images)
+        style_tokens = self._encode_satellite_style(sat_emb)
 
         # Encode negative prompt
         negative_emb = None
@@ -298,9 +169,9 @@ class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
         positive_emb = self._encode_prompt("", sat_images.shape[0])
 
         # Concatenate embeddings
-        encoder_hidden_states = torch.cat([positive_emb, sat_emb], dim=1)
+        encoder_hidden_states = torch.cat([positive_emb, style_tokens], dim=1)
         if negative_emb is not None:
-            negative_emb = torch.cat([negative_emb, torch.zeros_like(sat_emb)], dim=1)
+            negative_emb = torch.cat([negative_emb, torch.zeros_like(style_tokens)], dim=1)
 
         # Call super().__call__
         return super().__call__(
@@ -317,8 +188,6 @@ class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
 def load_sd_model(
     base_model: str = 'stabilityai/stable-diffusion-2-1',
     freeze_base: bool = True,
-    use_satellite_reading: bool = True,
-    reading_injection_sites: Optional[List[str]] = None,
     reading_block_config: Optional[Dict[str, Any]] = None,
 ) -> SatelliteConditionedSDPipeline:
     """
@@ -345,12 +214,48 @@ def load_sd_model(
 
     # Create satellite encoder (separate from UNet)
     satellite_encoder = SatelliteConditionEncoder(embed_dim=sat_embed_dim, num_heads=sat_num_heads)
+    cross_attention_dim = int(base_unet.config.cross_attention_dim or 1024)
+    style_num_tokens = int(reading_cfg.get("style_num_tokens", 4))
+    style_num_heads = int(reading_cfg.get("style_num_heads", 8))
+    if sat_embed_dim % style_num_heads != 0:
+        if sat_embed_dim % 64 == 0:
+            style_num_heads = sat_embed_dim // 64
+        else:
+            style_num_heads = 1
+            for candidate in range(min(style_num_heads, sat_embed_dim), 0, -1):
+                if sat_embed_dim % candidate == 0:
+                    style_num_heads = candidate
+                    break
+    satellite_style_adapter = SatelliteStyleAdapter(
+        sat_in_dim=sat_embed_dim,
+        out_dim=cross_attention_dim,
+        num_tokens=style_num_tokens,
+        num_heads=style_num_heads,
+        scale=float(reading_cfg.get("style_scale", 0.5)),
+    )
 
     # Replace UNet with satellite-conditioned version
     pipeline.unet = SatelliteConditionedUNet(
-        use_satellite_reading=use_satellite_reading,
-        reading_injection_sites=reading_injection_sites,
-        reading_block_config=reading_cfg,
+        reading_block_config={
+            'sat_in_dim': sat_embed_dim,
+            'plucker_dropout_prob': reading_cfg.get('plucker_dropout_prob', 0.3),
+            'style_num_tokens': reading_cfg.get('style_num_tokens', 4),
+            'style_num_heads': reading_cfg.get('style_num_heads', 8),
+            'style_scale': reading_cfg.get('style_scale', 0.5),
+            'view_grid_h': reading_cfg.get('view_grid_h', 8),
+            'view_grid_w': reading_cfg.get('view_grid_w', 20),
+            'view_query_dim': reading_cfg.get('view_query_dim', sat_embed_dim),
+            'view_num_heads': reading_cfg.get('view_num_heads', 8),
+            'view_scale': reading_cfg.get('view_scale', 1.0),
+            'view_geo_bias_weight': reading_cfg.get('view_geo_bias_weight', 1.0),
+            'view_geo_sigma': reading_cfg.get('view_geo_sigma', 0.35),
+            'view_local_topk': reading_cfg.get('view_local_topk', 25),
+            'view_geo_target_sigma': reading_cfg.get('view_geo_target_sigma', 0.20),
+            'view_geo_loss_weight': reading_cfg.get('view_geo_loss_weight', 0.1),
+            'view_gate_hidden_dim': reading_cfg.get('view_gate_hidden_dim', 256),
+            'save_attention_heatmap': reading_cfg.get('save_attention_heatmap', True),
+            'heatmap_max_tokens': reading_cfg.get('heatmap_max_tokens', 16),
+        },
         **base_unet.config,
     )
 
@@ -374,6 +279,7 @@ def load_sd_model(
 
     return SatelliteConditionedSDPipeline(
         satellite_encoder=satellite_encoder,
+        satellite_style_adapter=satellite_style_adapter,
         vae=pipeline.vae,
         text_encoder=pipeline.text_encoder,
         tokenizer=pipeline.tokenizer,
