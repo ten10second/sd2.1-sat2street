@@ -96,7 +96,7 @@ training:
 # 保存配置
 checkpoint:
   save_dir: './checkpoints'
-  save_every: 10
+  save_every: 50
   max_checkpoints: 5
   resume_from: null
 
