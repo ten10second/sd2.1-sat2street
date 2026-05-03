@@ -1,5 +1,11 @@
 """
 View-aware satellite scene reader.
+
+This branch implements a perspective baseline inspired by SatDreamer360's core
+idea: use the current camera rays to read from a shared satellite scene memory.
+Instead of local top-k lookup around a BEV anchor, the reader samples multiple
+points along each perspective ray projected into the satellite plane and
+aggregates them with query-conditioned attention.
 """
 
 from __future__ import annotations
@@ -14,11 +20,11 @@ import torch.nn.functional as F
 
 class ViewAwareSatelliteAdapter(nn.Module):
     """
-    Query local satellite scene memory with pose-conditioned queries.
+    Query shared satellite scene memory with perspective ray-guided attention.
 
-    The reader keeps the previous map output for backward compatibility, while
-    also exposing unified readout tokens so cross-attention and feature-map
-    conditioning can come from the same scene readout.
+    The reader keeps the public interface unchanged:
+    - `readout_tokens` drive cross-attention
+    - `readout_map` drives UNet feature modulation
     """
 
     def __init__(
@@ -40,6 +46,11 @@ class ViewAwareSatelliteAdapter(nn.Module):
         token_scale: float = 1.0,
         save_attention_heatmap: bool = True,
         heatmap_max_tokens: int = 16,
+        ray_num_samples: int = 8,
+        ray_depth_min: float = 0.15,
+        ray_depth_max: float = 1.25,
+        ray_offset_scale: float = 0.10,
+        ray_boundary_scale: float = 0.95,
     ):
         super().__init__()
         if sat_in_dim <= 0 or out_dim <= 0 or query_dim <= 0:
@@ -50,14 +61,14 @@ class ViewAwareSatelliteAdapter(nn.Module):
             raise ValueError(f"grid_h/grid_w must be positive, got {grid_h}/{grid_w}")
         if query_dim % num_heads != 0:
             raise ValueError(f"query_dim must be divisible by num_heads, got {query_dim}/{num_heads}")
-        if geo_sigma <= 0.0:
-            raise ValueError(f"geo_sigma must be positive, got {geo_sigma}")
-        if geo_target_sigma <= 0.0:
-            raise ValueError(f"geo_target_sigma must be positive, got {geo_target_sigma}")
-        if local_topk <= 0:
-            raise ValueError(f"local_topk must be positive, got {local_topk}")
         if token_pool_num_tokens <= 0:
             raise ValueError(f"token_pool_num_tokens must be positive, got {token_pool_num_tokens}")
+        if ray_num_samples <= 0:
+            raise ValueError(f"ray_num_samples must be positive, got {ray_num_samples}")
+        if ray_depth_max <= ray_depth_min:
+            raise ValueError(
+                f"ray_depth_max must be larger than ray_depth_min, got {ray_depth_min}/{ray_depth_max}"
+            )
         token_pool_num_heads = int(token_pool_num_heads or num_heads)
         if query_dim % token_pool_num_heads != 0:
             raise ValueError(
@@ -72,17 +83,21 @@ class ViewAwareSatelliteAdapter(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = self.query_dim // self.num_heads
         self.scale = float(scale)
-        self.geo_bias_weight = float(geo_bias_weight)
-        self.geo_sigma = float(geo_sigma)
-        self.local_topk = int(local_topk)
-        self.geo_target_sigma = float(geo_target_sigma)
+        self.map_scale = float(scale)
         self.token_pool_num_tokens = int(token_pool_num_tokens)
         self.token_pool_num_heads = int(token_pool_num_heads)
         self.token_scale = float(token_scale)
         self.save_attention_heatmap = bool(save_attention_heatmap)
         self.heatmap_max_tokens = int(max(1, heatmap_max_tokens))
-        self.scale = float(scale)
-        self.map_scale = float(scale)
+        self.ray_num_samples = int(ray_num_samples)
+        self.ray_depth_min = float(ray_depth_min)
+        self.ray_depth_max = float(ray_depth_max)
+        self.ray_offset_scale = float(ray_offset_scale)
+        self.ray_boundary_scale = float(ray_boundary_scale)
+        self.geo_bias_weight = float(geo_bias_weight)
+        self.geo_sigma = float(geo_sigma)
+        self.local_topk = int(local_topk)
+        self.geo_target_sigma = float(geo_target_sigma)
 
         self.query_mlp = nn.Sequential(
             nn.Linear(9, query_dim),
@@ -103,6 +118,17 @@ class ViewAwareSatelliteAdapter(nn.Module):
             embed_dim=query_dim,
             num_heads=num_heads,
             batch_first=True,
+        )
+        self.ray_depth_proj = nn.Sequential(
+            nn.Linear(1, query_dim),
+            nn.SiLU(),
+            nn.Linear(query_dim, query_dim),
+        )
+        self.ray_offset_mlp = nn.Sequential(
+            nn.Linear(query_dim + 9, query_dim),
+            nn.LayerNorm(query_dim),
+            nn.SiLU(),
+            nn.Linear(query_dim, self.ray_num_samples * 2),
         )
         self.out = nn.Sequential(
             nn.LayerNorm(query_dim),
@@ -129,6 +155,12 @@ class ViewAwareSatelliteAdapter(nn.Module):
             nn.SiLU(),
             nn.Linear(gate_hidden_dim, 1),
         )
+        self.register_buffer(
+            "ray_sample_scales",
+            torch.linspace(self.ray_depth_min, self.ray_depth_max, steps=self.ray_num_samples),
+            persistent=False,
+        )
+
         self.last_stats: Dict[str, torch.Tensor] = {}
         self.last_attention_heatmap: Optional[torch.Tensor] = None
         self.last_attention_index: Optional[torch.Tensor] = None
@@ -170,6 +202,20 @@ class ViewAwareSatelliteAdapter(nn.Module):
             pooled = F.interpolate(x, size=size, mode=mode, align_corners=False)
         return pooled.permute(0, 2, 3, 1).reshape(x.shape[0], size[0] * size[1], x.shape[1])
 
+    @staticmethod
+    def _infer_scene_hw(token_count: int) -> Tuple[int, int]:
+        side = int(round(math.sqrt(token_count)))
+        if side * side == token_count:
+            return side, side
+        h = int(math.sqrt(token_count))
+        while h > 1 and token_count % h != 0:
+            h -= 1
+        return h, token_count // max(h, 1)
+
+    @staticmethod
+    def _normalize_xy(xy: torch.Tensor) -> torch.Tensor:
+        return xy / xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
     def _build_pose_query_inputs(
         self,
         front_bev_xy: Optional[torch.Tensor],
@@ -210,7 +256,6 @@ class ViewAwareSatelliteAdapter(nn.Module):
         dtype: torch.dtype,
         batch: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Backward-compatible wrapper used by older call sites/tests.
         return self._build_pose_query_inputs(
             front_bev_xy=front_bev_xy,
             plucker=plucker,
@@ -230,68 +275,117 @@ class ViewAwareSatelliteAdapter(nn.Module):
         query_tokens = self.query_mlp(query_input)
         return query_input, query_tokens
 
-    def _read_scene_locally(
+    def _build_query_anchor(
+        self,
+        xy_tokens: torch.Tensor,
+        plucker_tokens: torch.Tensor,
+        valid_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        valid_binary = (valid_tokens > 0.5).to(dtype=xy_tokens.dtype)
+        ray_dir_xy = plucker_tokens[..., :2]
+        xy_dir = self._normalize_xy(xy_tokens)
+        dir_norm = ray_dir_xy.norm(dim=-1, keepdim=True)
+        ray_dir_xy = torch.where(dir_norm > 1e-6, ray_dir_xy / dir_norm.clamp_min(1e-6), xy_dir)
+        boundary_denom = ray_dir_xy.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+        boundary_xy = (ray_dir_xy / boundary_denom) * self.ray_boundary_scale
+
+        has_anchor = (xy_tokens.abs().amax(dim=-1, keepdim=True) > 1e-6).to(dtype=xy_tokens.dtype)
+        use_anchor = valid_binary * has_anchor
+        anchor_xy = use_anchor * xy_tokens + (1.0 - use_anchor) * boundary_xy
+
+        anchor_dir = self._normalize_xy(anchor_xy)
+        ray_dir_xy = torch.where(
+            (ray_dir_xy.abs().amax(dim=-1, keepdim=True) > 1e-6),
+            ray_dir_xy,
+            anchor_dir,
+        )
+        ray_dir_xy = self._normalize_xy(ray_dir_xy)
+        return anchor_xy, ray_dir_xy
+
+    def _sample_scene_along_rays(
         self,
         scene_tokens: torch.Tensor,
         scene_xy: torch.Tensor,
         pose_query_tokens: torch.Tensor,
-        query_xy_tokens: torch.Tensor,
-        valid_tokens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch = scene_tokens.shape[0]
+        query_input: torch.Tensor,
+        query_anchor_xy: torch.Tensor,
+        ray_dir_xy: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, num_queries = pose_query_tokens.shape[:2]
         device = scene_tokens.device
         dtype = scene_tokens.dtype
+        scene_h, scene_w = self._infer_scene_hw(scene_tokens.shape[1])
 
         world = self.world_proj(self.sat_norm(scene_tokens)) + self.world_xy_proj(
             scene_xy.to(device=device, dtype=dtype)
         )
-        q, k, v = F._in_projection_packed(
-            pose_query_tokens,
-            world,
-            world,
-            self.attn.in_proj_weight,
-            self.attn.in_proj_bias,
+        scene_map = world.transpose(1, 2).reshape(batch, self.query_dim, scene_h, scene_w).contiguous()
+
+        base_scales = self.ray_sample_scales.to(device=device, dtype=dtype).view(1, 1, self.ray_num_samples, 1)
+        base_xy = query_anchor_xy.unsqueeze(2) * base_scales
+
+        ray_perp_xy = torch.stack([-ray_dir_xy[..., 1], ray_dir_xy[..., 0]], dim=-1)
+        raw_offsets = self.ray_offset_mlp(torch.cat([pose_query_tokens, query_input], dim=-1))
+        raw_offsets = raw_offsets.view(batch, num_queries, self.ray_num_samples, 2)
+        raw_offsets = torch.tanh(raw_offsets) * self.ray_offset_scale
+        offset_xy = (
+            raw_offsets[..., :1] * ray_dir_xy.unsqueeze(2)
+            + raw_offsets[..., 1:] * ray_perp_xy.unsqueeze(2)
         )
-        q = q.reshape(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        sample_xy = (base_xy + offset_xy).clamp(
+            min=-self.ray_boundary_scale * 1.25,
+            max=self.ray_boundary_scale * 1.25,
+        )
 
-        geo_dist2 = (
-            query_xy_tokens[:, :, None, :] - scene_xy.to(device=device, dtype=dtype)[:, None, :, :]
-        ).pow(2).sum(dim=-1)
-        local_topk = min(self.local_topk, scene_tokens.shape[1])
-        local_dist2, local_index = torch.topk(geo_dist2, k=local_topk, dim=-1, largest=False)
+        sample_grid = torch.stack([sample_xy[..., 0], -sample_xy[..., 1]], dim=-1)
+        sampled_world = F.grid_sample(
+            scene_map,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        sampled_world = sampled_world.permute(0, 2, 3, 1).contiguous()
 
-        head_index = local_index[:, None, :, :].expand(-1, self.num_heads, -1, -1)
-        k_expanded = k.unsqueeze(2).expand(-1, -1, q.shape[2], -1, -1)
-        v_expanded = v.unsqueeze(2).expand(-1, -1, q.shape[2], -1, -1)
-        gather_index = head_index.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
-        local_k = torch.gather(k_expanded, dim=3, index=gather_index)
-        local_v = torch.gather(v_expanded, dim=3, index=gather_index)
+        sample_xy_tokens = self.world_xy_proj(sample_xy.reshape(batch, -1, 2))
+        sample_xy_tokens = sample_xy_tokens.reshape(batch, num_queries, self.ray_num_samples, self.query_dim)
+        depth_tokens = self.ray_depth_proj(base_scales.expand(batch, num_queries, -1, -1))
+        sample_tokens = sampled_world + sample_xy_tokens + depth_tokens
 
-        logits = (q.unsqueeze(3) * local_k).sum(dim=-1) / math.sqrt(self.head_dim)
-        if self.geo_bias_weight != 0.0:
-            local_geo_bias = -self.geo_bias_weight * local_dist2 / (self.geo_sigma ** 2 + 1e-6)
-            logits = logits + local_geo_bias.unsqueeze(1)
+        q_weight, k_weight, v_weight = self.attn.in_proj_weight.chunk(3, dim=0)
+        q_bias, k_bias, v_bias = self.attn.in_proj_bias.chunk(3, dim=0)
+        q = F.linear(pose_query_tokens, q_weight, q_bias)
+        k = F.linear(sample_tokens, k_weight, k_bias)
+        v = F.linear(sample_tokens, v_weight, v_bias)
+
+        q = q.reshape(batch, num_queries, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(batch, num_queries, self.ray_num_samples, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        v = v.reshape(batch, num_queries, self.ray_num_samples, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+
+        logits = (q.unsqueeze(3) * k).sum(dim=-1) / math.sqrt(self.head_dim)
         attn_weights = torch.softmax(logits.float(), dim=-1).to(dtype=dtype)
 
-        readout_tokens_raw = (attn_weights.unsqueeze(-1) * local_v).sum(dim=3)
-        readout_tokens_raw = readout_tokens_raw.transpose(1, 2).reshape(batch, -1, self.query_dim)
+        readout_tokens_raw = (attn_weights.unsqueeze(-1) * v).sum(dim=3)
+        readout_tokens_raw = readout_tokens_raw.permute(0, 2, 1, 3).reshape(batch, num_queries, self.query_dim)
         readout_tokens_raw = self.attn.out_proj(readout_tokens_raw)
 
-        local_attn_mean = attn_weights.float().mean(dim=1)
-        local_geo_target = torch.softmax(
-            (-local_dist2.float() / (self.geo_target_sigma ** 2 + 1e-6)),
-            dim=-1,
+        sample_x_idx = (
+            ((sample_xy[..., 0] + 1.0) * 0.5 * float(max(scene_w - 1, 1)))
+            .round()
+            .to(dtype=torch.long)
+            .clamp(0, max(scene_w - 1, 0))
         )
-        geo_kl = (
-            local_geo_target
-            * (local_geo_target.clamp_min(1e-8).log() - local_attn_mean.clamp_min(1e-8).log())
-        ).sum(dim=-1)
-        geo_kl = (
-            geo_kl * valid_tokens.squeeze(-1).float()
-        ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
-        return readout_tokens_raw, geo_kl, local_attn_mean, local_index
+        sample_y_idx = (
+            ((1.0 - sample_xy[..., 1]) * 0.5 * float(max(scene_h - 1, 1)))
+            .round()
+            .to(dtype=torch.long)
+            .clamp(0, max(scene_h - 1, 0))
+        )
+        sample_token_index = sample_y_idx * scene_w + sample_x_idx
+
+        local_attn_mean = attn_weights.float().mean(dim=1)
+        geo_loss = local_attn_mean.new_zeros(())
+        return readout_tokens_raw, geo_loss, local_attn_mean, sample_token_index, sample_xy
 
     def _apply_query_gate(
         self,
@@ -373,12 +467,18 @@ class ViewAwareSatelliteAdapter(nn.Module):
             plucker_tokens=plucker_tokens,
             valid_tokens=valid_tokens,
         )
-        readout_tokens_raw, geo_kl, local_attn_mean, local_index = self._read_scene_locally(
+        query_anchor_xy, ray_dir_xy = self._build_query_anchor(
+            xy_tokens=xy_tokens,
+            plucker_tokens=plucker_tokens,
+            valid_tokens=valid_tokens,
+        )
+        readout_tokens_raw, geo_loss, local_attn_mean, local_index, sample_xy = self._sample_scene_along_rays(
             scene_tokens=sat_tokens,
             scene_xy=sat_xy,
             pose_query_tokens=query_tokens,
-            query_xy_tokens=xy_tokens,
-            valid_tokens=valid_tokens,
+            query_input=query_input,
+            query_anchor_xy=query_anchor_xy,
+            ray_dir_xy=ray_dir_xy,
         )
         readout_tokens_raw, token_gate = self._apply_query_gate(
             readout_tokens_raw=readout_tokens_raw,
@@ -394,16 +494,12 @@ class ViewAwareSatelliteAdapter(nn.Module):
         entropy = (
             entropy * valid_tokens.squeeze(-1).float()
         ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
-        local_geo_dist = torch.gather(
-            (xy_tokens[:, :, None, :] - sat_xy.to(device=device, dtype=dtype)[:, None, :, :]).pow(2).sum(dim=-1).sqrt(),
-            dim=-1,
-            index=local_index,
-        ).float()
-        attn_geo_dist = (local_attn_mean * local_geo_dist).sum(dim=-1)
+        sample_geo_dist = (sample_xy - query_anchor_xy.unsqueeze(2)).pow(2).sum(dim=-1).sqrt().float()
+        attn_geo_dist = (local_attn_mean * sample_geo_dist).sum(dim=-1)
         attn_geo_dist = (
             attn_geo_dist * valid_tokens.squeeze(-1).float()
         ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
-        nearest_geo_dist = local_geo_dist[..., 0]
+        nearest_geo_dist = sample_geo_dist.min(dim=-1).values
         nearest_geo_dist = (
             nearest_geo_dist * valid_tokens.squeeze(-1).float()
         ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
@@ -413,7 +509,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
             self.last_attention_heatmap = local_attn_mean[:, :keep_tokens].detach().cpu()
             self.last_attention_index = local_index[:, :keep_tokens].detach().cpu()
             self.last_sat_xy = sat_xy.detach().cpu()
-            self.last_view_xy = xy_tokens[:, :keep_tokens].detach().cpu()
+            self.last_view_xy = query_anchor_xy[:, :keep_tokens].detach().cpu()
         else:
             self.last_attention_heatmap = None
             self.last_attention_index = None
@@ -430,14 +526,14 @@ class ViewAwareSatelliteAdapter(nn.Module):
             "attn_entropy": entropy.detach(),
             "attn_geo_dist": attn_geo_dist.detach(),
             "nearest_geo_dist": nearest_geo_dist.detach(),
-            "geo_kl": geo_kl.detach(),
+            "geo_kl": geo_loss.detach(),
         }
         return {
             "readout_tokens": readout_tokens,
             "readout_map": readout_map,
             "query_tokens": query_tokens,
             "readout_tokens_raw": readout_tokens_raw,
-            "geo_loss": geo_kl,
+            "geo_loss": geo_loss,
         }
 
     def forward(

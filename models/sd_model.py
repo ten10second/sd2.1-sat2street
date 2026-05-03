@@ -48,6 +48,11 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "scene_consistency_weight": 0.0,
             "save_attention_heatmap": False,
             "heatmap_max_tokens": 16,
+            "ray_num_samples": 8,
+            "ray_depth_min": 0.15,
+            "ray_depth_max": 1.25,
+            "ray_offset_scale": 0.10,
+            "ray_boundary_scale": 0.95,
             "view_injection_sites": ("down2", "down3", "mid", "up0", "up1"),
             "view_modulation_scale": 0.4,
         }

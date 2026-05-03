@@ -313,6 +313,11 @@ class SatelliteConditionedSDModel(nn.Module):
             token_scale=float(adapter_cfg.get("token_scale", 1.0)),
             save_attention_heatmap=bool(adapter_cfg.get("save_attention_heatmap", True)),
             heatmap_max_tokens=int(adapter_cfg.get("heatmap_max_tokens", 16)),
+            ray_num_samples=int(adapter_cfg.get("ray_num_samples", 8)),
+            ray_depth_min=float(adapter_cfg.get("ray_depth_min", 0.15)),
+            ray_depth_max=float(adapter_cfg.get("ray_depth_max", 1.25)),
+            ray_offset_scale=float(adapter_cfg.get("ray_offset_scale", 0.10)),
+            ray_boundary_scale=float(adapter_cfg.get("ray_boundary_scale", 0.95)),
         )
         self.view_geo_loss_weight = float(adapter_cfg.get("view_geo_loss_weight", 0.1))
         self.scene_consistency_weight = float(adapter_cfg.get("scene_consistency_weight", 0.0))

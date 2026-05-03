@@ -58,6 +58,11 @@ model:
     scene_consistency_weight: 0.01
     save_attention_heatmap: false
     heatmap_max_tokens: 16
+    ray_num_samples: 8
+    ray_depth_min: 0.15
+    ray_depth_max: 1.25
+    ray_offset_scale: 0.10
+    ray_boundary_scale: 0.95
     view_injection_sites: [down2, down3, mid, up0, up1]
     view_modulation_scale: 0.4
     plucker_dropout_prob: 0.0
