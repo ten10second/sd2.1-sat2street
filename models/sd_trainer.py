@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any, Sequence, Tuple
 import logging
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import DEFAULT_SATELLITE_EMBED_DIM, SatelliteConditionedUNet
