@@ -1,11 +1,12 @@
 """
 View-aware satellite scene reader.
 
-This branch implements a perspective baseline inspired by SatDreamer360's core
-idea: use the current camera rays to read from a shared satellite scene memory.
-Instead of local top-k lookup around a BEV anchor, the reader samples multiple
-points along each perspective ray projected into the satellite plane and
-aggregates them with query-conditioned attention.
+This version reads from a lightweight triplane scene representation:
+- `xy`: overhead satellite-aligned memory
+- `xz` / `yz`: learned vertical memories derived from the satellite image
+
+The public output interface stays unchanged so training and inference can keep
+using `readout_tokens` and `readout_map`.
 """
 
 from __future__ import annotations
@@ -19,14 +20,6 @@ import torch.nn.functional as F
 
 
 class ViewAwareSatelliteAdapter(nn.Module):
-    """
-    Query shared satellite scene memory with perspective ray-guided attention.
-
-    The reader keeps the public interface unchanged:
-    - `readout_tokens` drive cross-attention
-    - `readout_map` drives UNet feature modulation
-    """
-
     def __init__(
         self,
         sat_in_dim: int = 768,
@@ -51,6 +44,8 @@ class ViewAwareSatelliteAdapter(nn.Module):
         ray_depth_max: float = 1.25,
         ray_offset_scale: float = 0.10,
         ray_boundary_scale: float = 0.95,
+        ray_height_scale: float = 0.75,
+        triplane_enabled: bool = True,
     ):
         super().__init__()
         if sat_in_dim <= 0 or out_dim <= 0 or query_dim <= 0:
@@ -94,6 +89,8 @@ class ViewAwareSatelliteAdapter(nn.Module):
         self.ray_depth_max = float(ray_depth_max)
         self.ray_offset_scale = float(ray_offset_scale)
         self.ray_boundary_scale = float(ray_boundary_scale)
+        self.ray_height_scale = float(ray_height_scale)
+        self.triplane_enabled = bool(triplane_enabled)
         self.geo_bias_weight = float(geo_bias_weight)
         self.geo_sigma = float(geo_sigma)
         self.local_topk = int(local_topk)
@@ -108,7 +105,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
         )
         self.sat_norm = nn.LayerNorm(sat_in_dim)
         self.world_proj = nn.Linear(sat_in_dim, query_dim)
-        self.world_xy_proj = nn.Sequential(
+        self.coord_proj = nn.Sequential(
             nn.Linear(2, query_dim),
             nn.LayerNorm(query_dim),
             nn.SiLU(),
@@ -128,7 +125,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
             nn.Linear(query_dim + 9, query_dim),
             nn.LayerNorm(query_dim),
             nn.SiLU(),
-            nn.Linear(query_dim, self.ray_num_samples * 2),
+            nn.Linear(query_dim, self.ray_num_samples * 3),
         )
         self.out = nn.Sequential(
             nn.LayerNorm(query_dim),
@@ -154,6 +151,9 @@ class ViewAwareSatelliteAdapter(nn.Module):
             nn.LayerNorm(gate_hidden_dim),
             nn.SiLU(),
             nn.Linear(gate_hidden_dim, 1),
+        )
+        self.plane_embeddings = nn.Parameter(
+            torch.randn(3, query_dim) / math.sqrt(query_dim)
         )
         self.register_buffer(
             "ray_sample_scales",
@@ -203,18 +203,12 @@ class ViewAwareSatelliteAdapter(nn.Module):
         return pooled.permute(0, 2, 3, 1).reshape(x.shape[0], size[0] * size[1], x.shape[1])
 
     @staticmethod
-    def _infer_scene_hw(token_count: int) -> Tuple[int, int]:
-        side = int(round(math.sqrt(token_count)))
-        if side * side == token_count:
-            return side, side
-        h = int(math.sqrt(token_count))
-        while h > 1 and token_count % h != 0:
-            h -= 1
-        return h, token_count // max(h, 1)
-
-    @staticmethod
     def _normalize_xy(xy: torch.Tensor) -> torch.Tensor:
         return xy / xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    @staticmethod
+    def _normalize_xyz(xyz: torch.Tensor) -> torch.Tensor:
+        return xyz / xyz.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
     def _build_pose_query_inputs(
         self,
@@ -247,24 +241,6 @@ class ViewAwareSatelliteAdapter(nn.Module):
 
         return xy_tokens, plucker_tokens, valid_tokens
 
-    def _build_query_features(
-        self,
-        front_bev_xy: Optional[torch.Tensor],
-        plucker: Optional[torch.Tensor],
-        valid_mask: Optional[torch.Tensor],
-        device: torch.device,
-        dtype: torch.dtype,
-        batch: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self._build_pose_query_inputs(
-            front_bev_xy=front_bev_xy,
-            plucker=plucker,
-            valid_mask=valid_mask,
-            device=device,
-            dtype=dtype,
-            batch=batch,
-        )
-
     def _encode_pose_queries(
         self,
         xy_tokens: torch.Tensor,
@@ -280,12 +256,13 @@ class ViewAwareSatelliteAdapter(nn.Module):
         xy_tokens: torch.Tensor,
         plucker_tokens: torch.Tensor,
         valid_tokens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         valid_binary = (valid_tokens > 0.5).to(dtype=xy_tokens.dtype)
-        ray_dir_xy = plucker_tokens[..., :2]
+        ray_dir_xyz = self._normalize_xyz(plucker_tokens[..., :3])
+        ray_dir_xy = ray_dir_xyz[..., :2]
         xy_dir = self._normalize_xy(xy_tokens)
-        dir_norm = ray_dir_xy.norm(dim=-1, keepdim=True)
-        ray_dir_xy = torch.where(dir_norm > 1e-6, ray_dir_xy / dir_norm.clamp_min(1e-6), xy_dir)
+        ray_dir_xy_norm = ray_dir_xy.norm(dim=-1, keepdim=True)
+        ray_dir_xy = torch.where(ray_dir_xy_norm > 1e-6, ray_dir_xy / ray_dir_xy_norm.clamp_min(1e-6), xy_dir)
         boundary_denom = ray_dir_xy.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
         boundary_xy = (ray_dir_xy / boundary_denom) * self.ray_boundary_scale
 
@@ -300,57 +277,161 @@ class ViewAwareSatelliteAdapter(nn.Module):
             anchor_dir,
         )
         ray_dir_xy = self._normalize_xy(ray_dir_xy)
-        return anchor_xy, ray_dir_xy
 
-    def _sample_scene_along_rays(
+        ray_dir_xyz = torch.cat([ray_dir_xy, ray_dir_xyz[..., 2:3]], dim=-1)
+        ray_dir_xyz = self._normalize_xyz(ray_dir_xyz)
+        return anchor_xy, ray_dir_xy, ray_dir_xyz
+
+    def _prepare_plane_maps(
         self,
-        scene_tokens: torch.Tensor,
-        scene_xy: torch.Tensor,
-        pose_query_tokens: torch.Tensor,
-        query_input: torch.Tensor,
-        query_anchor_xy: torch.Tensor,
-        ray_dir_xy: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch, num_queries = pose_query_tokens.shape[:2]
-        device = scene_tokens.device
-        dtype = scene_tokens.dtype
-        scene_h, scene_w = self._infer_scene_hw(scene_tokens.shape[1])
+        scene_memory: Dict[str, Union[torch.Tensor, Tuple[int, int], int]],
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        batch = int(scene_memory["xy_tokens"].shape[0])
+        device = scene_memory["xy_tokens"].device
+        xy_h, xy_w = scene_memory["xy_hw"]
+        z_tokens = int(scene_memory["z_tokens"])
+        plane_maps: Dict[str, torch.Tensor] = {}
+        plane_shapes = {
+            "xy": (int(xy_h), int(xy_w)),
+            "xz": (z_tokens, int(xy_w)),
+            "yz": (z_tokens, int(xy_h)),
+        }
+        for plane_name in ("xy", "xz", "yz"):
+            tokens = scene_memory[f"{plane_name}_tokens"]
+            coords = scene_memory[f"{plane_name}_coords"].to(device=device, dtype=dtype)
+            world = self.world_proj(self.sat_norm(tokens)) + self.coord_proj(coords)
+            plane_h, plane_w = plane_shapes[plane_name]
+            plane_maps[plane_name] = world.transpose(1, 2).reshape(
+                batch, self.query_dim, plane_h, plane_w
+            ).contiguous()
+        return plane_maps
 
-        world = self.world_proj(self.sat_norm(scene_tokens)) + self.world_xy_proj(
-            scene_xy.to(device=device, dtype=dtype)
-        )
-        scene_map = world.transpose(1, 2).reshape(batch, self.query_dim, scene_h, scene_w).contiguous()
+    def _coerce_scene_memory(
+        self,
+        scene_memory: Optional[Dict[str, Union[torch.Tensor, Tuple[int, int], int]]],
+        sat_tokens: Optional[torch.Tensor],
+        sat_xy: Optional[torch.Tensor],
+    ) -> Dict[str, Union[torch.Tensor, Tuple[int, int], int]]:
+        if isinstance(scene_memory, dict):
+            required = ("xy_tokens", "xy_coords", "xz_tokens", "xz_coords", "yz_tokens", "yz_coords", "xy_hw", "z_tokens")
+            for key in required:
+                if key not in scene_memory:
+                    raise ValueError(f"scene_memory missing required key: {key}")
+            return scene_memory
 
-        base_scales = self.ray_sample_scales.to(device=device, dtype=dtype).view(1, 1, self.ray_num_samples, 1)
-        base_xy = query_anchor_xy.unsqueeze(2) * base_scales
+        if sat_tokens is None or sat_xy is None:
+            raise ValueError("Either scene_memory or both sat_tokens/sat_xy must be provided")
+        if sat_tokens.ndim != 3 or sat_tokens.shape[-1] != self.sat_in_dim:
+            raise ValueError(f"sat_tokens must be [B,N,{self.sat_in_dim}], got {list(sat_tokens.shape)}")
+        if sat_xy.ndim != 3 or sat_xy.shape[:2] != sat_tokens.shape[:2] or sat_xy.shape[-1] != 2:
+            raise ValueError(f"sat_xy must be [B,{sat_tokens.shape[1]},2], got {list(sat_xy.shape)}")
 
-        ray_perp_xy = torch.stack([-ray_dir_xy[..., 1], ray_dir_xy[..., 0]], dim=-1)
-        raw_offsets = self.ray_offset_mlp(torch.cat([pose_query_tokens, query_input], dim=-1))
-        raw_offsets = raw_offsets.view(batch, num_queries, self.ray_num_samples, 2)
-        raw_offsets = torch.tanh(raw_offsets) * self.ray_offset_scale
-        offset_xy = (
-            raw_offsets[..., :1] * ray_dir_xy.unsqueeze(2)
-            + raw_offsets[..., 1:] * ray_perp_xy.unsqueeze(2)
-        )
-        sample_xy = (base_xy + offset_xy).clamp(
-            min=-self.ray_boundary_scale * 1.25,
-            max=self.ray_boundary_scale * 1.25,
-        )
+        batch = sat_tokens.shape[0]
+        token_count = sat_tokens.shape[1]
+        xy_h = int(round(math.sqrt(token_count)))
+        while xy_h > 1 and token_count % xy_h != 0:
+            xy_h -= 1
+        xy_w = token_count // max(1, xy_h)
+        z_tokens = max(8, xy_h // 2)
 
-        sample_grid = torch.stack([sample_xy[..., 0], -sample_xy[..., 1]], dim=-1)
-        sampled_world = F.grid_sample(
-            scene_map,
-            sample_grid,
+        xy_plane = sat_tokens.reshape(batch, xy_h, xy_w, self.sat_in_dim).permute(0, 3, 1, 2).contiguous()
+        x_reduced = xy_plane.mean(dim=2, keepdim=True).expand(-1, -1, z_tokens, -1).contiguous()
+        y_reduced = xy_plane.mean(dim=3, keepdim=True).expand(-1, -1, z_tokens, -1).contiguous()
+
+        sat_xy_grid = sat_xy.reshape(batch, xy_h, xy_w, 2)
+        x_axis = sat_xy_grid[0, 0, :, 0]
+        y_axis = sat_xy_grid[0, :, 0, 1]
+        z_axis = 1.0 - (
+            (torch.arange(z_tokens, device=sat_tokens.device, dtype=sat_tokens.dtype) + 0.5) / float(max(z_tokens, 1))
+        ) * 2.0
+        xz_x, xz_z = torch.meshgrid(x_axis, z_axis, indexing="xy")
+        yz_y, yz_z = torch.meshgrid(y_axis, z_axis, indexing="xy")
+
+        return {
+            "xy_tokens": sat_tokens,
+            "xy_coords": sat_xy,
+            "xz_tokens": x_reduced.permute(0, 2, 3, 1).reshape(batch, -1, self.sat_in_dim).contiguous(),
+            "xz_coords": torch.stack([xz_x.reshape(-1), xz_z.reshape(-1)], dim=-1).unsqueeze(0).expand(batch, -1, -1),
+            "yz_tokens": y_reduced.permute(0, 2, 3, 1).reshape(batch, -1, self.sat_in_dim).contiguous(),
+            "yz_coords": torch.stack([yz_y.reshape(-1), yz_z.reshape(-1)], dim=-1).unsqueeze(0).expand(batch, -1, -1),
+            "xy_hw": (xy_h, xy_w),
+            "z_tokens": z_tokens,
+        }
+
+    def _sample_plane(
+        self,
+        plane_map: torch.Tensor,
+        grid: torch.Tensor,
+    ) -> torch.Tensor:
+        sampled = F.grid_sample(
+            plane_map,
+            grid,
             mode="bilinear",
             padding_mode="zeros",
             align_corners=False,
         )
-        sampled_world = sampled_world.permute(0, 2, 3, 1).contiguous()
+        return sampled.permute(0, 2, 3, 1).contiguous()
 
-        sample_xy_tokens = self.world_xy_proj(sample_xy.reshape(batch, -1, 2))
-        sample_xy_tokens = sample_xy_tokens.reshape(batch, num_queries, self.ray_num_samples, self.query_dim)
+    def _sample_scene_along_rays(
+        self,
+        scene_memory: Dict[str, Union[torch.Tensor, Tuple[int, int], int]],
+        pose_query_tokens: torch.Tensor,
+        query_input: torch.Tensor,
+        query_anchor_xy: torch.Tensor,
+        ray_dir_xy: torch.Tensor,
+        ray_dir_xyz: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, num_queries = pose_query_tokens.shape[:2]
+        device = pose_query_tokens.device
+        dtype = pose_query_tokens.dtype
+        plane_maps = self._prepare_plane_maps(scene_memory, dtype=dtype)
+        xy_h, xy_w = scene_memory["xy_hw"]
+
+        base_scales = self.ray_sample_scales.to(device=device, dtype=dtype).view(1, 1, self.ray_num_samples, 1)
+        base_xy = query_anchor_xy.unsqueeze(2) * base_scales
+        base_z = (-ray_dir_xyz[..., 2:3]).unsqueeze(2) * base_scales * self.ray_height_scale
+
+        ray_perp_xy = torch.stack([-ray_dir_xy[..., 1], ray_dir_xy[..., 0]], dim=-1)
+        raw_offsets = self.ray_offset_mlp(torch.cat([pose_query_tokens, query_input], dim=-1))
+        raw_offsets = raw_offsets.view(batch, num_queries, self.ray_num_samples, 3)
+        raw_offsets = torch.tanh(raw_offsets) * self.ray_offset_scale
+
+        sample_xy = (
+            base_xy
+            + raw_offsets[..., :1] * ray_dir_xy.unsqueeze(2)
+            + raw_offsets[..., 1:2] * ray_perp_xy.unsqueeze(2)
+        ).clamp(
+            min=-self.ray_boundary_scale * 1.25,
+            max=self.ray_boundary_scale * 1.25,
+        )
+        sample_z = (base_z + raw_offsets[..., 2:3]).clamp(-1.0, 1.0)
+
+        xy_grid = torch.stack([sample_xy[..., 0], -sample_xy[..., 1]], dim=-1)
+        xz_grid = torch.stack([sample_xy[..., 0], -sample_z[..., 0]], dim=-1)
+        yz_grid = torch.stack([sample_xy[..., 1], -sample_z[..., 0]], dim=-1)
+
+        xy_sampled = self._sample_plane(plane_maps["xy"], xy_grid)
+        xz_sampled = self._sample_plane(plane_maps["xz"], xz_grid)
+        yz_sampled = self._sample_plane(plane_maps["yz"], yz_grid)
+
+        xy_coord_tokens = self.coord_proj(sample_xy.reshape(batch, -1, 2)).reshape(
+            batch, num_queries, self.ray_num_samples, self.query_dim
+        )
+        xz_coord = torch.cat([sample_xy[..., 0:1], sample_z], dim=-1)
+        xz_coord_tokens = self.coord_proj(xz_coord.reshape(batch, -1, 2)).reshape(
+            batch, num_queries, self.ray_num_samples, self.query_dim
+        )
+        yz_coord = torch.cat([sample_xy[..., 1:2], sample_z], dim=-1)
+        yz_coord_tokens = self.coord_proj(yz_coord.reshape(batch, -1, 2)).reshape(
+            batch, num_queries, self.ray_num_samples, self.query_dim
+        )
         depth_tokens = self.ray_depth_proj(base_scales.expand(batch, num_queries, -1, -1))
-        sample_tokens = sampled_world + sample_xy_tokens + depth_tokens
+
+        xy_tokens = xy_sampled + xy_coord_tokens + depth_tokens + self.plane_embeddings[0].view(1, 1, 1, -1)
+        xz_tokens = xz_sampled + xz_coord_tokens + depth_tokens + self.plane_embeddings[1].view(1, 1, 1, -1)
+        yz_tokens = yz_sampled + yz_coord_tokens + depth_tokens + self.plane_embeddings[2].view(1, 1, 1, -1)
+        sample_tokens = torch.cat([xy_tokens, xz_tokens, yz_tokens], dim=2)
 
         q_weight, k_weight, v_weight = self.attn.in_proj_weight.chunk(3, dim=0)
         q_bias, k_bias, v_bias = self.attn.in_proj_bias.chunk(3, dim=0)
@@ -358,9 +439,10 @@ class ViewAwareSatelliteAdapter(nn.Module):
         k = F.linear(sample_tokens, k_weight, k_bias)
         v = F.linear(sample_tokens, v_weight, v_bias)
 
+        total_candidates = sample_tokens.shape[2]
         q = q.reshape(batch, num_queries, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = k.reshape(batch, num_queries, self.ray_num_samples, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
-        v = v.reshape(batch, num_queries, self.ray_num_samples, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        k = k.reshape(batch, num_queries, total_candidates, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        v = v.reshape(batch, num_queries, total_candidates, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
 
         logits = (q.unsqueeze(3) * k).sum(dim=-1) / math.sqrt(self.head_dim)
         attn_weights = torch.softmax(logits.float(), dim=-1).to(dtype=dtype)
@@ -369,21 +451,21 @@ class ViewAwareSatelliteAdapter(nn.Module):
         readout_tokens_raw = readout_tokens_raw.permute(0, 2, 1, 3).reshape(batch, num_queries, self.query_dim)
         readout_tokens_raw = self.attn.out_proj(readout_tokens_raw)
 
+        xy_attn_weights = attn_weights[..., : self.ray_num_samples]
+        local_attn_mean = xy_attn_weights.float().mean(dim=1)
         sample_x_idx = (
-            ((sample_xy[..., 0] + 1.0) * 0.5 * float(max(scene_w - 1, 1)))
+            ((sample_xy[..., 0] + 1.0) * 0.5 * float(max(int(xy_w) - 1, 1)))
             .round()
             .to(dtype=torch.long)
-            .clamp(0, max(scene_w - 1, 0))
+            .clamp(0, max(int(xy_w) - 1, 0))
         )
         sample_y_idx = (
-            ((1.0 - sample_xy[..., 1]) * 0.5 * float(max(scene_h - 1, 1)))
+            ((1.0 - sample_xy[..., 1]) * 0.5 * float(max(int(xy_h) - 1, 1)))
             .round()
             .to(dtype=torch.long)
-            .clamp(0, max(scene_h - 1, 0))
+            .clamp(0, max(int(xy_h) - 1, 0))
         )
-        sample_token_index = sample_y_idx * scene_w + sample_x_idx
-
-        local_attn_mean = attn_weights.float().mean(dim=1)
+        sample_token_index = sample_y_idx * int(xy_w) + sample_x_idx
         geo_loss = local_attn_mean.new_zeros(())
         return readout_tokens_raw, geo_loss, local_attn_mean, sample_token_index, sample_xy
 
@@ -405,10 +487,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
             ).view(readout_tokens_raw.shape[0], 1, 1)
         return readout_tokens_raw * token_gate, token_gate
 
-    def _pool_readout_tokens(
-        self,
-        readout_tokens_raw: torch.Tensor,
-    ) -> torch.Tensor:
+    def _pool_readout_tokens(self, readout_tokens_raw: torch.Tensor) -> torch.Tensor:
         batch = readout_tokens_raw.shape[0]
         token_queries = self.token_pool_query.unsqueeze(0).expand(batch, -1, -1)
         token_queries = self.token_pool_query_norm(token_queries)
@@ -420,10 +499,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
         )
         return self.token_out(pooled_tokens) * self.token_scale
 
-    def _build_readout_map(
-        self,
-        readout_tokens_raw: torch.Tensor,
-    ) -> torch.Tensor:
+    def _build_readout_map(self, readout_tokens_raw: torch.Tensor) -> torch.Tensor:
         readout_map_tokens = self.out(readout_tokens_raw) * self.map_scale
         return readout_map_tokens.reshape(
             readout_tokens_raw.shape[0],
@@ -434,25 +510,19 @@ class ViewAwareSatelliteAdapter(nn.Module):
 
     def read_scene(
         self,
-        sat_tokens: torch.Tensor,
-        sat_xy: torch.Tensor,
-        front_bev_xy: Optional[torch.Tensor],
-        plucker: Optional[torch.Tensor],
+        scene_memory: Optional[Dict[str, Union[torch.Tensor, Tuple[int, int], int]]] = None,
+        sat_tokens: Optional[torch.Tensor] = None,
+        sat_xy: Optional[torch.Tensor] = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        plucker: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        if sat_tokens.ndim != 3 or sat_tokens.shape[-1] != self.sat_in_dim:
-            raise ValueError(
-                f"sat_tokens must be [B,N,{self.sat_in_dim}], got {list(sat_tokens.shape)}"
-            )
-        if sat_xy.ndim != 3 or sat_xy.shape[:2] != sat_tokens.shape[:2] or sat_xy.shape[-1] != 2:
-            raise ValueError(
-                f"sat_xy must be [B,{sat_tokens.shape[1]},2], got {list(sat_xy.shape)}"
-            )
+        scene_memory = self._coerce_scene_memory(scene_memory=scene_memory, sat_tokens=sat_tokens, sat_xy=sat_xy)
 
-        batch = sat_tokens.shape[0]
-        device = sat_tokens.device
-        dtype = sat_tokens.dtype
+        batch = int(scene_memory["xy_tokens"].shape[0])
+        device = scene_memory["xy_tokens"].device
+        dtype = scene_memory["xy_tokens"].dtype
 
         xy_tokens, plucker_tokens, valid_tokens = self._build_pose_query_inputs(
             front_bev_xy=front_bev_xy,
@@ -467,18 +537,18 @@ class ViewAwareSatelliteAdapter(nn.Module):
             plucker_tokens=plucker_tokens,
             valid_tokens=valid_tokens,
         )
-        query_anchor_xy, ray_dir_xy = self._build_query_anchor(
+        query_anchor_xy, ray_dir_xy, ray_dir_xyz = self._build_query_anchor(
             xy_tokens=xy_tokens,
             plucker_tokens=plucker_tokens,
             valid_tokens=valid_tokens,
         )
         readout_tokens_raw, geo_loss, local_attn_mean, local_index, sample_xy = self._sample_scene_along_rays(
-            scene_tokens=sat_tokens,
-            scene_xy=sat_xy,
+            scene_memory=scene_memory,
             pose_query_tokens=query_tokens,
             query_input=query_input,
             query_anchor_xy=query_anchor_xy,
             ray_dir_xy=ray_dir_xy,
+            ray_dir_xyz=ray_dir_xyz,
         )
         readout_tokens_raw, token_gate = self._apply_query_gate(
             readout_tokens_raw=readout_tokens_raw,
@@ -508,7 +578,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
             keep_tokens = min(self.heatmap_max_tokens, local_attn_mean.shape[1])
             self.last_attention_heatmap = local_attn_mean[:, :keep_tokens].detach().cpu()
             self.last_attention_index = local_index[:, :keep_tokens].detach().cpu()
-            self.last_sat_xy = sat_xy.detach().cpu()
+            self.last_sat_xy = scene_memory["xy_coords"].detach().cpu()
             self.last_view_xy = query_anchor_xy[:, :keep_tokens].detach().cpu()
         else:
             self.last_attention_heatmap = None
@@ -538,15 +608,17 @@ class ViewAwareSatelliteAdapter(nn.Module):
 
     def forward(
         self,
-        sat_tokens: torch.Tensor,
-        sat_xy: torch.Tensor,
-        front_bev_xy: Optional[torch.Tensor],
-        plucker: Optional[torch.Tensor],
+        scene_memory: Optional[Dict[str, Union[torch.Tensor, Tuple[int, int], int]]] = None,
+        sat_tokens: Optional[torch.Tensor] = None,
+        sat_xy: Optional[torch.Tensor] = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        plucker: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
         return_dict: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         outputs = self.read_scene(
+            scene_memory=scene_memory,
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
             front_bev_xy=front_bev_xy,

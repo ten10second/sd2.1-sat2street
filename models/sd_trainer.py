@@ -318,6 +318,8 @@ class SatelliteConditionedSDModel(nn.Module):
             ray_depth_max=float(adapter_cfg.get("ray_depth_max", 1.25)),
             ray_offset_scale=float(adapter_cfg.get("ray_offset_scale", 0.10)),
             ray_boundary_scale=float(adapter_cfg.get("ray_boundary_scale", 0.95)),
+            ray_height_scale=float(adapter_cfg.get("ray_height_scale", 0.75)),
+            triplane_enabled=bool(adapter_cfg.get("triplane_enabled", True)),
         )
         self.view_geo_loss_weight = float(adapter_cfg.get("view_geo_loss_weight", 0.1))
         self.scene_consistency_weight = float(adapter_cfg.get("scene_consistency_weight", 0.0))
@@ -357,7 +359,7 @@ class SatelliteConditionedSDModel(nn.Module):
 
     def read_scene_with_pose(
         self,
-        sat_tokens: torch.Tensor,
+        scene_memory: Optional[Dict[str, Any]],
         sat_xy: torch.Tensor,
         coords_map: Optional[torch.Tensor],
         coords_valid_mask: Optional[torch.Tensor],
@@ -365,7 +367,7 @@ class SatelliteConditionedSDModel(nn.Module):
         condition_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         return self.view_satellite_adapter(
-            sat_tokens=sat_tokens,
+            scene_memory=scene_memory,
             sat_xy=sat_xy,
             front_bev_xy=coords_map,
             plucker=plucker_map,
@@ -404,6 +406,38 @@ class SatelliteConditionedSDModel(nn.Module):
             return tensor
         batch, views = tensor.shape[:2]
         return tensor.reshape(batch * views, *tensor.shape[2:])
+
+    @staticmethod
+    def _apply_condition_mask_to_scene_memory(
+        scene_memory: Any,
+        condition_mask: torch.Tensor,
+    ) -> Any:
+        if not isinstance(scene_memory, dict):
+            return scene_memory
+        masked: Dict[str, Any] = {}
+        for key, value in scene_memory.items():
+            if torch.is_tensor(value) and value.shape[:1] == condition_mask.shape[:1]:
+                masked[key] = value * SatelliteConditionedSDModel._expand_condition_mask(condition_mask, value)
+            else:
+                masked[key] = value
+        return masked
+
+    @staticmethod
+    def _expand_scene_memory_for_views(
+        scene_memory: Any,
+        num_views: int,
+    ) -> Any:
+        if not isinstance(scene_memory, dict):
+            return scene_memory
+        expanded: Dict[str, Any] = {}
+        for key, value in scene_memory.items():
+            if torch.is_tensor(value) and value.ndim >= 1:
+                expanded[key] = value[:, None].expand(-1, num_views, *value.shape[1:]).reshape(
+                    value.shape[0] * num_views, *value.shape[1:]
+                )
+            else:
+                expanded[key] = value
+        return expanded
 
     def _compute_scene_consistency_loss(
         self,
@@ -452,8 +486,14 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Encode satellite images
         sat_encoded = self.encode_scene_memory(sat_images, coords_map)
+        scene_memory = None
         if isinstance(sat_encoded, tuple):
-            sat_tokens, sat_xy = sat_encoded
+            first_value, sat_xy = sat_encoded
+            if isinstance(first_value, dict):
+                scene_memory = first_value
+                sat_tokens = first_value.get("xy_tokens")
+            else:
+                sat_tokens = first_value
         else:
             sat_tokens = sat_encoded
             sat_xy = None
@@ -463,7 +503,9 @@ class SatelliteConditionedSDModel(nn.Module):
             if not bool(condition_mask.any().item()):
                 keep_index = torch.randint(0, B, (1,), device=device)
                 condition_mask[keep_index] = True
-            sat_tokens = sat_tokens * self._expand_condition_mask(condition_mask, sat_tokens)
+            if sat_tokens is not None:
+                sat_tokens = sat_tokens * self._expand_condition_mask(condition_mask, sat_tokens)
+            scene_memory = self._apply_condition_mask_to_scene_memory(scene_memory, condition_mask)
             if sat_xy is not None:
                 sat_xy = sat_xy * self._expand_condition_mask(condition_mask, sat_xy)
         plucker_for_unet = plucker_map
@@ -474,7 +516,9 @@ class SatelliteConditionedSDModel(nn.Module):
         if sat_xy is None:
             raise ValueError("Satellite encoder must return sat_xy for view-aware conditioning")
         if grouped_views:
-            sat_tokens = sat_tokens[:, None].expand(-1, num_views, -1, -1).reshape(B * num_views, *sat_tokens.shape[1:])
+            if sat_tokens is not None:
+                sat_tokens = sat_tokens[:, None].expand(-1, num_views, -1, -1).reshape(B * num_views, *sat_tokens.shape[1:])
+            scene_memory = self._expand_scene_memory_for_views(scene_memory, num_views)
             sat_xy = sat_xy[:, None].expand(-1, num_views, -1, -1).reshape(B * num_views, *sat_xy.shape[1:])
             condition_mask = condition_mask[:, None].expand(-1, num_views).reshape(B * num_views)
             target_images = self._flatten_grouped_views(target_images)
@@ -483,7 +527,7 @@ class SatelliteConditionedSDModel(nn.Module):
             plucker_for_unet = self._flatten_grouped_views(plucker_for_unet)
 
         reader_outputs = self.read_scene_with_pose(
-            sat_tokens=sat_tokens,
+            scene_memory=scene_memory,
             sat_xy=sat_xy,
             coords_map=coords_map,
             coords_valid_mask=coords_valid_mask,
@@ -638,8 +682,14 @@ class SatelliteConditionedSDModel(nn.Module):
 
         # Encode satellite images
         sat_encoded = self.encode_scene_memory(sat_images, coords_map)
+        scene_memory = None
         if isinstance(sat_encoded, tuple):
-            sat_tokens, sat_xy = sat_encoded
+            first_value, sat_xy = sat_encoded
+            if isinstance(first_value, dict):
+                scene_memory = first_value
+                sat_tokens = first_value.get("xy_tokens")
+            else:
+                sat_tokens = first_value
         else:
             sat_tokens = sat_encoded
             sat_xy = None
@@ -647,7 +697,12 @@ class SatelliteConditionedSDModel(nn.Module):
         if sat_condition_mode == "normal":
             condition_mask = torch.ones(B, device=device, dtype=torch.bool)
         elif sat_condition_mode == "zero":
-            sat_tokens = torch.zeros_like(sat_tokens)
+            if sat_tokens is not None:
+                sat_tokens = torch.zeros_like(sat_tokens)
+            scene_memory = self._apply_condition_mask_to_scene_memory(
+                scene_memory,
+                torch.zeros(B, device=device, dtype=torch.bool),
+            )
             sat_xy = torch.zeros_like(sat_xy) if sat_xy is not None else None
             condition_mask = torch.zeros(B, device=device, dtype=torch.bool)
         else:
@@ -655,7 +710,7 @@ class SatelliteConditionedSDModel(nn.Module):
         if sat_xy is None:
             raise ValueError("Satellite encoder must return sat_xy for view-aware conditioning")
         reader_outputs = self.read_scene_with_pose(
-            sat_tokens=sat_tokens,
+            scene_memory=scene_memory,
             sat_xy=sat_xy,
             coords_map=coords_map,
             coords_valid_mask=coords_valid_mask,
@@ -808,7 +863,17 @@ def create_sd_model(
                 if requested_sat_embed_dim % candidate == 0:
                     sat_num_heads = candidate
                     break
-    satellite_encoder = SatelliteConditionEncoder(embed_dim=requested_sat_embed_dim, num_heads=sat_num_heads)
+    satellite_encoder = SatelliteConditionEncoder(
+        embed_dim=requested_sat_embed_dim,
+        num_heads=sat_num_heads,
+        triplane_enabled=bool(reading_cfg.get('triplane_enabled', True)),
+        triplane_height_tokens=int(reading_cfg.get('triplane_height_tokens', 16)),
+        triplane_num_cvha_layers=int(reading_cfg.get('triplane_num_cvha_layers', 1)),
+        triplane_cvha_num_self_points=int(reading_cfg.get('triplane_cvha_num_self_points', 4)),
+        triplane_cvha_num_cross_points=int(reading_cfg.get('triplane_cvha_num_cross_points', 8)),
+        triplane_cvha_local_radius=float(reading_cfg.get('triplane_cvha_local_radius', 1.0)),
+        triplane_cvha_offset_scale=float(reading_cfg.get('triplane_cvha_offset_scale', 1.0)),
+    )
     sat_embed_dim = int(getattr(satellite_encoder, "embed_dim", DEFAULT_SATELLITE_EMBED_DIM))
     reading_cfg["sat_in_dim"] = sat_embed_dim
 
@@ -833,6 +898,21 @@ def create_sd_model(
             'scene_consistency_weight': reading_cfg.get('scene_consistency_weight', 0.0),
             'save_attention_heatmap': reading_cfg.get('save_attention_heatmap', False),
             'heatmap_max_tokens': reading_cfg.get('heatmap_max_tokens', 16),
+            'ray_num_samples': reading_cfg.get('ray_num_samples', 8),
+            'ray_depth_min': reading_cfg.get('ray_depth_min', 0.15),
+            'ray_depth_max': reading_cfg.get('ray_depth_max', 1.25),
+            'ray_offset_scale': reading_cfg.get('ray_offset_scale', 0.10),
+            'ray_boundary_scale': reading_cfg.get('ray_boundary_scale', 0.95),
+            'ray_height_scale': reading_cfg.get('ray_height_scale', 0.75),
+            'triplane_enabled': reading_cfg.get('triplane_enabled', True),
+            'triplane_height_tokens': reading_cfg.get('triplane_height_tokens', 16),
+            'triplane_num_cvha_layers': reading_cfg.get('triplane_num_cvha_layers', 1),
+            'triplane_cvha_num_self_points': reading_cfg.get('triplane_cvha_num_self_points', 4),
+            'triplane_cvha_num_cross_points': reading_cfg.get('triplane_cvha_num_cross_points', 8),
+            'triplane_cvha_local_radius': reading_cfg.get('triplane_cvha_local_radius', 1.0),
+            'triplane_cvha_offset_scale': reading_cfg.get('triplane_cvha_offset_scale', 1.0),
+            'view_injection_sites': reading_cfg.get('view_injection_sites', ("down2", "down3", "mid", "up0", "up1")),
+            'view_modulation_scale': reading_cfg.get('view_modulation_scale', 0.4),
         },
         **base_unet.config,
     )
