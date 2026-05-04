@@ -141,6 +141,33 @@ def _safe_collate(batch):
     return collated
 
 
+def _load_condition_config(config_data: dict) -> dict:
+    if not isinstance(config_data, dict):
+        return {}
+    model_cfg = config_data.get("model", {})
+    if not isinstance(model_cfg, dict):
+        return {}
+
+    reading_cfg = dict(model_cfg.get("reading_block", {}) or {})
+    satellite_cfg = model_cfg.get("satellite_encoder", {})
+    if isinstance(satellite_cfg, dict):
+        for key in (
+            "patch_size",
+            "num_layers",
+            "num_heads",
+            "use_relative_pos",
+            "xy_feature_source",
+            "resnet_name",
+            "resnet_stage",
+            "resnet_pretrained",
+        ):
+            if key in satellite_cfg and key not in reading_cfg:
+                reading_cfg[key] = satellite_cfg[key]
+        if "embed_dim" in satellite_cfg and "sat_in_dim" not in reading_cfg:
+            reading_cfg["sat_in_dim"] = satellite_cfg["embed_dim"]
+    return reading_cfg
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Stable Diffusion for satellite-to-frontview generation"
@@ -234,7 +261,7 @@ def main():
     )
     parser.add_argument(
         "--view_set", type=str, default="grouped_front_fixed_yaw5",
-        choices=["single", "fixed5", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"],
+        choices=["single", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"],
         help="Per-frame view expansion for fisheye_virtual. 'grouped_front_fixed_yaw5' returns front plus yaw -120/-60/60/120 as one grouped sample.",
     )
     parser.add_argument(
@@ -343,10 +370,7 @@ def main():
     if is_main_process:
         logger.info(f"Training configuration: {args}")
 
-    reading_block_cfg = (
-        config_data.get("model", {}).get("reading_block", {})
-        if isinstance(config_data, dict) else {}
-    )
+    reading_block_cfg = _load_condition_config(config_data)
 
     # Load data
     if is_main_process:

@@ -240,41 +240,6 @@ def _load_perspective_calib(calib_path: Path) -> Dict[str, Any]:
 
 FISHEYE_CAMERAS = ("image_02", "image_03")
 
-FIXED_FIVE_VIEW_SPECS = (
-    {
-        "view_name": "front",
-        "mode_override": "front",
-    },
-    {
-        "view_name": "left_forward_45",
-        "mode_override": "fisheye_virtual",
-        "fisheye_camera_override": "image_02",
-        "fisheye_relative_yaw_deg_override": 45.0,
-        "vehicle_relative_yaw_deg_override": -45.0,
-    },
-    {
-        "view_name": "left_side",
-        "mode_override": "fisheye_virtual",
-        "fisheye_camera_override": "image_02",
-        "fisheye_relative_yaw_deg_override": 0.0,
-        "vehicle_relative_yaw_deg_override": -90.0,
-    },
-    {
-        "view_name": "right_forward_45",
-        "mode_override": "fisheye_virtual",
-        "fisheye_camera_override": "image_03",
-        "fisheye_relative_yaw_deg_override": -45.0,
-        "vehicle_relative_yaw_deg_override": 45.0,
-    },
-    {
-        "view_name": "right_side",
-        "mode_override": "fisheye_virtual",
-        "fisheye_camera_override": "image_03",
-        "fisheye_relative_yaw_deg_override": 0.0,
-        "vehicle_relative_yaw_deg_override": 90.0,
-    },
-)
-
 
 def _get_camera_height_m(camera_name: Optional[str]) -> float:
     if camera_name is None:
@@ -360,51 +325,6 @@ def compute_camera_bev_xy(
     if return_valid_mask:
         return bev_xy_t, valid_mask_t
     return bev_xy_t
-
-
-def compute_plucker_map(
-    K: np.ndarray,
-    T_cam_to_world: np.ndarray,
-    height: int,
-    width: int,
-    T_imu_to_world: Optional[np.ndarray] = None,
-    sat_m_per_px: float = 0.2,
-    sat_w: int = 512,
-) -> torch.Tensor:
-    """Return a per-pixel Plucker ray map as (6, H, W)."""
-    K_inv = np.linalg.inv(K.astype(np.float64))
-    R = T_cam_to_world[:3, :3].astype(np.float64)
-    cam_center = T_cam_to_world[:3, 3].astype(np.float64)
-
-    if T_imu_to_world is not None:
-        local_origin = np.array(
-            [T_imu_to_world[0, 3], T_imu_to_world[1, 3], 0.0],
-            dtype=np.float64,
-        )
-    else:
-        local_origin = np.array([cam_center[0], cam_center[1], 0.0], dtype=np.float64)
-
-    u = np.arange(width, dtype=np.float64) + 0.5
-    v = np.arange(height, dtype=np.float64) + 0.5
-    vv, uu = np.meshgrid(v, u, indexing='ij')
-    pixels = np.stack([uu, vv, np.ones_like(uu)], axis=0).reshape(3, -1)
-
-    dirs_cam = K_inv @ pixels
-    dirs_world = R @ dirs_cam
-    dirs_world = dirs_world / np.clip(np.linalg.norm(dirs_world, axis=0, keepdims=True), a_min=1e-8, a_max=None)
-
-    c_local = (cam_center - local_origin).astype(np.float64)
-    moments = np.cross(
-        np.broadcast_to(c_local[None, :], (dirs_world.shape[1], 3)),
-        dirs_world.T,
-    ).T
-
-    bev_extent_m = float(sat_w) * float(sat_m_per_px) / 2.0
-    plucker = np.concatenate(
-        [dirs_world, moments / (bev_extent_m + 1e-8)],
-        axis=0,
-    ).reshape(6, height, width)
-    return torch.from_numpy(plucker).to(torch.float32).contiguous()
 
 
 def _sample_random_signed_yaw(
@@ -494,8 +414,6 @@ class Kitti360dDataset(Dataset):
 
     View sets:
       - single: one sample per frame using the requested mode.
-      - fixed5: expand each frame to five fixed views:
-        front, left_forward_45, left_side, right_forward_45, right_side.
       - front_plus_random: expand each frame to front plus one random virtual fisheye view.
       - grouped_front_plus_random: return front plus one random virtual fisheye view in one sample.
       - grouped_front_plus_random4: return front plus four random virtual fisheye views in one sample.
@@ -601,9 +519,9 @@ class Kitti360dDataset(Dataset):
             raise ValueError(f"Unknown mode: {self.mode}")
         if self.yaw_mode not in {"fisheye_relative", "vehicle_relative"}:
             raise ValueError(f"Unknown yaw_mode: {self.yaw_mode}")
-        if self.view_set not in {"single", "fixed5", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"}:
+        if self.view_set not in {"single", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"}:
             raise ValueError(f"Unknown view_set: {self.view_set}")
-        if self.view_set in {"fixed5", "front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"} and self.mode != "fisheye_virtual":
+        if self.view_set in {"front_plus_random", "grouped_front_plus_random", "grouped_front_plus_random4", "grouped_front_fixed_yaw5"} and self.mode != "fisheye_virtual":
             raise ValueError(f"view_set='{self.view_set}' requires mode='fisheye_virtual'")
         # fisheye_camera can be auto-selected based on yaw; only validate when explicitly set
         if self.fisheye_camera is not None and self.fisheye_camera not in {"image_02", "image_03"}:
@@ -635,16 +553,7 @@ class Kitti360dDataset(Dataset):
             if self.exclude_frames:
                 ids = [fid for fid in ids if fid not in self.exclude_frames]
             for fid in ids:
-                if self.view_set == "fixed5":
-                    for spec in FIXED_FIVE_VIEW_SPECS:
-                        self.samples.append(
-                            SampleIndex(
-                                drive_dir=d,
-                                frame_id=int(fid),
-                                meta=dict(spec),
-                            )
-                        )
-                elif self.view_set == "front_plus_random":
+                if self.view_set == "front_plus_random":
                     self.samples.append(
                         SampleIndex(
                             drive_dir=d,
@@ -965,7 +874,6 @@ class Kitti360dDataset(Dataset):
             "coords_map": front_bev_xy,
             "front_bev_valid_mask": front_bev_valid_mask,
             "coords_valid_mask": front_bev_valid_mask,
-            "plucker_map": torch.zeros(6, h, w, dtype=torch.float32),
             "K": torch.eye(3, dtype=torch.float32),
             "T_pose_cam": torch.eye(4, dtype=torch.float32),
             "T_imu_to_world": torch.eye(4, dtype=torch.float32),
@@ -1266,19 +1174,9 @@ class Kitti360dDataset(Dataset):
                 cam_height=camera_height_m,
                 return_valid_mask=True,
             )
-            plucker_map = compute_plucker_map(
-                K=K,
-                T_cam_to_world=T_cam_to_world,
-                T_imu_to_world=T_imu_to_world,
-                height=int(img.shape[0]),
-                width=int(img.shape[1]),
-                sat_m_per_px=self.sat_m_per_px,
-                sat_w=self.sat_size[0],
-            )
         else:
             front_bev_xy = self._get_front_bev_xy(int(img.shape[0]), int(img.shape[1]))
             front_bev_valid_mask = torch.zeros(1, int(img.shape[0]), int(img.shape[1]), dtype=torch.float32)
-            plucker_map = torch.zeros(6, int(img.shape[0]), int(img.shape[1]), dtype=torch.float32)
 
         return {
             "image": img_t,
@@ -1290,7 +1188,6 @@ class Kitti360dDataset(Dataset):
             "coords_map": front_bev_xy,
             "front_bev_valid_mask": front_bev_valid_mask,
             "coords_valid_mask": front_bev_valid_mask,
-            "plucker_map": plucker_map,
             "K": K_t,  # (3,3) after resize/crop, or virtual K in fisheye mode
             "T_pose_cam": T_pose_cam_t,  # (4,4) camera pose (prefer cam->world if available)
             "T_imu_to_world": T_imu_to_world_t,  # (4,4) imu->world, may be None if missing

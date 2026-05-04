@@ -16,6 +16,101 @@ import torch.nn.functional as F
 from ..unet.relative_position_attention import RelativePositionAttention
 
 
+class ResNetXYBackbone(nn.Module):
+    """Return an intermediate ResNet feature map for the satellite XY plane."""
+
+    _VALID_STAGES = ("layer1", "layer2", "layer3", "layer4")
+
+    def __init__(
+        self,
+        name: str = "resnet34",
+        output_stage: str = "layer3",
+        pretrained: bool = False,
+    ):
+        super().__init__()
+        output_stage = str(output_stage)
+        if output_stage not in self._VALID_STAGES:
+            raise ValueError(f"output_stage must be one of {self._VALID_STAGES}, got {output_stage}")
+
+        try:
+            from torchvision import models as tv_models
+        except ImportError as exc:
+            raise ImportError("ResNetXYBackbone requires torchvision to be installed") from exc
+
+        builder = getattr(tv_models, str(name), None)
+        if builder is None:
+            raise ValueError(f"Unknown torchvision ResNet backbone: {name}")
+
+        if pretrained:
+            weight_key = f"{str(name).lower()}_weights"
+            weights_enum = next(
+                (
+                    value
+                    for enum_name, value in vars(tv_models).items()
+                    if enum_name.lower() == weight_key
+                ),
+                None,
+            )
+            weights = weights_enum.DEFAULT if weights_enum is not None else None
+            backbone = builder(weights=weights)
+        else:
+            backbone = builder(weights=None)
+
+        self.name = str(name)
+        self.output_stage = output_stage
+        self.pretrained = bool(pretrained)
+        self.stem = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
+        )
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+        self.out_channels = self._stage_out_channels(getattr(backbone, output_stage))
+        if self.pretrained:
+            self.register_buffer(
+                "image_mean",
+                torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "image_std",
+                torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+                persistent=False,
+            )
+
+    @staticmethod
+    def _stage_out_channels(stage: nn.Module) -> int:
+        block = list(stage.children())[-1]
+        for attr_name in ("conv3", "conv2", "conv1"):
+            conv = getattr(block, attr_name, None)
+            out_channels = getattr(conv, "out_channels", None)
+            if isinstance(out_channels, int):
+                return out_channels
+        raise ValueError(f"Unable to infer ResNet stage channels from {type(block).__name__}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.pretrained:
+            x = (x - self.image_mean.to(device=x.device, dtype=x.dtype)) / self.image_std.to(
+                device=x.device,
+                dtype=x.dtype,
+            )
+        x = self.stem(x)
+        x = self.layer1(x)
+        if self.output_stage == "layer1":
+            return x
+        x = self.layer2(x)
+        if self.output_stage == "layer2":
+            return x
+        x = self.layer3(x)
+        if self.output_stage == "layer3":
+            return x
+        return self.layer4(x)
+
+
 class SatelliteConditionEncoder(nn.Module):
     """
     Encode satellite images with coordinate positional encoding.
@@ -42,11 +137,15 @@ class SatelliteConditionEncoder(nn.Module):
         self,
         embed_dim: int = 768,
         patch_size: int = 16,
-        num_layers: int = 4,
+        num_layers: int = 0,
         num_heads: int = 12,
         use_relative_pos: bool = True,
         sat_resolution: float = 0.2,
         sat_size: int = 512,
+        xy_feature_source: str = "resnet",
+        resnet_name: str = "resnet34",
+        resnet_stage: str = "layer3",
+        resnet_pretrained: bool = False,
         triplane_enabled: bool = True,
         triplane_height_tokens: int = 16,
         triplane_num_cvha_layers: int = 1,
@@ -64,6 +163,10 @@ class SatelliteConditionEncoder(nn.Module):
         self.use_relative_pos = use_relative_pos
         self.sat_resolution = sat_resolution
         self.sat_size = sat_size
+        self.xy_feature_source = str(xy_feature_source).lower()
+        self.resnet_name = str(resnet_name)
+        self.resnet_stage = str(resnet_stage)
+        self.resnet_pretrained = bool(resnet_pretrained)
         self.triplane_enabled = bool(triplane_enabled)
         self.triplane_height_tokens = int(triplane_height_tokens)
         self.triplane_num_cvha_layers = int(triplane_num_cvha_layers)
@@ -96,14 +199,31 @@ class SatelliteConditionEncoder(nn.Module):
                 f"triplane_cvha_offset_scale must be positive, got {self.triplane_cvha_offset_scale}"
             )
 
-        # Patch embedding
-        self.patch_embed = nn.Conv2d(
-            in_channels=3,
-            out_channels=embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-            padding=0,
-        )
+        if self.xy_feature_source not in {"resnet", "patch"}:
+            raise ValueError(f"xy_feature_source must be 'resnet' or 'patch', got {xy_feature_source}")
+
+        if self.xy_feature_source == "resnet":
+            self.xy_backbone = ResNetXYBackbone(
+                name=self.resnet_name,
+                output_stage=self.resnet_stage,
+                pretrained=self.resnet_pretrained,
+            )
+            self.xy_feature_proj = nn.Sequential(
+                nn.Conv2d(self.xy_backbone.out_channels, embed_dim, kernel_size=1),
+                self._make_group_norm(embed_dim),
+                nn.SiLU(),
+            )
+            self.patch_embed = None
+        else:
+            self.xy_backbone = None
+            self.xy_feature_proj = None
+            self.patch_embed = nn.Conv2d(
+                in_channels=3,
+                out_channels=embed_dim,
+                kernel_size=patch_size,
+                stride=patch_size,
+                padding=0,
+            )
 
         # Coordinate encoder - for BEV space coordinates (meters)
         self.coord_encoder = nn.Sequential(
@@ -134,6 +254,8 @@ class SatelliteConditionEncoder(nn.Module):
                 torch.randn(self.triplane_height_tokens, embed_dim) / math.sqrt(embed_dim)
             )
             base_plane_w = max(1, self.sat_size // self.patch_size)
+            # XZ/YZ start as content-free learnable positional tokens. CVHA is
+            # responsible for pulling satellite content from XY into them.
             self.xz_plane_init = nn.Parameter(
                 torch.randn(1, embed_dim, self.triplane_height_tokens, base_plane_w) / math.sqrt(embed_dim)
             )
@@ -217,6 +339,26 @@ class SatelliteConditionEncoder(nn.Module):
         # Expand for batch
         return coords.unsqueeze(0).expand(B, -1, 2)
 
+    def _compute_feature_bev_coords(
+        self,
+        B: int,
+        image_h: int,
+        image_w: int,
+        feat_h: int,
+        feat_w: int,
+    ) -> torch.Tensor:
+        """Compute BEV meter coordinates for centers of an arbitrary XY feature map."""
+        cell_h = float(image_h) / float(max(feat_h, 1))
+        cell_w = float(image_w) / float(max(feat_w, 1))
+        center_h = (torch.arange(feat_h, dtype=torch.float32) + 0.5) * cell_h
+        center_w = (torch.arange(feat_w, dtype=torch.float32) + 0.5) * cell_w
+        w_grid, h_grid = torch.meshgrid(center_w, center_h, indexing="xy")
+
+        x_meters = (w_grid - (float(image_w) / 2.0)) * self.sat_resolution
+        y_meters = ((float(image_h) / 2.0) - h_grid) * self.sat_resolution
+        coords = torch.stack([x_meters.reshape(-1), y_meters.reshape(-1)], dim=-1)
+        return coords.unsqueeze(0).expand(B, -1, 2)
+
     def _compute_patch_normalized_coords(
         self,
         B: int,
@@ -241,19 +383,39 @@ class SatelliteConditionEncoder(nn.Module):
         coords = torch.stack([x_norm.reshape(-1), y_norm.reshape(-1)], dim=-1)
         return coords.unsqueeze(0).expand(B, -1, 2)
 
+    @staticmethod
+    def _compute_plane_normalized_coords(
+        B: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return normalized XY centers for a plane grid using x-right/y-up convention."""
+        x_axis = (torch.arange(width, device=device, dtype=dtype) + 0.5) / float(max(width, 1))
+        y_axis = (torch.arange(height, device=device, dtype=dtype) + 0.5) / float(max(height, 1))
+        x_axis = x_axis * 2.0 - 1.0
+        y_axis = 1.0 - y_axis * 2.0
+        x_grid, y_grid = torch.meshgrid(x_axis, y_axis, indexing="xy")
+        coords = torch.stack([x_grid.reshape(-1), y_grid.reshape(-1)], dim=-1)
+        return coords.unsqueeze(0).expand(B, -1, 2)
+
     def _compute_triplane_coords(
         self,
         B: int,
-        H: int,
-        W: int,
+        xy_h: int,
+        xy_w: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Dict[str, torch.Tensor]:
-        patch_h = H // self.patch_size
-        patch_w = W // self.patch_size
-
-        sat_xy = self._compute_patch_normalized_coords(B, H, W).to(device=device, dtype=dtype)
-        sat_xy_grid = sat_xy.reshape(B, patch_h, patch_w, 2)
+        sat_xy = self._compute_plane_normalized_coords(
+            B,
+            height=xy_h,
+            width=xy_w,
+            device=device,
+            dtype=dtype,
+        )
+        sat_xy_grid = sat_xy.reshape(B, xy_h, xy_w, 2)
         x_axis = sat_xy_grid[0, 0, :, 0]
         y_axis = sat_xy_grid[0, :, 0, 1]
         z_axis = self._make_axis_centers(
@@ -279,28 +441,25 @@ class SatelliteConditionEncoder(nn.Module):
         self,
         xy_tokens: torch.Tensor,
         B: int,
-        H: int,
-        W: int,
+        xy_h: int,
+        xy_w: int,
     ) -> Dict[str, torch.Tensor]:
-        patch_h = H // self.patch_size
-        patch_w = W // self.patch_size
-
-        xy_plane = xy_tokens.reshape(B, patch_h, patch_w, self.embed_dim).permute(0, 3, 1, 2).contiguous()
+        xy_plane = xy_tokens.reshape(B, xy_h, xy_w, self.embed_dim).permute(0, 3, 1, 2).contiguous()
         xz_plane = self.xz_plane_init
-        if xz_plane.shape[-2:] != (self.triplane_height_tokens, patch_w):
+        if xz_plane.shape[-2:] != (self.triplane_height_tokens, xy_w):
             xz_plane = F.interpolate(
                 xz_plane,
-                size=(self.triplane_height_tokens, patch_w),
+                size=(self.triplane_height_tokens, xy_w),
                 mode="bilinear",
                 align_corners=False,
             )
         xz_plane = xz_plane.expand(B, -1, -1, -1).contiguous()
 
         yz_plane = self.yz_plane_init
-        if yz_plane.shape[-2:] != (self.triplane_height_tokens, patch_h):
+        if yz_plane.shape[-2:] != (self.triplane_height_tokens, xy_h):
             yz_plane = F.interpolate(
                 yz_plane,
-                size=(self.triplane_height_tokens, patch_h),
+                size=(self.triplane_height_tokens, xy_h),
                 mode="bilinear",
                 align_corners=False,
             )
@@ -312,8 +471,8 @@ class SatelliteConditionEncoder(nn.Module):
 
         coords = self._compute_triplane_coords(
             B=B,
-            H=H,
-            W=W,
+            xy_h=xy_h,
+            xy_w=xy_w,
             device=xy_tokens.device,
             dtype=xy_tokens.dtype,
         )
@@ -335,7 +494,7 @@ class SatelliteConditionEncoder(nn.Module):
             "xy_coords": coords["xy"],
             "xz_coords": coords["xz"],
             "yz_coords": coords["yz"],
-            "xy_hw": (patch_h, patch_w),
+            "xy_hw": (xy_h, xy_w),
             "z_tokens": self.triplane_height_tokens,
         }
 
@@ -359,13 +518,18 @@ class SatelliteConditionEncoder(nn.Module):
         """
         B, C, H, W = sat_images.shape
 
-        # Step 1: Patch embedding
-        patches = self.patch_embed(sat_images)  # (B, D, H/P, W/P)
-        patches_flat = patches.permute(0, 2, 3, 1).reshape(B, -1, self.embed_dim)  # (B, N, D)
+        # Step 1: extract the satellite XY plane feature map.
+        if self.xy_feature_source == "resnet":
+            xy_map = self.xy_backbone(sat_images)
+            xy_map = self.xy_feature_proj(xy_map)
+        else:
+            xy_map = self.patch_embed(sat_images)
+        xy_h, xy_w = int(xy_map.shape[-2]), int(xy_map.shape[-1])
+        patches_flat = xy_map.permute(0, 2, 3, 1).reshape(B, -1, self.embed_dim)  # (B, N, D)
 
         # Step 2: Compute BEV space coordinates for each patch
         # These are fixed physical positions in meters
-        bev_coords = self._compute_patch_bev_coords(B, H, W)
+        bev_coords = self._compute_feature_bev_coords(B, H, W, xy_h, xy_w)
         bev_coords = bev_coords.to(sat_images.device)  # (B, N, 2)
 
         # Step 3: Encode BEV coordinates
@@ -383,7 +547,7 @@ class SatelliteConditionEncoder(nn.Module):
         x = self.norm(x)
 
         if self.triplane_enabled:
-            scene_memory = self._build_triplane_memory(x, B=B, H=H, W=W)
+            scene_memory = self._build_triplane_memory(x, B=B, xy_h=xy_h, xy_w=xy_w)
             if not return_sat_xy:
                 return scene_memory
             return scene_memory, scene_memory["xy_coords"]
@@ -391,7 +555,13 @@ class SatelliteConditionEncoder(nn.Module):
         if not return_sat_xy:
             return x
 
-        sat_xy = self._compute_patch_normalized_coords(B, H, W).to(sat_images.device)
+        sat_xy = self._compute_plane_normalized_coords(
+            B,
+            height=xy_h,
+            width=xy_w,
+            device=sat_images.device,
+            dtype=sat_images.dtype,
+        )
         return x, sat_xy
 
 

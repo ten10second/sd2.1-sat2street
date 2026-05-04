@@ -30,7 +30,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.use_satellite_reading = False
         self.reading_block_config = {
             "sat_in_dim": DEFAULT_SATELLITE_EMBED_DIM,
-            "plucker_dropout_prob": 0.3,
             "view_grid_h": 8,
             "view_grid_w": 20,
             "view_query_dim": DEFAULT_SATELLITE_EMBED_DIM,
@@ -48,12 +47,14 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "scene_consistency_weight": 0.0,
             "save_attention_heatmap": False,
             "heatmap_max_tokens": 16,
-            "ray_num_samples": 8,
-            "ray_depth_min": 0.15,
-            "ray_depth_max": 1.25,
-            "ray_offset_scale": 0.10,
-            "ray_boundary_scale": 0.95,
-            "ray_height_scale": 0.75,
+            "ray_num_samples": 32,
+            "ray_depth_min": 1.0,
+            "ray_depth_max": 80.0,
+            "ray_offset_scale": 0.50,
+            "ray_scene_extent_x_m": 51.2,
+            "ray_scene_extent_y_m": 51.2,
+            "ray_scene_z_min_m": 0.0,
+            "ray_scene_z_max_m": 20.0,
             "triplane_enabled": True,
             "triplane_height_tokens": 16,
             "triplane_num_cvha_layers": 1,
@@ -66,7 +67,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         }
         if reading_block_config is not None:
             self.reading_block_config.update(reading_block_config)
-        self.plucker_dropout_prob = float(self.reading_block_config.get("plucker_dropout_prob", 0.0))
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
         self.view_injection_sites = tuple(self.reading_block_config.get("view_injection_sites", ("down2", "down3", "mid", "up0", "up1")))
         self.view_modulation_scale = float(self.reading_block_config.get("view_modulation_scale", 0.4))

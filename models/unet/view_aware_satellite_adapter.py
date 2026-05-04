@@ -39,12 +39,14 @@ class ViewAwareSatelliteAdapter(nn.Module):
         token_scale: float = 1.0,
         save_attention_heatmap: bool = True,
         heatmap_max_tokens: int = 16,
-        ray_num_samples: int = 8,
-        ray_depth_min: float = 0.15,
-        ray_depth_max: float = 1.25,
-        ray_offset_scale: float = 0.10,
-        ray_boundary_scale: float = 0.95,
-        ray_height_scale: float = 0.75,
+        ray_num_samples: int = 32,
+        ray_depth_min: float = 1.0,
+        ray_depth_max: float = 80.0,
+        ray_offset_scale: float = 0.50,
+        ray_scene_extent_x_m: float = 51.2,
+        ray_scene_extent_y_m: float = 51.2,
+        ray_scene_z_min_m: float = 0.0,
+        ray_scene_z_max_m: float = 20.0,
         triplane_enabled: bool = True,
     ):
         super().__init__()
@@ -63,6 +65,16 @@ class ViewAwareSatelliteAdapter(nn.Module):
         if ray_depth_max <= ray_depth_min:
             raise ValueError(
                 f"ray_depth_max must be larger than ray_depth_min, got {ray_depth_min}/{ray_depth_max}"
+            )
+        if ray_scene_extent_x_m <= 0.0 or ray_scene_extent_y_m <= 0.0:
+            raise ValueError(
+                "ray_scene_extent_x_m/ray_scene_extent_y_m must be positive, "
+                f"got {ray_scene_extent_x_m}/{ray_scene_extent_y_m}"
+            )
+        if ray_scene_z_max_m <= ray_scene_z_min_m:
+            raise ValueError(
+                f"ray_scene_z_max_m must be larger than ray_scene_z_min_m, got "
+                f"{ray_scene_z_min_m}/{ray_scene_z_max_m}"
             )
         token_pool_num_heads = int(token_pool_num_heads or num_heads)
         if query_dim % token_pool_num_heads != 0:
@@ -88,8 +100,10 @@ class ViewAwareSatelliteAdapter(nn.Module):
         self.ray_depth_min = float(ray_depth_min)
         self.ray_depth_max = float(ray_depth_max)
         self.ray_offset_scale = float(ray_offset_scale)
-        self.ray_boundary_scale = float(ray_boundary_scale)
-        self.ray_height_scale = float(ray_height_scale)
+        self.ray_scene_extent_x_m = float(ray_scene_extent_x_m)
+        self.ray_scene_extent_y_m = float(ray_scene_extent_y_m)
+        self.ray_scene_z_min_m = float(ray_scene_z_min_m)
+        self.ray_scene_z_max_m = float(ray_scene_z_max_m)
         self.triplane_enabled = bool(triplane_enabled)
         self.geo_bias_weight = float(geo_bias_weight)
         self.geo_sigma = float(geo_sigma)
@@ -111,22 +125,10 @@ class ViewAwareSatelliteAdapter(nn.Module):
             nn.SiLU(),
             nn.Linear(query_dim, query_dim),
         )
-        self.attn = nn.MultiheadAttention(
-            embed_dim=query_dim,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-        self.ray_depth_proj = nn.Sequential(
-            nn.Linear(1, query_dim),
-            nn.SiLU(),
-            nn.Linear(query_dim, query_dim),
-        )
-        self.ray_offset_mlp = nn.Sequential(
-            nn.Linear(query_dim + 9, query_dim),
-            nn.LayerNorm(query_dim),
-            nn.SiLU(),
-            nn.Linear(query_dim, self.ray_num_samples * 3),
-        )
+        self.perspective_offset_net = nn.Linear(query_dim, self.num_heads * self.ray_num_samples * 3)
+        self.perspective_attn_net = nn.Linear(query_dim, self.num_heads * self.ray_num_samples)
+        self.perspective_value_proj = nn.Linear(query_dim, query_dim)
+        self.perspective_head_mix = nn.Linear(query_dim, query_dim)
         self.out = nn.Sequential(
             nn.LayerNorm(query_dim),
             nn.Linear(query_dim, out_dim),
@@ -152,14 +154,12 @@ class ViewAwareSatelliteAdapter(nn.Module):
             nn.SiLU(),
             nn.Linear(gate_hidden_dim, 1),
         )
-        self.plane_embeddings = nn.Parameter(
-            torch.randn(3, query_dim) / math.sqrt(query_dim)
-        )
         self.register_buffer(
             "ray_sample_scales",
             torch.linspace(self.ray_depth_min, self.ray_depth_max, steps=self.ray_num_samples),
             persistent=False,
         )
+        self._reset_perspective_ray_attention()
 
         self.last_stats: Dict[str, torch.Tensor] = {}
         self.last_attention_heatmap: Optional[torch.Tensor] = None
@@ -171,116 +171,179 @@ class ViewAwareSatelliteAdapter(nn.Module):
         self.last_readout_map: Optional[torch.Tensor] = None
         self.last_readout_tokens_raw: Optional[torch.Tensor] = None
 
+    def _reset_perspective_ray_attention(self) -> None:
+        """Start from uniform ray sampling: zero offsets and uniform depth weights."""
+        nn.init.zeros_(self.perspective_offset_net.weight)
+        nn.init.zeros_(self.perspective_offset_net.bias)
+        nn.init.zeros_(self.perspective_attn_net.weight)
+        nn.init.zeros_(self.perspective_attn_net.bias)
+        nn.init.eye_(self.perspective_value_proj.weight)
+        nn.init.zeros_(self.perspective_value_proj.bias)
+        nn.init.eye_(self.perspective_head_mix.weight)
+        nn.init.zeros_(self.perspective_head_mix.bias)
+
     @staticmethod
-    def _as_bchw_map(
+    def _as_batched_intrinsics(
         value: Optional[torch.Tensor],
-        channels: int,
+        batch: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
         if value is None or not torch.is_tensor(value):
             return None
         x = value.to(device=device, dtype=dtype)
-        if x.ndim == 4 and x.shape[1] == channels:
-            return x
-        if x.ndim == 4 and x.shape[-1] == channels:
-            return x.permute(0, 3, 1, 2)
-        if x.ndim == 3 and x.shape[-1] == channels:
-            token_count = x.shape[1]
-            h = int(math.sqrt(token_count))
-            while h > 1 and token_count % h != 0:
-                h -= 1
-            w = token_count // h
-            return x.reshape(x.shape[0], h, w, channels).permute(0, 3, 1, 2)
+        if x.ndim == 1 and x.shape[0] == 4:
+            fx, fy, cx, cy = x.unbind(dim=0)
+            K = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+            K[:, 0, 0] = fx
+            K[:, 1, 1] = fy
+            K[:, 0, 2] = cx
+            K[:, 1, 2] = cy
+            return K.expand(batch, -1, -1)
+        if x.ndim == 2 and x.shape == (3, 3):
+            return x.unsqueeze(0).expand(batch, -1, -1)
+        if x.ndim == 2 and x.shape[-1] == 4:
+            if x.shape[0] == 1:
+                x = x.expand(batch, -1)
+            if x.shape[0] != batch:
+                return None
+            K = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(batch, -1, -1).clone()
+            K[:, 0, 0] = x[:, 0]
+            K[:, 1, 1] = x[:, 1]
+            K[:, 0, 2] = x[:, 2]
+            K[:, 1, 2] = x[:, 3]
+            return K
+        if x.ndim == 3 and x.shape[-2:] == (3, 3):
+            if x.shape[0] == 1 and batch != 1:
+                return x.expand(batch, -1, -1)
+            if x.shape[0] == batch:
+                return x
         return None
 
     @staticmethod
-    def _pool_map(x: torch.Tensor, size: Tuple[int, int], mode: str = "bilinear") -> torch.Tensor:
-        if mode == "nearest":
-            pooled = F.interpolate(x, size=size, mode=mode)
-        else:
-            pooled = F.interpolate(x, size=size, mode=mode, align_corners=False)
-        return pooled.permute(0, 2, 3, 1).reshape(x.shape[0], size[0] * size[1], x.shape[1])
-
-    @staticmethod
-    def _normalize_xy(xy: torch.Tensor) -> torch.Tensor:
-        return xy / xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-
-    @staticmethod
-    def _normalize_xyz(xyz: torch.Tensor) -> torch.Tensor:
-        return xyz / xyz.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-
-    def _build_pose_query_inputs(
-        self,
-        front_bev_xy: Optional[torch.Tensor],
-        plucker: Optional[torch.Tensor],
-        valid_mask: Optional[torch.Tensor],
+    def _as_batched_transform(
+        value: Optional[torch.Tensor],
+        batch: int,
         device: torch.device,
         dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if value is None or not torch.is_tensor(value):
+            return None
+        x = value.to(device=device, dtype=dtype)
+        if x.ndim == 2 and x.shape == (4, 4):
+            return x.unsqueeze(0).expand(batch, -1, -1)
+        if x.ndim == 3 and x.shape[-2:] == (4, 4):
+            if x.shape[0] == 1 and batch != 1:
+                return x.expand(batch, -1, -1)
+            if x.shape[0] == batch:
+                return x
+        return None
+
+    @staticmethod
+    def _as_batched_scalar(
+        value: Optional[torch.Tensor],
         batch: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        size = (self.grid_h, self.grid_w)
-
-        xy_map = self._as_bchw_map(front_bev_xy, 2, device, dtype)
-        if xy_map is None:
-            xy_tokens = torch.zeros(batch, self.grid_h * self.grid_w, 2, device=device, dtype=dtype)
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            x = value.to(device=device, dtype=dtype)
         else:
-            xy_tokens = self._pool_map(xy_map, size)
+            try:
+                x = torch.as_tensor(value, device=device, dtype=dtype)
+            except (TypeError, ValueError):
+                return None
+        if x.ndim == 0:
+            return x.reshape(1).expand(batch)
+        x = x.reshape(-1)
+        if x.numel() == 1 and batch != 1:
+            return x.expand(batch)
+        if x.numel() == batch:
+            return x
+        return None
 
-        plucker_map = self._as_bchw_map(plucker, 6, device, dtype)
-        if plucker_map is None:
-            plucker_tokens = torch.zeros(batch, self.grid_h * self.grid_w, 6, device=device, dtype=dtype)
-        else:
-            plucker_tokens = self._pool_map(plucker_map, size)
+    @staticmethod
+    def _coerce_source_image_size(source_image_size: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+        if source_image_size is None:
+            return None
+        if len(source_image_size) != 2:
+            return None
+        height, width = int(source_image_size[0]), int(source_image_size[1])
+        if height <= 0 or width <= 0:
+            return None
+        return height, width
 
-        mask_map = self._as_bchw_map(valid_mask, 1, device, dtype)
-        if mask_map is None:
-            valid_tokens = torch.ones(batch, self.grid_h * self.grid_w, 1, device=device, dtype=dtype)
-        else:
-            valid_tokens = self._pool_map(mask_map, size, mode="nearest").clamp(0.0, 1.0)
-
-        return xy_tokens, plucker_tokens, valid_tokens
-
-    def _encode_pose_queries(
+    def _build_perspective_query_inputs(
         self,
-        xy_tokens: torch.Tensor,
-        plucker_tokens: torch.Tensor,
-        valid_tokens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        query_input = torch.cat([xy_tokens, plucker_tokens, valid_tokens], dim=-1)
-        query_tokens = self.query_mlp(query_input)
-        return query_input, query_tokens
-
-    def _build_query_anchor(
-        self,
-        xy_tokens: torch.Tensor,
-        plucker_tokens: torch.Tensor,
-        valid_tokens: torch.Tensor,
+        intrinsics: torch.Tensor,
+        cam_to_world: torch.Tensor,
+        ego_to_world: Optional[torch.Tensor],
+        camera_height_m: Optional[torch.Tensor],
+        source_image_size: Tuple[int, int],
+        batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        valid_binary = (valid_tokens > 0.5).to(dtype=xy_tokens.dtype)
-        ray_dir_xyz = self._normalize_xyz(plucker_tokens[..., :3])
-        ray_dir_xy = ray_dir_xyz[..., :2]
-        xy_dir = self._normalize_xy(xy_tokens)
-        ray_dir_xy_norm = ray_dir_xy.norm(dim=-1, keepdim=True)
-        ray_dir_xy = torch.where(ray_dir_xy_norm > 1e-6, ray_dir_xy / ray_dir_xy_norm.clamp_min(1e-6), xy_dir)
-        boundary_denom = ray_dir_xy.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
-        boundary_xy = (ray_dir_xy / boundary_denom) * self.ray_boundary_scale
-
-        has_anchor = (xy_tokens.abs().amax(dim=-1, keepdim=True) > 1e-6).to(dtype=xy_tokens.dtype)
-        use_anchor = valid_binary * has_anchor
-        anchor_xy = use_anchor * xy_tokens + (1.0 - use_anchor) * boundary_xy
-
-        anchor_dir = self._normalize_xy(anchor_xy)
-        ray_dir_xy = torch.where(
-            (ray_dir_xy.abs().amax(dim=-1, keepdim=True) > 1e-6),
-            ray_dir_xy,
-            anchor_dir,
+        source_h, source_w = int(source_image_size[0]), int(source_image_size[1])
+        geom_dtype = torch.float32
+        K = intrinsics.to(device=device, dtype=geom_dtype)
+        T_cam = cam_to_world.to(device=device, dtype=geom_dtype)
+        T_ego = ego_to_world.to(device=device, dtype=geom_dtype) if ego_to_world is not None else None
+        cam_height = (
+            camera_height_m.to(device=device, dtype=geom_dtype).reshape(batch)
+            if camera_height_m is not None
+            else None
         )
-        ray_dir_xy = self._normalize_xy(ray_dir_xy)
 
-        ray_dir_xyz = torch.cat([ray_dir_xy, ray_dir_xyz[..., 2:3]], dim=-1)
-        ray_dir_xyz = self._normalize_xyz(ray_dir_xyz)
-        return anchor_xy, ray_dir_xy, ray_dir_xyz
+        u = (torch.arange(self.grid_w, device=device, dtype=geom_dtype) + 0.5) * (
+            float(source_w) / float(max(self.grid_w, 1))
+        )
+        v = (torch.arange(self.grid_h, device=device, dtype=geom_dtype) + 0.5) * (
+            float(source_h) / float(max(self.grid_h, 1))
+        )
+        vv, uu = torch.meshgrid(v, u, indexing="ij")
+        pixels = torch.stack(
+            [uu.reshape(-1), vv.reshape(-1), torch.ones_like(uu.reshape(-1))],
+            dim=0,
+        ).unsqueeze(0).expand(batch, -1, -1)
+
+        dirs_cam = torch.bmm(torch.inverse(K), pixels).transpose(1, 2)
+        dirs_world = torch.bmm(T_cam[:, :3, :3], dirs_cam.transpose(1, 2)).transpose(1, 2)
+        dirs_world = F.normalize(dirs_world, dim=-1)
+
+        cam_center = T_cam[:, :3, 3]
+        if T_ego is not None:
+            center_xy = T_ego[:, :2, 3]
+        else:
+            center_xy = cam_center[:, :2]
+        if cam_height is not None:
+            ground_z = cam_center[:, 2] - cam_height
+        elif T_ego is not None:
+            ground_z = T_ego[:, 2, 3]
+        else:
+            ground_z = torch.zeros(batch, device=device, dtype=geom_dtype)
+
+        origin_x = (cam_center[:, 0] - center_xy[:, 0]) / self.ray_scene_extent_x_m
+        origin_y = (cam_center[:, 1] - center_xy[:, 1]) / self.ray_scene_extent_y_m
+        origin_z = (
+            (cam_center[:, 2] - ground_z - self.ray_scene_z_min_m)
+            / (self.ray_scene_z_max_m - self.ray_scene_z_min_m)
+            * 2.0
+            - 1.0
+        )
+        origin_norm = torch.stack([origin_x, origin_y, origin_z], dim=-1)
+        origin_norm = origin_norm[:, None, :].expand(-1, self.grid_h * self.grid_w, -1)
+
+        pixel_x = uu.reshape(-1) / float(max(source_w, 1)) * 2.0 - 1.0
+        pixel_y = 1.0 - vv.reshape(-1) / float(max(source_h, 1)) * 2.0
+        pixel_xy = torch.stack([pixel_x, pixel_y], dim=-1).unsqueeze(0).expand(batch, -1, -1)
+        valid_tokens = torch.ones(batch, self.grid_h * self.grid_w, 1, device=device, dtype=geom_dtype)
+
+        query_input = torch.cat([pixel_xy, dirs_world, origin_norm, valid_tokens], dim=-1).to(dtype=dtype)
+        query_tokens = self.query_mlp(query_input)
+        return query_input, query_tokens, valid_tokens.to(dtype=dtype)
 
     def _prepare_plane_maps(
         self,
@@ -373,14 +436,130 @@ class ViewAwareSatelliteAdapter(nn.Module):
         )
         return sampled.permute(0, 2, 3, 1).contiguous()
 
-    def _sample_scene_along_rays(
+    def _build_perspective_ray_samples(
+        self,
+        intrinsics: torch.Tensor,
+        cam_to_world: torch.Tensor,
+        ego_to_world: Optional[torch.Tensor],
+        camera_height_m: Optional[torch.Tensor],
+        source_image_size: Tuple[int, int],
+        batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        source_h, source_w = int(source_image_size[0]), int(source_image_size[1])
+        geom_dtype = torch.float32
+        K = intrinsics.to(device=device, dtype=geom_dtype)
+        T_cam = cam_to_world.to(device=device, dtype=geom_dtype)
+        T_ego = ego_to_world.to(device=device, dtype=geom_dtype) if ego_to_world is not None else None
+        cam_height = (
+            camera_height_m.to(device=device, dtype=geom_dtype).reshape(batch)
+            if camera_height_m is not None
+            else None
+        )
+
+        u = (torch.arange(self.grid_w, device=device, dtype=geom_dtype) + 0.5) * (
+            float(source_w) / float(max(self.grid_w, 1))
+        )
+        v = (torch.arange(self.grid_h, device=device, dtype=geom_dtype) + 0.5) * (
+            float(source_h) / float(max(self.grid_h, 1))
+        )
+        vv, uu = torch.meshgrid(v, u, indexing="ij")
+        pixels = torch.stack(
+            [uu.reshape(-1), vv.reshape(-1), torch.ones_like(uu.reshape(-1))],
+            dim=0,
+        ).unsqueeze(0).expand(batch, -1, -1)
+
+        dirs_cam = torch.bmm(torch.inverse(K), pixels).transpose(1, 2)
+        depths = self.ray_sample_scales.to(device=device, dtype=geom_dtype)
+        pts_cam = dirs_cam.unsqueeze(2) * depths.view(1, 1, self.ray_num_samples, 1)
+
+        R = T_cam[:, :3, :3]
+        cam_center = T_cam[:, :3, 3]
+        pts_world = torch.einsum("bij,bnkj->bnki", R, pts_cam) + cam_center[:, None, None, :]
+
+        if T_ego is not None:
+            center_xy = T_ego[:, :2, 3]
+        else:
+            center_xy = cam_center[:, :2]
+
+        if cam_height is not None:
+            ground_z = cam_center[:, 2] - cam_height
+        elif T_ego is not None:
+            ground_z = T_ego[:, 2, 3]
+        else:
+            ground_z = torch.zeros(batch, device=device, dtype=geom_dtype)
+
+        x_norm = (pts_world[..., 0] - center_xy[:, None, None, 0]) / self.ray_scene_extent_x_m
+        y_norm = (pts_world[..., 1] - center_xy[:, None, None, 1]) / self.ray_scene_extent_y_m
+        z_m = pts_world[..., 2] - ground_z[:, None, None]
+        z_norm = (
+            (z_m - self.ray_scene_z_min_m)
+            / (self.ray_scene_z_max_m - self.ray_scene_z_min_m)
+        ) * 2.0 - 1.0
+        xyz_norm = torch.stack([x_norm, y_norm, z_norm], dim=-1).to(dtype=dtype)
+
+        valid = (
+            (depths.view(1, 1, -1) > 0.0)
+            & (x_norm >= -1.0)
+            & (x_norm <= 1.0)
+            & (y_norm >= -1.0)
+            & (y_norm <= 1.0)
+            & (z_norm >= -1.0)
+            & (z_norm <= 1.0)
+        )
+        return xyz_norm, valid
+
+    def _normalized_offset_from_metric(self, offsets_m: torch.Tensor) -> torch.Tensor:
+        z_extent = self.ray_scene_z_max_m - self.ray_scene_z_min_m
+        scale = offsets_m.new_tensor(
+            [
+                1.0 / self.ray_scene_extent_x_m,
+                1.0 / self.ray_scene_extent_y_m,
+                2.0 / z_extent,
+            ]
+        )
+        return offsets_m * scale.view(1, 1, 1, 1, 3)
+
+    @staticmethod
+    def _normalized_points_valid(xyz_norm: torch.Tensor) -> torch.Tensor:
+        return (
+            (xyz_norm[..., 0] >= -1.0)
+            & (xyz_norm[..., 0] <= 1.0)
+            & (xyz_norm[..., 1] >= -1.0)
+            & (xyz_norm[..., 1] <= 1.0)
+            & (xyz_norm[..., 2] >= -1.0)
+            & (xyz_norm[..., 2] <= 1.0)
+        )
+
+    def _triplane_lookup(
+        self,
+        plane_maps: Dict[str, torch.Tensor],
+        xyz_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, num_queries, num_heads, num_samples = xyz_norm.shape[:4]
+        flat_xyz = xyz_norm.reshape(batch, num_queries * num_heads, num_samples, 3)
+
+        xy_grid = torch.stack([flat_xyz[..., 0], -flat_xyz[..., 1]], dim=-1)
+        xz_grid = torch.stack([flat_xyz[..., 0], -flat_xyz[..., 2]], dim=-1)
+        yz_grid = torch.stack([flat_xyz[..., 1], -flat_xyz[..., 2]], dim=-1)
+
+        sampled = (
+            self._sample_plane(plane_maps["xy"], xy_grid)
+            + self._sample_plane(plane_maps["xz"], xz_grid)
+            + self._sample_plane(plane_maps["yz"], yz_grid)
+        )
+        return sampled.reshape(batch, num_queries, num_heads, num_samples, self.query_dim)
+
+    def _sample_scene_with_perspective_rays(
         self,
         scene_memory: Dict[str, Union[torch.Tensor, Tuple[int, int], int]],
         pose_query_tokens: torch.Tensor,
-        query_input: torch.Tensor,
-        query_anchor_xy: torch.Tensor,
-        ray_dir_xy: torch.Tensor,
-        ray_dir_xyz: torch.Tensor,
+        intrinsics: torch.Tensor,
+        cam_to_world: torch.Tensor,
+        ego_to_world: Optional[torch.Tensor],
+        camera_height_m: Optional[torch.Tensor],
+        source_image_size: Tuple[int, int],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, num_queries = pose_query_tokens.shape[:2]
         device = pose_query_tokens.device
@@ -388,71 +567,53 @@ class ViewAwareSatelliteAdapter(nn.Module):
         plane_maps = self._prepare_plane_maps(scene_memory, dtype=dtype)
         xy_h, xy_w = scene_memory["xy_hw"]
 
-        base_scales = self.ray_sample_scales.to(device=device, dtype=dtype).view(1, 1, self.ray_num_samples, 1)
-        base_xy = query_anchor_xy.unsqueeze(2) * base_scales
-        base_z = (-ray_dir_xyz[..., 2:3]).unsqueeze(2) * base_scales * self.ray_height_scale
-
-        ray_perp_xy = torch.stack([-ray_dir_xy[..., 1], ray_dir_xy[..., 0]], dim=-1)
-        raw_offsets = self.ray_offset_mlp(torch.cat([pose_query_tokens, query_input], dim=-1))
-        raw_offsets = raw_offsets.view(batch, num_queries, self.ray_num_samples, 3)
-        raw_offsets = torch.tanh(raw_offsets) * self.ray_offset_scale
-
-        sample_xy = (
-            base_xy
-            + raw_offsets[..., :1] * ray_dir_xy.unsqueeze(2)
-            + raw_offsets[..., 1:2] * ray_perp_xy.unsqueeze(2)
-        ).clamp(
-            min=-self.ray_boundary_scale * 1.25,
-            max=self.ray_boundary_scale * 1.25,
+        base_xyz, base_valid = self._build_perspective_ray_samples(
+            intrinsics=intrinsics,
+            cam_to_world=cam_to_world,
+            ego_to_world=ego_to_world,
+            camera_height_m=camera_height_m,
+            source_image_size=source_image_size,
+            batch=batch,
+            device=device,
+            dtype=dtype,
         )
-        sample_z = (base_z + raw_offsets[..., 2:3]).clamp(-1.0, 1.0)
+        offsets_m = self.perspective_offset_net(pose_query_tokens)
+        offsets_m = offsets_m.view(batch, num_queries, self.num_heads, self.ray_num_samples, 3)
+        offsets_m = torch.tanh(offsets_m) * self.ray_offset_scale
+        offsets_norm = self._normalized_offset_from_metric(offsets_m)
 
-        xy_grid = torch.stack([sample_xy[..., 0], -sample_xy[..., 1]], dim=-1)
-        xz_grid = torch.stack([sample_xy[..., 0], -sample_z[..., 0]], dim=-1)
-        yz_grid = torch.stack([sample_xy[..., 1], -sample_z[..., 0]], dim=-1)
+        sample_xyz = base_xyz.unsqueeze(2) + offsets_norm
+        sample_valid = base_valid.unsqueeze(2) & self._normalized_points_valid(sample_xyz)
 
-        xy_sampled = self._sample_plane(plane_maps["xy"], xy_grid)
-        xz_sampled = self._sample_plane(plane_maps["xz"], xz_grid)
-        yz_sampled = self._sample_plane(plane_maps["yz"], yz_grid)
-
-        xy_coord_tokens = self.coord_proj(sample_xy.reshape(batch, -1, 2)).reshape(
-            batch, num_queries, self.ray_num_samples, self.query_dim
+        feats = self._triplane_lookup(plane_maps, sample_xyz)
+        feats = feats * sample_valid.unsqueeze(-1).to(dtype=feats.dtype)
+        values_full = self.perspective_value_proj(feats)
+        values_full = values_full.reshape(
+            batch,
+            num_queries,
+            self.num_heads,
+            self.ray_num_samples,
+            self.num_heads,
+            self.head_dim,
         )
-        xz_coord = torch.cat([sample_xy[..., 0:1], sample_z], dim=-1)
-        xz_coord_tokens = self.coord_proj(xz_coord.reshape(batch, -1, 2)).reshape(
-            batch, num_queries, self.ray_num_samples, self.query_dim
+        values = torch.stack(
+            [values_full[:, :, head_idx, :, head_idx, :] for head_idx in range(self.num_heads)],
+            dim=2,
         )
-        yz_coord = torch.cat([sample_xy[..., 1:2], sample_z], dim=-1)
-        yz_coord_tokens = self.coord_proj(yz_coord.reshape(batch, -1, 2)).reshape(
-            batch, num_queries, self.ray_num_samples, self.query_dim
-        )
-        depth_tokens = self.ray_depth_proj(base_scales.expand(batch, num_queries, -1, -1))
 
-        xy_tokens = xy_sampled + xy_coord_tokens + depth_tokens + self.plane_embeddings[0].view(1, 1, 1, -1)
-        xz_tokens = xz_sampled + xz_coord_tokens + depth_tokens + self.plane_embeddings[1].view(1, 1, 1, -1)
-        yz_tokens = yz_sampled + yz_coord_tokens + depth_tokens + self.plane_embeddings[2].view(1, 1, 1, -1)
-        sample_tokens = torch.cat([xy_tokens, xz_tokens, yz_tokens], dim=2)
+        attn_logits = self.perspective_attn_net(pose_query_tokens)
+        attn_logits = attn_logits.view(batch, num_queries, self.num_heads, self.ray_num_samples)
+        attn_logits = attn_logits.masked_fill(~sample_valid, -1.0e4)
+        attn_weights = torch.softmax(attn_logits.float(), dim=-1).to(dtype=dtype)
+        attn_weights = attn_weights * sample_valid.to(dtype=dtype)
+        attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        q_weight, k_weight, v_weight = self.attn.in_proj_weight.chunk(3, dim=0)
-        q_bias, k_bias, v_bias = self.attn.in_proj_bias.chunk(3, dim=0)
-        q = F.linear(pose_query_tokens, q_weight, q_bias)
-        k = F.linear(sample_tokens, k_weight, k_bias)
-        v = F.linear(sample_tokens, v_weight, v_bias)
+        readout_tokens_raw = (attn_weights.unsqueeze(-1) * values).sum(dim=3)
+        readout_tokens_raw = readout_tokens_raw.reshape(batch, num_queries, self.query_dim)
+        readout_tokens_raw = self.perspective_head_mix(readout_tokens_raw)
 
-        total_candidates = sample_tokens.shape[2]
-        q = q.reshape(batch, num_queries, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = k.reshape(batch, num_queries, total_candidates, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
-        v = v.reshape(batch, num_queries, total_candidates, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
-
-        logits = (q.unsqueeze(3) * k).sum(dim=-1) / math.sqrt(self.head_dim)
-        attn_weights = torch.softmax(logits.float(), dim=-1).to(dtype=dtype)
-
-        readout_tokens_raw = (attn_weights.unsqueeze(-1) * v).sum(dim=3)
-        readout_tokens_raw = readout_tokens_raw.permute(0, 2, 1, 3).reshape(batch, num_queries, self.query_dim)
-        readout_tokens_raw = self.attn.out_proj(readout_tokens_raw)
-
-        xy_attn_weights = attn_weights[..., : self.ray_num_samples]
-        local_attn_mean = xy_attn_weights.float().mean(dim=1)
+        local_attn_mean = attn_weights.float().mean(dim=2)
+        sample_xy = base_xyz[..., :2]
         sample_x_idx = (
             ((sample_xy[..., 0] + 1.0) * 0.5 * float(max(int(xy_w) - 1, 1)))
             .round()
@@ -513,9 +674,11 @@ class ViewAwareSatelliteAdapter(nn.Module):
         scene_memory: Optional[Dict[str, Union[torch.Tensor, Tuple[int, int], int]]] = None,
         sat_tokens: Optional[torch.Tensor] = None,
         sat_xy: Optional[torch.Tensor] = None,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        plucker: Optional[torch.Tensor] = None,
-        valid_mask: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None,
+        cam_to_world: Optional[torch.Tensor] = None,
+        ego_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
+        source_image_size: Optional[Tuple[int, int]] = None,
         condition_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         scene_memory = self._coerce_scene_memory(scene_memory=scene_memory, sat_tokens=sat_tokens, sat_xy=sat_xy)
@@ -524,31 +687,45 @@ class ViewAwareSatelliteAdapter(nn.Module):
         device = scene_memory["xy_tokens"].device
         dtype = scene_memory["xy_tokens"].dtype
 
-        xy_tokens, plucker_tokens, valid_tokens = self._build_pose_query_inputs(
-            front_bev_xy=front_bev_xy,
-            plucker=plucker,
-            valid_mask=valid_mask,
+        source_size = self._coerce_source_image_size(source_image_size)
+        intrinsics_b = self._as_batched_intrinsics(intrinsics, batch, device, torch.float32)
+        cam_to_world_b = self._as_batched_transform(cam_to_world, batch, device, torch.float32)
+        ego_to_world_b = self._as_batched_transform(ego_to_world, batch, device, torch.float32)
+        camera_height_b = self._as_batched_scalar(camera_height_m, batch, device, torch.float32)
+        missing = []
+        if source_size is None:
+            missing.append("source_image_size")
+        if intrinsics_b is None:
+            missing.append("intrinsics")
+        if cam_to_world_b is None:
+            missing.append("cam_to_world")
+        if missing:
+            raise ValueError(
+                "Perspective ray reader requires "
+                + ", ".join(missing)
+                + "; no fallback path is available."
+            )
+
+        query_input, query_tokens, valid_tokens = self._build_perspective_query_inputs(
+            intrinsics=intrinsics_b,
+            cam_to_world=cam_to_world_b,
+            ego_to_world=ego_to_world_b,
+            camera_height_m=camera_height_b,
+            source_image_size=source_size,
             device=device,
             dtype=dtype,
             batch=batch,
         )
-        query_input, query_tokens = self._encode_pose_queries(
-            xy_tokens=xy_tokens,
-            plucker_tokens=plucker_tokens,
-            valid_tokens=valid_tokens,
-        )
-        query_anchor_xy, ray_dir_xy, ray_dir_xyz = self._build_query_anchor(
-            xy_tokens=xy_tokens,
-            plucker_tokens=plucker_tokens,
-            valid_tokens=valid_tokens,
-        )
-        readout_tokens_raw, geo_loss, local_attn_mean, local_index, sample_xy = self._sample_scene_along_rays(
-            scene_memory=scene_memory,
-            pose_query_tokens=query_tokens,
-            query_input=query_input,
-            query_anchor_xy=query_anchor_xy,
-            ray_dir_xy=ray_dir_xy,
-            ray_dir_xyz=ray_dir_xyz,
+        readout_tokens_raw, geo_loss, local_attn_mean, local_index, sample_xy = (
+            self._sample_scene_with_perspective_rays(
+                scene_memory=scene_memory,
+                pose_query_tokens=query_tokens,
+                intrinsics=intrinsics_b,
+                cam_to_world=cam_to_world_b,
+                ego_to_world=ego_to_world_b,
+                camera_height_m=camera_height_b,
+                source_image_size=source_size,
+            )
         )
         readout_tokens_raw, token_gate = self._apply_query_gate(
             readout_tokens_raw=readout_tokens_raw,
@@ -564,6 +741,7 @@ class ViewAwareSatelliteAdapter(nn.Module):
         entropy = (
             entropy * valid_tokens.squeeze(-1).float()
         ).sum() / valid_tokens.squeeze(-1).float().sum().clamp_min(1.0)
+        query_anchor_xy = sample_xy[..., 0, :]
         sample_geo_dist = (sample_xy - query_anchor_xy.unsqueeze(2)).pow(2).sum(dim=-1).sqrt().float()
         attn_geo_dist = (local_attn_mean * sample_geo_dist).sum(dim=-1)
         attn_geo_dist = (
@@ -611,9 +789,11 @@ class ViewAwareSatelliteAdapter(nn.Module):
         scene_memory: Optional[Dict[str, Union[torch.Tensor, Tuple[int, int], int]]] = None,
         sat_tokens: Optional[torch.Tensor] = None,
         sat_xy: Optional[torch.Tensor] = None,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        plucker: Optional[torch.Tensor] = None,
-        valid_mask: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None,
+        cam_to_world: Optional[torch.Tensor] = None,
+        ego_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
+        source_image_size: Optional[Tuple[int, int]] = None,
         condition_mask: Optional[torch.Tensor] = None,
         return_dict: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -621,9 +801,11 @@ class ViewAwareSatelliteAdapter(nn.Module):
             scene_memory=scene_memory,
             sat_tokens=sat_tokens,
             sat_xy=sat_xy,
-            front_bev_xy=front_bev_xy,
-            plucker=plucker,
-            valid_mask=valid_mask,
+            intrinsics=intrinsics,
+            cam_to_world=cam_to_world,
+            ego_to_world=ego_to_world,
+            camera_height_m=camera_height_m,
+            source_image_size=source_image_size,
             condition_mask=condition_mask,
         )
         if return_dict:

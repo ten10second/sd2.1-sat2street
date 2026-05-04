@@ -327,9 +327,18 @@ def main() -> None:
     coords_valid_mask = sample.get("coords_valid_mask")
     if coords_valid_mask is not None:
         coords_valid_mask = coords_valid_mask.unsqueeze(0).to(args.device)
-    plucker_map = sample.get("plucker_map")
-    if plucker_map is not None:
-        plucker_map = plucker_map.unsqueeze(0).to(args.device)
+    intrinsics = sample.get("K")
+    intrinsics = intrinsics.unsqueeze(0).to(args.device) if torch.is_tensor(intrinsics) else None
+    cam_to_world = sample.get("T_cam_to_world")
+    cam_to_world = cam_to_world.unsqueeze(0).to(args.device) if torch.is_tensor(cam_to_world) else None
+    ego_to_world = sample.get("T_imu_to_world")
+    ego_to_world = ego_to_world.unsqueeze(0).to(args.device) if torch.is_tensor(ego_to_world) else None
+    camera_height_m = sample.get("camera_height_m")
+    camera_height_m = (
+        torch.as_tensor([float(camera_height_m)], device=args.device, dtype=torch.float32)
+        if camera_height_m is not None
+        else None
+    )
 
     frame_id = int(sample["frame_id"])
     drive_name = str(sample["drive"])
@@ -397,7 +406,10 @@ def main() -> None:
                 sat_image,
                 coords_map=coords_map,
                 coords_valid_mask=coords_valid_mask,
-                plucker_map=plucker_map,
+                intrinsics=intrinsics,
+                cam_to_world=cam_to_world,
+                ego_to_world=ego_to_world,
+                camera_height_m=camera_height_m,
                 target_size=target_size,
                 num_inference_steps=args.inference_steps,
                 guidance_scale=guidance_scale,

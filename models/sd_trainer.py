@@ -313,12 +313,14 @@ class SatelliteConditionedSDModel(nn.Module):
             token_scale=float(adapter_cfg.get("token_scale", 1.0)),
             save_attention_heatmap=bool(adapter_cfg.get("save_attention_heatmap", True)),
             heatmap_max_tokens=int(adapter_cfg.get("heatmap_max_tokens", 16)),
-            ray_num_samples=int(adapter_cfg.get("ray_num_samples", 8)),
-            ray_depth_min=float(adapter_cfg.get("ray_depth_min", 0.15)),
-            ray_depth_max=float(adapter_cfg.get("ray_depth_max", 1.25)),
-            ray_offset_scale=float(adapter_cfg.get("ray_offset_scale", 0.10)),
-            ray_boundary_scale=float(adapter_cfg.get("ray_boundary_scale", 0.95)),
-            ray_height_scale=float(adapter_cfg.get("ray_height_scale", 0.75)),
+            ray_num_samples=int(adapter_cfg.get("ray_num_samples", 32)),
+            ray_depth_min=float(adapter_cfg.get("ray_depth_min", 1.0)),
+            ray_depth_max=float(adapter_cfg.get("ray_depth_max", 80.0)),
+            ray_offset_scale=float(adapter_cfg.get("ray_offset_scale", 0.50)),
+            ray_scene_extent_x_m=float(adapter_cfg.get("ray_scene_extent_x_m", 51.2)),
+            ray_scene_extent_y_m=float(adapter_cfg.get("ray_scene_extent_y_m", 51.2)),
+            ray_scene_z_min_m=float(adapter_cfg.get("ray_scene_z_min_m", 0.0)),
+            ray_scene_z_max_m=float(adapter_cfg.get("ray_scene_z_max_m", 20.0)),
             triplane_enabled=bool(adapter_cfg.get("triplane_enabled", True)),
         )
         self.view_geo_loss_weight = float(adapter_cfg.get("view_geo_loss_weight", 0.1))
@@ -361,17 +363,21 @@ class SatelliteConditionedSDModel(nn.Module):
         self,
         scene_memory: Optional[Dict[str, Any]],
         sat_xy: torch.Tensor,
-        coords_map: Optional[torch.Tensor],
-        coords_valid_mask: Optional[torch.Tensor],
-        plucker_map: Optional[torch.Tensor],
+        intrinsics: Optional[torch.Tensor] = None,
+        cam_to_world: Optional[torch.Tensor] = None,
+        ego_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
+        source_image_size: Optional[Tuple[int, int]] = None,
         condition_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         return self.view_satellite_adapter(
             scene_memory=scene_memory,
             sat_xy=sat_xy,
-            front_bev_xy=coords_map,
-            plucker=plucker_map,
-            valid_mask=coords_valid_mask,
+            intrinsics=intrinsics,
+            cam_to_world=cam_to_world,
+            ego_to_world=ego_to_world,
+            camera_height_m=camera_height_m,
+            source_image_size=source_image_size,
             condition_mask=condition_mask,
             return_dict=True,
         )
@@ -403,6 +409,18 @@ class SatelliteConditionedSDModel(nn.Module):
     @staticmethod
     def _flatten_grouped_views(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if tensor is None or not torch.is_tensor(tensor) or tensor.ndim < 5:
+            return tensor
+        batch, views = tensor.shape[:2]
+        return tensor.reshape(batch * views, *tensor.shape[2:])
+
+    @staticmethod
+    def _flatten_grouped_view_tensor(
+        tensor: Optional[torch.Tensor],
+        num_views: int,
+    ) -> Optional[torch.Tensor]:
+        if tensor is None or not torch.is_tensor(tensor) or tensor.ndim < 2:
+            return tensor
+        if int(tensor.shape[1]) != int(num_views):
             return tensor
         batch, views = tensor.shape[:2]
         return tensor.reshape(batch * views, *tensor.shape[2:])
@@ -464,7 +482,10 @@ class SatelliteConditionedSDModel(nn.Module):
         target_images: torch.Tensor,
         coords_map: torch.Tensor = None,
         coords_valid_mask: Optional[torch.Tensor] = None,
-        plucker_map: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None,
+        cam_to_world: Optional[torch.Tensor] = None,
+        ego_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for training.
@@ -474,7 +495,10 @@ class SatelliteConditionedSDModel(nn.Module):
             target_images: (B, 3, H, W) - Target frontview images
             coords_map: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
             coords_valid_mask: (B, 1, H_cam, W_cam) - Valid ground projection mask
-            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
+            intrinsics: (B, 3, 3) - Per-view pinhole camera intrinsics
+            cam_to_world: (B, 4, 4) - Per-view camera-to-world transform
+            ego_to_world: (B, 4, 4) - Ego/IMU-to-world transform for satellite crop center
+            camera_height_m: (B,) - Camera height used to define the metric z=0 plane
 
         Returns:
             dict with 'loss' and other info
@@ -508,11 +532,6 @@ class SatelliteConditionedSDModel(nn.Module):
             scene_memory = self._apply_condition_mask_to_scene_memory(scene_memory, condition_mask)
             if sat_xy is not None:
                 sat_xy = sat_xy * self._expand_condition_mask(condition_mask, sat_xy)
-        plucker_for_unet = plucker_map
-        plucker_dropout_prob = float(getattr(self.unet, "plucker_dropout_prob", 0.0))
-        if self.training and plucker_for_unet is not None and plucker_dropout_prob > 0.0:
-            if torch.rand((), device=device) < plucker_dropout_prob:
-                plucker_for_unet = None
         if sat_xy is None:
             raise ValueError("Satellite encoder must return sat_xy for view-aware conditioning")
         if grouped_views:
@@ -524,14 +543,20 @@ class SatelliteConditionedSDModel(nn.Module):
             target_images = self._flatten_grouped_views(target_images)
             coords_map = self._flatten_grouped_views(coords_map)
             coords_valid_mask = self._flatten_grouped_views(coords_valid_mask)
-            plucker_for_unet = self._flatten_grouped_views(plucker_for_unet)
+            intrinsics = self._flatten_grouped_view_tensor(intrinsics, num_views)
+            cam_to_world = self._flatten_grouped_view_tensor(cam_to_world, num_views)
+            ego_to_world = self._flatten_grouped_view_tensor(ego_to_world, num_views)
+            camera_height_m = self._flatten_grouped_view_tensor(camera_height_m, num_views)
 
+        source_image_size = tuple(int(x) for x in target_images.shape[-2:])
         reader_outputs = self.read_scene_with_pose(
             scene_memory=scene_memory,
             sat_xy=sat_xy,
-            coords_map=coords_map,
-            coords_valid_mask=coords_valid_mask,
-            plucker_map=plucker_for_unet,
+            intrinsics=intrinsics,
+            cam_to_world=cam_to_world,
+            ego_to_world=ego_to_world,
+            camera_height_m=camera_height_m,
+            source_image_size=source_image_size,
             condition_mask=condition_mask,
         )
         encoder_hidden_states = reader_outputs["readout_tokens"]
@@ -653,7 +678,10 @@ class SatelliteConditionedSDModel(nn.Module):
         sat_images: torch.Tensor,
         coords_map: torch.Tensor = None,
         coords_valid_mask: Optional[torch.Tensor] = None,
-        plucker_map: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None,
+        cam_to_world: Optional[torch.Tensor] = None,
+        ego_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
@@ -667,7 +695,10 @@ class SatelliteConditionedSDModel(nn.Module):
             sat_images: (B, 3, H_sat, W_sat) - Satellite images
             coords_map: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
             coords_valid_mask: (B, 1, H_cam, W_cam) - Valid ground projection mask
-            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
+            intrinsics: (B, 3, 3) - Per-view pinhole camera intrinsics
+            cam_to_world: (B, 4, 4) - Per-view camera-to-world transform
+            ego_to_world: (B, 4, 4) - Ego/IMU-to-world transform for satellite crop center
+            camera_height_m: (B,) - Camera height used to define the metric z=0 plane
             target_size: Optional target image size as (H, W)
             num_inference_steps: Number of denoising steps
             guidance_scale: Guidance scale for classifier-free guidance
@@ -709,18 +740,21 @@ class SatelliteConditionedSDModel(nn.Module):
             raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
         if sat_xy is None:
             raise ValueError("Satellite encoder must return sat_xy for view-aware conditioning")
+
+        image_h, image_w = self._infer_generation_size(coords_map=coords_map, target_size=target_size)
         reader_outputs = self.read_scene_with_pose(
             scene_memory=scene_memory,
             sat_xy=sat_xy,
-            coords_map=coords_map,
-            coords_valid_mask=coords_valid_mask,
-            plucker_map=plucker_map,
+            intrinsics=intrinsics,
+            cam_to_world=cam_to_world,
+            ego_to_world=ego_to_world,
+            camera_height_m=camera_height_m,
+            source_image_size=(image_h, image_w),
             condition_mask=condition_mask,
         )
         encoder_hidden_states = reader_outputs["readout_tokens"]
         view_condition_map = reader_outputs["readout_map"]
 
-        image_h, image_w = self._infer_generation_size(coords_map=coords_map, target_size=target_size)
         vae_scale_factor = self._get_vae_scale_factor()
         latent_h = max(1, (image_h + vae_scale_factor - 1) // vae_scale_factor)
         latent_w = max(1, (image_w + vae_scale_factor - 1) // vae_scale_factor)
@@ -852,9 +886,15 @@ def create_sd_model(
 
     reading_cfg = dict(reading_block_config or {})
     requested_sat_embed_dim = int(
-        reading_cfg.get('sat_in_dim', reading_cfg.get('satellite_embed_dim', DEFAULT_SATELLITE_EMBED_DIM))
+        reading_cfg.get(
+            'sat_in_dim',
+            reading_cfg.get(
+                'embed_dim',
+                reading_cfg.get('satellite_embed_dim', DEFAULT_SATELLITE_EMBED_DIM),
+            ),
+        )
     )
-    sat_num_heads = 12
+    sat_num_heads = int(reading_cfg.get('num_heads', 12))
     if requested_sat_embed_dim % sat_num_heads != 0:
         if requested_sat_embed_dim % 64 == 0:
             sat_num_heads = requested_sat_embed_dim // 64
@@ -865,7 +905,14 @@ def create_sd_model(
                     break
     satellite_encoder = SatelliteConditionEncoder(
         embed_dim=requested_sat_embed_dim,
+        patch_size=int(reading_cfg.get('patch_size', 16)),
+        num_layers=int(reading_cfg.get('num_layers', 0)),
         num_heads=sat_num_heads,
+        use_relative_pos=bool(reading_cfg.get('use_relative_pos', True)),
+        xy_feature_source=str(reading_cfg.get('xy_feature_source', 'resnet')),
+        resnet_name=str(reading_cfg.get('resnet_name', 'resnet34')),
+        resnet_stage=str(reading_cfg.get('resnet_stage', 'layer3')),
+        resnet_pretrained=bool(reading_cfg.get('resnet_pretrained', False)),
         triplane_enabled=bool(reading_cfg.get('triplane_enabled', True)),
         triplane_height_tokens=int(reading_cfg.get('triplane_height_tokens', 16)),
         triplane_num_cvha_layers=int(reading_cfg.get('triplane_num_cvha_layers', 1)),
@@ -880,7 +927,6 @@ def create_sd_model(
     unet = SatelliteConditionedUNet(
         reading_block_config={
             'sat_in_dim': sat_embed_dim,
-            'plucker_dropout_prob': reading_cfg.get('plucker_dropout_prob', 0.3),
             'view_grid_h': reading_cfg.get('view_grid_h', 8),
             'view_grid_w': reading_cfg.get('view_grid_w', 20),
             'view_query_dim': reading_cfg.get('view_query_dim', sat_embed_dim),
@@ -898,12 +944,14 @@ def create_sd_model(
             'scene_consistency_weight': reading_cfg.get('scene_consistency_weight', 0.0),
             'save_attention_heatmap': reading_cfg.get('save_attention_heatmap', False),
             'heatmap_max_tokens': reading_cfg.get('heatmap_max_tokens', 16),
-            'ray_num_samples': reading_cfg.get('ray_num_samples', 8),
-            'ray_depth_min': reading_cfg.get('ray_depth_min', 0.15),
-            'ray_depth_max': reading_cfg.get('ray_depth_max', 1.25),
-            'ray_offset_scale': reading_cfg.get('ray_offset_scale', 0.10),
-            'ray_boundary_scale': reading_cfg.get('ray_boundary_scale', 0.95),
-            'ray_height_scale': reading_cfg.get('ray_height_scale', 0.75),
+            'ray_num_samples': reading_cfg.get('ray_num_samples', 32),
+            'ray_depth_min': reading_cfg.get('ray_depth_min', 1.0),
+            'ray_depth_max': reading_cfg.get('ray_depth_max', 80.0),
+            'ray_offset_scale': reading_cfg.get('ray_offset_scale', 0.50),
+            'ray_scene_extent_x_m': reading_cfg.get('ray_scene_extent_x_m', 51.2),
+            'ray_scene_extent_y_m': reading_cfg.get('ray_scene_extent_y_m', 51.2),
+            'ray_scene_z_min_m': reading_cfg.get('ray_scene_z_min_m', 0.0),
+            'ray_scene_z_max_m': reading_cfg.get('ray_scene_z_max_m', 20.0),
             'triplane_enabled': reading_cfg.get('triplane_enabled', True),
             'triplane_height_tokens': reading_cfg.get('triplane_height_tokens', 16),
             'triplane_num_cvha_layers': reading_cfg.get('triplane_num_cvha_layers', 1),
@@ -1341,9 +1389,26 @@ class SDTrainer:
             coords_valid_mask = batch.get('coords_valid_mask')
             if coords_valid_mask is not None:
                 coords_valid_mask = coords_valid_mask.to(self.device)
-            plucker_map = batch.get('plucker_map')
-            if plucker_map is not None:
-                plucker_map = plucker_map.to(self.device)
+            intrinsics = batch.get('K')
+            if torch.is_tensor(intrinsics):
+                intrinsics = intrinsics.to(self.device)
+            else:
+                intrinsics = None
+            cam_to_world = batch.get('T_cam_to_world')
+            if torch.is_tensor(cam_to_world):
+                cam_to_world = cam_to_world.to(self.device)
+            else:
+                cam_to_world = None
+            ego_to_world = batch.get('T_imu_to_world')
+            if torch.is_tensor(ego_to_world):
+                ego_to_world = ego_to_world.to(self.device)
+            else:
+                ego_to_world = None
+            camera_height_m = batch.get('camera_height_m')
+            if torch.is_tensor(camera_height_m):
+                camera_height_m = camera_height_m.to(self.device)
+            else:
+                camera_height_m = None
 
             # Forward pass
             with torch.autocast(
@@ -1356,7 +1421,10 @@ class SDTrainer:
                     target_images,
                     coords_map=coords_map,
                     coords_valid_mask=coords_valid_mask,
-                    plucker_map=plucker_map,
+                    intrinsics=intrinsics,
+                    cam_to_world=cam_to_world,
+                    ego_to_world=ego_to_world,
+                    camera_height_m=camera_height_m,
                 )
                 raw_loss = outputs['loss']
 
@@ -1497,9 +1565,26 @@ class SDTrainer:
             coords_valid_mask = batch.get('coords_valid_mask')
             if coords_valid_mask is not None:
                 coords_valid_mask = coords_valid_mask.to(self.device)
-            plucker_map = batch.get('plucker_map')
-            if plucker_map is not None:
-                plucker_map = plucker_map.to(self.device)
+            intrinsics = batch.get('K')
+            if torch.is_tensor(intrinsics):
+                intrinsics = intrinsics.to(self.device)
+            else:
+                intrinsics = None
+            cam_to_world = batch.get('T_cam_to_world')
+            if torch.is_tensor(cam_to_world):
+                cam_to_world = cam_to_world.to(self.device)
+            else:
+                cam_to_world = None
+            ego_to_world = batch.get('T_imu_to_world')
+            if torch.is_tensor(ego_to_world):
+                ego_to_world = ego_to_world.to(self.device)
+            else:
+                ego_to_world = None
+            camera_height_m = batch.get('camera_height_m')
+            if torch.is_tensor(camera_height_m):
+                camera_height_m = camera_height_m.to(self.device)
+            else:
+                camera_height_m = None
 
             with torch.autocast(
                 device_type="cuda",
@@ -1511,7 +1596,10 @@ class SDTrainer:
                     target_images,
                     coords_map=coords_map,
                     coords_valid_mask=coords_valid_mask,
-                    plucker_map=plucker_map,
+                    intrinsics=intrinsics,
+                    cam_to_world=cam_to_world,
+                    ego_to_world=ego_to_world,
+                    camera_height_m=camera_height_m,
                 )
                 loss = outputs['loss']
             total_loss += loss.item()
@@ -1644,7 +1732,10 @@ class SDTrainer:
         target_chunks = []
         coords_chunks = []
         coords_valid_chunks = []
-        plucker_chunks = []
+        intrinsics_chunks = []
+        cam_to_world_chunks = []
+        ego_to_world_chunks = []
+        camera_height_chunks = []
         frame_ids = []
         metas = []
 
@@ -1664,9 +1755,18 @@ class SDTrainer:
             coords_valid_mask = batch.get('coords_valid_mask')
             if coords_valid_mask is not None:
                 coords_valid_chunks.append(coords_valid_mask[:take])
-            plucker_map = batch.get('plucker_map')
-            if plucker_map is not None:
-                plucker_chunks.append(plucker_map[:take])
+            intrinsics = batch.get('K')
+            if torch.is_tensor(intrinsics):
+                intrinsics_chunks.append(intrinsics[:take])
+            cam_to_world = batch.get('T_cam_to_world')
+            if torch.is_tensor(cam_to_world):
+                cam_to_world_chunks.append(cam_to_world[:take])
+            ego_to_world = batch.get('T_imu_to_world')
+            if torch.is_tensor(ego_to_world):
+                ego_to_world_chunks.append(ego_to_world[:take])
+            camera_height_m = batch.get('camera_height_m')
+            if torch.is_tensor(camera_height_m):
+                camera_height_chunks.append(camera_height_m[:take])
 
             batch_frame_ids = batch.get('frame_id')
             if batch_frame_ids is None:
@@ -1689,7 +1789,10 @@ class SDTrainer:
         target_images = torch.cat(target_chunks, dim=0).to(self.device)
         coords_map = torch.cat(coords_chunks, dim=0).to(self.device) if coords_chunks else None
         coords_valid_mask = torch.cat(coords_valid_chunks, dim=0).to(self.device) if coords_valid_chunks else None
-        plucker_map = torch.cat(plucker_chunks, dim=0).to(self.device) if plucker_chunks else None
+        intrinsics = torch.cat(intrinsics_chunks, dim=0).to(self.device) if intrinsics_chunks else None
+        cam_to_world = torch.cat(cam_to_world_chunks, dim=0).to(self.device) if cam_to_world_chunks else None
+        ego_to_world = torch.cat(ego_to_world_chunks, dim=0).to(self.device) if ego_to_world_chunks else None
+        camera_height_m = torch.cat(camera_height_chunks, dim=0).to(self.device) if camera_height_chunks else None
         if target_images.ndim == 5:
             batch_count, view_count = target_images.shape[:2]
             sat_images = sat_images[:, None].expand(-1, view_count, -1, -1, -1).reshape(
@@ -1699,7 +1802,10 @@ class SDTrainer:
             target_images = SatelliteConditionedSDModel._flatten_grouped_views(target_images)
             coords_map = SatelliteConditionedSDModel._flatten_grouped_views(coords_map)
             coords_valid_mask = SatelliteConditionedSDModel._flatten_grouped_views(coords_valid_mask)
-            plucker_map = SatelliteConditionedSDModel._flatten_grouped_views(plucker_map)
+            intrinsics = SatelliteConditionedSDModel._flatten_grouped_view_tensor(intrinsics, view_count)
+            cam_to_world = SatelliteConditionedSDModel._flatten_grouped_view_tensor(cam_to_world, view_count)
+            ego_to_world = SatelliteConditionedSDModel._flatten_grouped_view_tensor(ego_to_world, view_count)
+            camera_height_m = SatelliteConditionedSDModel._flatten_grouped_view_tensor(camera_height_m, view_count)
             expanded_frame_ids = []
             for frame_id in frame_ids:
                 expanded_frame_ids.extend([frame_id] * view_count)
@@ -1723,7 +1829,10 @@ class SDTrainer:
             sat_images,
             coords_map=coords_map,
             coords_valid_mask=coords_valid_mask,
-            plucker_map=plucker_map,
+            intrinsics=intrinsics,
+            cam_to_world=cam_to_world,
+            ego_to_world=ego_to_world,
+            camera_height_m=camera_height_m,
             target_size=tuple(target_images.shape[-2:]),
             num_inference_steps=self.visualization_inference_steps,
             guidance_scale=self.visualization_guidance_scale,

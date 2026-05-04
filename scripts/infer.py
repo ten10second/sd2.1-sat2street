@@ -52,12 +52,9 @@ FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = (
     ("yaw_p120", 120.0),
 )
 
-ABLATION_MODE_CONFIGS: Dict[str, Tuple[str, str]] = {
-    "normal": ("normal", "normal"),
-    "sat_zero": ("zero", "normal"),
-    "plucker_zero": ("normal", "zero"),
-    "plucker_none": ("normal", "none"),
-    "sat_plucker_zero": ("zero", "zero"),
+ABLATION_MODE_CONFIGS: Dict[str, str] = {
+    "normal": "normal",
+    "sat_zero": "zero",
 }
 
 
@@ -71,8 +68,24 @@ def _load_reading_block_config(config_path: Path) -> Dict[str, object]:
     model_cfg = config_data.get("model", {})
     if not isinstance(model_cfg, dict):
         return {}
-    reading_block = model_cfg.get("reading_block", {})
-    return reading_block if isinstance(reading_block, dict) else {}
+    reading_block = dict(model_cfg.get("reading_block", {}) or {})
+    satellite_cfg = model_cfg.get("satellite_encoder", {})
+    if isinstance(satellite_cfg, dict):
+        for key in (
+            "patch_size",
+            "num_layers",
+            "num_heads",
+            "use_relative_pos",
+            "xy_feature_source",
+            "resnet_name",
+            "resnet_stage",
+            "resnet_pretrained",
+        ):
+            if key in satellite_cfg and key not in reading_block:
+                reading_block[key] = satellite_cfg[key]
+        if "embed_dim" in satellite_cfg and "sat_in_dim" not in reading_block:
+            reading_block["sat_in_dim"] = satellite_cfg["embed_dim"]
+    return reading_block
 
 
 def _load_frame_ids(frames_file: Path) -> List[int]:
@@ -194,13 +207,6 @@ def _parse_args() -> argparse.Namespace:
         help="Use zero for satellite-conditioning ablation.",
     )
     parser.add_argument(
-        "--plucker_condition_mode",
-        type=str,
-        default="normal",
-        choices=["normal", "zero", "none"],
-        help="Use zero or none for Plucker-conditioning ablation.",
-    )
-    parser.add_argument(
         "--ablation_modes",
         type=str,
         nargs="+",
@@ -208,8 +214,8 @@ def _parse_args() -> argparse.Namespace:
         choices=list(ABLATION_MODE_CONFIGS.keys()),
         help=(
             "Optional suite of ablations to run in one command. "
-            "When set, this overrides --sat_condition_mode and --plucker_condition_mode "
-            "and writes each ablation under a separate output subdirectory."
+            "When set, this overrides --sat_condition_mode and writes each ablation "
+            "under a separate output subdirectory."
         ),
     )
     return parser.parse_args()
@@ -236,15 +242,14 @@ def _view_token(view_name: str, yaw: Optional[float]) -> str:
     return token
 
 
-def _resolve_ablation_runs(args: argparse.Namespace) -> List[Tuple[Optional[str], str, str]]:
-    """Return (output_subdir, sat_condition_mode, plucker_condition_mode)."""
+def _resolve_ablation_runs(args: argparse.Namespace) -> List[Tuple[Optional[str], str]]:
+    """Return (output_subdir, sat_condition_mode)."""
     if args.ablation_modes is None:
-        return [(None, args.sat_condition_mode, args.plucker_condition_mode)]
+        return [(None, args.sat_condition_mode)]
 
-    runs: List[Tuple[Optional[str], str, str]] = []
+    runs: List[Tuple[Optional[str], str]] = []
     for mode_name in args.ablation_modes:
-        sat_mode, plucker_mode = ABLATION_MODE_CONFIGS[mode_name]
-        runs.append((mode_name, sat_mode, plucker_mode))
+        runs.append((mode_name, ABLATION_MODE_CONFIGS[mode_name]))
     return runs
 
 
@@ -616,21 +621,24 @@ def _generate_one(
     sample: Dict,
     args: argparse.Namespace,
     sat_condition_mode: str,
-    plucker_condition_mode: str,
 ) -> torch.Tensor:
     sat_image = sample["sat"].unsqueeze(0).to(args.device)
     coords_map = sample.get("coords_map")
     coords_map = coords_map.unsqueeze(0).to(args.device) if coords_map is not None else None
     coords_valid_mask = sample.get("coords_valid_mask")
     coords_valid_mask = coords_valid_mask.unsqueeze(0).to(args.device) if coords_valid_mask is not None else None
-    plucker_map = sample.get("plucker_map")
-    plucker_map = plucker_map.unsqueeze(0).to(args.device) if plucker_map is not None else None
-    if plucker_condition_mode == "zero" and plucker_map is not None:
-        plucker_map = torch.zeros_like(plucker_map)
-    elif plucker_condition_mode == "none":
-        plucker_map = None
-    elif plucker_condition_mode != "normal":
-        raise ValueError(f"Unknown plucker_condition_mode: {plucker_condition_mode}")
+    intrinsics = sample.get("K")
+    intrinsics = intrinsics.unsqueeze(0).to(args.device) if torch.is_tensor(intrinsics) else None
+    cam_to_world = sample.get("T_cam_to_world")
+    cam_to_world = cam_to_world.unsqueeze(0).to(args.device) if torch.is_tensor(cam_to_world) else None
+    ego_to_world = sample.get("T_imu_to_world")
+    ego_to_world = ego_to_world.unsqueeze(0).to(args.device) if torch.is_tensor(ego_to_world) else None
+    camera_height_m = sample.get("camera_height_m")
+    camera_height_m = (
+        torch.as_tensor([float(camera_height_m)], device=args.device, dtype=torch.float32)
+        if camera_height_m is not None
+        else None
+    )
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
 
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
@@ -641,7 +649,10 @@ def _generate_one(
         sat_image,
         coords_map=coords_map,
         coords_valid_mask=coords_valid_mask,
-        plucker_map=plucker_map,
+        intrinsics=intrinsics,
+        cam_to_world=cam_to_world,
+        ego_to_world=ego_to_world,
+        camera_height_m=camera_height_m,
         target_size=target_size,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
@@ -658,7 +669,6 @@ def _save_view_outputs(
     yaw: Optional[float],
     ablation_mode: Optional[str],
     sat_condition_mode: str,
-    plucker_condition_mode: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     gt_image = sample["image"]
@@ -688,7 +698,6 @@ def _save_view_outputs(
         "vehicle_yaw_deg": None if yaw is None else float(yaw),
         "ablation_mode": ablation_mode,
         "sat_condition_mode": sat_condition_mode,
-        "plucker_condition_mode": plucker_condition_mode,
         "meta": sample.get("meta", {}),
     }
     with open(output_dir / "metadata.yaml", "w") as f:
@@ -736,7 +745,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
     base_sample = dataset.samples[sample_index]
     ablation_runs = _resolve_ablation_runs(args)
 
-    for ablation_name, sat_mode, plucker_mode in ablation_runs:
+    for ablation_name, sat_mode in ablation_runs:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_yaw_sweep"
 
@@ -749,7 +758,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                 ablation_name or "custom",
             )
             sample = _get_view_sample(dataset, sample_index, view_name, yaw)
-            generated = _generate_one(model, sample, args, sat_mode, plucker_mode)
+            generated = _generate_one(model, sample, args, sat_mode)
             _save_view_outputs(
                 sample,
                 generated,
@@ -758,7 +767,6 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                 yaw,
                 ablation_name,
                 sat_mode,
-                plucker_mode,
             )
 
         with open(sample_dir / "run_metadata.yaml", "w") as f:
@@ -769,7 +777,6 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                     "mode": args.mode,
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
-                    "plucker_condition_mode": plucker_mode,
                     "views": [{"view_name": name, "vehicle_yaw_deg": yaw} for name, yaw in view_specs],
                 },
                 f,
@@ -795,7 +802,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
 
     output_root = Path(args.output_dir)
     ablation_runs = _resolve_ablation_runs(args)
-    for ablation_name, sat_mode, plucker_mode in ablation_runs:
+    for ablation_name, sat_mode in ablation_runs:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         progress = tqdm(sample_indices, desc=f"Split fixed-view inference [{ablation_name or 'custom'}]")
         for sample_index in progress:
@@ -808,7 +815,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     ablation=ablation_name or "custom",
                 )
                 sample = _get_view_sample(dataset, sample_index, view_name, yaw)
-                generated = _generate_one(model, sample, args, sat_mode, plucker_mode)
+                generated = _generate_one(model, sample, args, sat_mode)
                 _save_view_outputs(
                     sample,
                     generated,
@@ -817,7 +824,6 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     yaw,
                     ablation_name,
                     sat_mode,
-                    plucker_mode,
                 )
 
         with open(active_output_root / "run_metadata.yaml", "w") as f:
@@ -834,7 +840,6 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     "num_frames": len(sample_indices),
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
-                    "plucker_condition_mode": plucker_mode,
                     "fixed_views": [
                         {"view_name": view_name, "vehicle_yaw_deg": yaw}
                         for view_name, yaw in FIXED_VIEW_SPECS

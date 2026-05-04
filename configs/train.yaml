@@ -32,8 +32,15 @@ model:
     name: 'satellite_condition_encoder'
     embed_dim: 768
     patch_size: 16
-    num_layers: 12
+    # ResNet layer3 gives a 32x32 XY feature map for 512x512 satellite images.
+    xy_feature_source: 'resnet'  # resnet, patch
+    resnet_name: 'resnet34'
+    resnet_stage: 'layer3'
+    resnet_pretrained: false
+    # Optional XY-plane relative-attention refinement before triplane/CVHA.
+    num_layers: 0
     num_heads: 12
+    use_relative_pos: true
 
   # 坐标位置编码配置
   coordinate_encoder:
@@ -72,12 +79,14 @@ model:
     scene_consistency_weight: 0.01
     save_attention_heatmap: false
     heatmap_max_tokens: 16
-    ray_num_samples: 8
-    ray_depth_min: 0.15
-    ray_depth_max: 1.25
-    ray_offset_scale: 0.10
-    ray_boundary_scale: 0.95
-    ray_height_scale: 0.75
+    ray_num_samples: 32
+    ray_depth_min: 1.0
+    ray_depth_max: 80.0
+    ray_offset_scale: 0.50  # meters
+    ray_scene_extent_x_m: 51.2
+    ray_scene_extent_y_m: 51.2
+    ray_scene_z_min_m: 0.0
+    ray_scene_z_max_m: 20.0
     triplane_enabled: true
     triplane_height_tokens: 16
     triplane_num_cvha_layers: 1
@@ -87,7 +96,6 @@ model:
     triplane_cvha_offset_scale: 1.0
     view_injection_sites: [down2, down3, mid, up0, up1]
     view_modulation_scale: 0.4
-    plucker_dropout_prob: 0.3
 
 # 训练配置
 training:
