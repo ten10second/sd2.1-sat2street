@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -42,15 +42,7 @@ DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
 
-FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = (
-    ("front", None),
-    ("yaw_m120", -120.0),
-    ("yaw_m90", -90.0),
-    ("yaw_m40", -40.0),
-    ("yaw_p40", 40.0),
-    ("yaw_p90", 90.0),
-    ("yaw_p120", 120.0),
-)
+DEFAULT_FIXED_VIEW_YAWS: Sequence[float] = (-120.0, -60.0, 60.0, 120.0)
 
 ABLATION_MODE_CONFIGS: Dict[str, str] = {
     "normal": "normal",
@@ -58,12 +50,39 @@ ABLATION_MODE_CONFIGS: Dict[str, str] = {
 }
 
 
-def _load_reading_block_config(config_path: Path) -> Dict[str, object]:
+def _load_yaml_config(config_path: Path) -> Dict[str, Any]:
     if not config_path.is_file():
         return {}
     with config_path.open("r") as f:
         config_data = yaml.safe_load(f) or {}
     if not isinstance(config_data, dict):
+        return {}
+    return config_data
+
+
+def _cfg_get(config_data: Dict[str, Any], path: Sequence[str], default: Any = None) -> Any:
+    value: Any = config_data
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return default
+        value = value[key]
+    return default if value is None else value
+
+
+def _as_wh(value: Any, default: Tuple[int, int]) -> Tuple[int, int]:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            width, height = int(value[0]), int(value[1])
+            if width > 0 and height > 0:
+                return width, height
+        except (TypeError, ValueError):
+            pass
+    return default
+
+
+def _load_reading_block_config(config_path: Path) -> Dict[str, object]:
+    config_data = _load_yaml_config(config_path)
+    if not config_data:
         return {}
     model_cfg = config_data.get("model", {})
     if not isinstance(model_cfg, dict):
@@ -150,59 +169,107 @@ def _load_split_from_yaml(
 
 
 def _parse_args() -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/inference.yaml",
+        help="Path to inference config. CLI flags override values loaded from this file.",
+    )
+    config_args, _ = config_parser.parse_known_args()
+    config_data = _load_yaml_config(Path(config_args.config))
+
     parser = argparse.ArgumentParser(
-        description="Inference for satellite-to-street generation"
+        description="Inference for satellite-to-street generation",
+        parents=[config_parser],
     )
     parser.add_argument(
         "--mode",
         type=str,
-        default="single_yaw_sweep",
+        default=_cfg_get(config_data, ("inference", "mode"), "single_yaw_sweep"),
         choices=["single_yaw_sweep", "split_fixed_views"],
         help="Inference mode.",
     )
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=_cfg_get(config_data, ("model", "checkpoint_path"), None),
+        help="Path to trained checkpoint. Defaults to model.checkpoint_path in --config.",
+    )
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
+        default=_cfg_get(
+            config_data,
+            ("data", "data_dir"),
+            "/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
+        ),
         help="Path to KITTI-360 data root.",
     )
-    parser.add_argument("--split_yaml", type=str, default=None, help="Split yaml for split-based inference.")
-    parser.add_argument("--dataset_split", type=str, default="val", choices=["train", "val"])
-    parser.add_argument("--drive", type=str, default=None, help="Drive name for single_yaw_sweep.")
-    parser.add_argument("--drive_dir", type=str, default=None, help="Drive path for single_yaw_sweep.")
-    parser.add_argument("--frame_id", type=int, default=None, help="Exact frame id for single_yaw_sweep.")
-    parser.add_argument("--start_frame", type=int, default=None, help="Minimum frame id for split_fixed_views.")
-    parser.add_argument("--end_frame", type=int, default=None, help="Maximum frame id for split_fixed_views.")
-    parser.add_argument("--max_frames", type=int, default=None, help="Optional cap on number of split frames.")
+    parser.add_argument("--split_yaml", type=str, default=_cfg_get(config_data, ("data", "split_yaml"), None), help="Split yaml for split-based inference.")
+    parser.add_argument("--dataset_split", type=str, default=_cfg_get(config_data, ("data", "dataset_split"), "val"), choices=["train", "val"])
+    parser.add_argument("--drive", type=str, default=_cfg_get(config_data, ("data", "drive"), None), help="Drive name for single_yaw_sweep.")
+    parser.add_argument("--drive_dir", type=str, default=_cfg_get(config_data, ("data", "drive_dir"), None), help="Drive path for single_yaw_sweep.")
+    parser.add_argument("--frame_id", type=int, default=_cfg_get(config_data, ("data", "frame_id"), None), help="Exact frame id for single_yaw_sweep.")
+    parser.add_argument("--start_frame", type=int, default=_cfg_get(config_data, ("data", "start_frame"), None), help="Minimum frame id for split_fixed_views.")
+    parser.add_argument("--end_frame", type=int, default=_cfg_get(config_data, ("data", "end_frame"), None), help="Maximum frame id for split_fixed_views.")
+    parser.add_argument("--max_frames", type=int, default=_cfg_get(config_data, ("data", "max_frames"), None), help="Optional cap on number of split frames.")
+    parser.add_argument(
+        "--front_resize",
+        type=int,
+        nargs=2,
+        metavar=("W", "H"),
+        default=_cfg_get(config_data, ("data", "front_resize"), [640, 256]),
+        help="Front-view resize as width height.",
+    )
+    parser.add_argument(
+        "--virtual_size",
+        type=int,
+        nargs=2,
+        metavar=("W", "H"),
+        default=_cfg_get(config_data, ("data", "virtual_size"), [640, 256]),
+        help="Virtual fisheye perspective size as width height.",
+    )
     parser.add_argument(
         "--vehicle_yaws",
         type=float,
         nargs="+",
-        default=None,
+        default=_cfg_get(config_data, ("inference", "vehicle_yaws"), None),
         help="Yaw values for single_yaw_sweep. Front is included by default; pass --no_include_front to omit it.",
     )
-    parser.add_argument("--vehicle_yaw_min_deg", type=float, default=60.0)
-    parser.add_argument("--vehicle_yaw_max_deg", type=float, default=120.0)
+    parser.add_argument(
+        "--fixed_yaws",
+        type=float,
+        nargs="+",
+        default=_cfg_get(config_data, ("inference", "fixed_yaws"), list(DEFAULT_FIXED_VIEW_YAWS)),
+        help="Yaw values for split_fixed_views.",
+    )
+    parser.add_argument("--vehicle_yaw_min_deg", type=float, default=_cfg_get(config_data, ("inference", "vehicle_yaw_min_deg"), 60.0))
+    parser.add_argument("--vehicle_yaw_max_deg", type=float, default=_cfg_get(config_data, ("inference", "vehicle_yaw_max_deg"), 120.0))
     front_group = parser.add_mutually_exclusive_group()
     front_group.add_argument("--include_front", dest="include_front", action="store_true")
     front_group.add_argument("--no_include_front", dest="include_front", action="store_false")
-    parser.set_defaults(include_front=True)
-    parser.add_argument("--output_dir", type=str, default="./inference_results")
-    parser.add_argument("--num_inference_steps", type=int, default=30)
-    parser.add_argument("--guidance_scale", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
-    parser.add_argument("--base_model", type=str, default=DEFAULT_SD21_BASE_REPO)
-    parser.add_argument("--base_model_revision", type=str, default=None)
-    parser.add_argument("--config", type=str, default="configs/inference.yaml")
-    parser.add_argument("--hf_endpoint", type=str, default=DEFAULT_HF_ENDPOINT)
-    parser.add_argument("--hf_home", type=str, default=str(DEFAULT_HF_HOME))
+    parser.set_defaults(include_front=bool(_cfg_get(config_data, ("inference", "include_front"), True)))
+    parser.add_argument(
+        "--front_only",
+        action="store_true",
+        default=bool(_cfg_get(config_data, ("inference", "front_only"), False)),
+        help="Render only the front view and skip yaw views.",
+    )
+    parser.add_argument("--output_dir", type=str, default=_cfg_get(config_data, ("output", "output_dir"), "./inference_results"))
+    parser.add_argument("--num_inference_steps", type=int, default=_cfg_get(config_data, ("inference", "num_inference_steps"), 30))
+    parser.add_argument("--guidance_scale", type=float, default=_cfg_get(config_data, ("inference", "guidance_scale"), 1.0))
+    parser.add_argument("--seed", type=int, default=_cfg_get(config_data, ("seed",), 42))
+    parser.add_argument("--device", type=str, default=_cfg_get(config_data, ("device",), "cuda"))
+    parser.add_argument("--mixed_precision", type=str, default=_cfg_get(config_data, ("mixed_precision",), "no"), choices=["no", "fp16", "bf16"])
+    parser.add_argument("--base_model", type=str, default=_cfg_get(config_data, ("model", "base_model"), DEFAULT_SD21_BASE_REPO))
+    parser.add_argument("--base_model_revision", type=str, default=_cfg_get(config_data, ("model", "base_model_revision"), None))
+    parser.add_argument("--hf_endpoint", type=str, default=_cfg_get(config_data, ("hf_endpoint",), DEFAULT_HF_ENDPOINT))
+    parser.add_argument("--hf_home", type=str, default=_cfg_get(config_data, ("hf_home",), str(DEFAULT_HF_HOME)))
     parser.add_argument(
         "--sat_condition_mode",
         type=str,
-        default="normal",
+        default=_cfg_get(config_data, ("inference", "sat_condition_mode"), "normal"),
         choices=["normal", "zero"],
         help="Use zero for satellite-conditioning ablation.",
     )
@@ -210,7 +277,7 @@ def _parse_args() -> argparse.Namespace:
         "--ablation_modes",
         type=str,
         nargs="+",
-        default=None,
+        default=_cfg_get(config_data, ("inference", "ablation_modes"), None),
         choices=list(ABLATION_MODE_CONFIGS.keys()),
         help=(
             "Optional suite of ablations to run in one command. "
@@ -218,7 +285,10 @@ def _parse_args() -> argparse.Namespace:
             "under a separate output subdirectory."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.checkpoint is None:
+        parser.error("--checkpoint is required unless model.checkpoint_path is set in --config")
+    return args
 
 
 def _training_range_yaws(min_abs: float, max_abs: float) -> List[float]:
@@ -490,7 +560,9 @@ def _draw_satellite_coverage(
     return image
 
 
-def _build_base_dataset(drives, frames, seed: int) -> Kitti360dDataset:
+def _build_base_dataset(drives, frames, args: argparse.Namespace) -> Kitti360dDataset:
+    front_resize = _as_wh(args.front_resize, (640, 256))
+    virtual_size = _as_wh(args.virtual_size, (640, 256))
     return Kitti360dDataset(
         drives=drives,
         frames=frames,
@@ -498,11 +570,11 @@ def _build_base_dataset(drives, frames, seed: int) -> Kitti360dDataset:
         yaw_mode="vehicle_relative",
         vehicle_relative_yaw_deg=90.0,
         random_vehicle_relative_yaw=False,
-        virtual_size=(640, 256),
-        front_resize=(640, 256),
+        virtual_size=virtual_size,
+        front_resize=front_resize,
         front_center_crop=None,
         random_fisheye_relative_yaw=False,
-        seed=seed,
+        seed=args.seed,
         return_bgr=False,
     )
 
@@ -616,37 +688,68 @@ def _load_model(args: argparse.Namespace):
 
 
 @torch.no_grad()
-def _generate_one(
+def _generate_batch(
     model,
-    sample: Dict,
+    samples: Sequence[Dict],
     args: argparse.Namespace,
     sat_condition_mode: str,
 ) -> torch.Tensor:
-    sat_image = sample["sat"].unsqueeze(0).to(args.device)
-    coords_map = sample.get("coords_map")
-    coords_map = coords_map.unsqueeze(0).to(args.device) if coords_map is not None else None
-    coords_valid_mask = sample.get("coords_valid_mask")
-    coords_valid_mask = coords_valid_mask.unsqueeze(0).to(args.device) if coords_valid_mask is not None else None
-    intrinsics = sample.get("K")
-    intrinsics = intrinsics.unsqueeze(0).to(args.device) if torch.is_tensor(intrinsics) else None
-    cam_to_world = sample.get("T_cam_to_world")
-    cam_to_world = cam_to_world.unsqueeze(0).to(args.device) if torch.is_tensor(cam_to_world) else None
-    ego_to_world = sample.get("T_imu_to_world")
-    ego_to_world = ego_to_world.unsqueeze(0).to(args.device) if torch.is_tensor(ego_to_world) else None
-    camera_height_m = sample.get("camera_height_m")
-    camera_height_m = (
-        torch.as_tensor([float(camera_height_m)], device=args.device, dtype=torch.float32)
-        if camera_height_m is not None
+    if not samples:
+        raise ValueError("At least one sample is required for generation")
+
+    target_size = tuple(int(x) for x in samples[0]["image"].shape[-2:])
+    for sample in samples[1:]:
+        sample_target_size = tuple(int(x) for x in sample["image"].shape[-2:])
+        if sample_target_size != target_size:
+            raise ValueError(
+                "Batched yaw-sweep generation requires all views to share the same target size; "
+                f"got {target_size} and {sample_target_size}."
+            )
+
+    sat_images = torch.stack([sample["sat"] for sample in samples], dim=0).to(args.device)
+    coords_maps = [sample.get("coords_map") for sample in samples]
+    coords_map = (
+        torch.stack(coords_maps, dim=0).to(args.device)
+        if all(torch.is_tensor(coords) for coords in coords_maps)
         else None
     )
-    target_size = tuple(int(x) for x in sample["image"].shape[-2:])
+    coords_valid_masks = [sample.get("coords_valid_mask") for sample in samples]
+    coords_valid_mask = (
+        torch.stack(coords_valid_masks, dim=0).to(args.device)
+        if all(torch.is_tensor(mask) for mask in coords_valid_masks)
+        else None
+    )
+    intrinsics_values = [sample.get("K") for sample in samples]
+    intrinsics = (
+        torch.stack(intrinsics_values, dim=0).to(args.device)
+        if all(torch.is_tensor(value) for value in intrinsics_values)
+        else None
+    )
+    cam_to_world_values = [sample.get("T_cam_to_world") for sample in samples]
+    cam_to_world = (
+        torch.stack(cam_to_world_values, dim=0).to(args.device)
+        if all(torch.is_tensor(value) for value in cam_to_world_values)
+        else None
+    )
+    ego_to_world_values = [sample.get("T_imu_to_world") for sample in samples]
+    ego_to_world = (
+        torch.stack(ego_to_world_values, dim=0).to(args.device)
+        if all(torch.is_tensor(value) for value in ego_to_world_values)
+        else None
+    )
+    camera_height_values = [sample.get("camera_height_m") for sample in samples]
+    camera_height_m = (
+        torch.as_tensor([float(value) for value in camera_height_values], device=args.device, dtype=torch.float32)
+        if all(value is not None for value in camera_height_values)
+        else None
+    )
 
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
     generator = torch.Generator(device=generator_device)
     generator.manual_seed(int(args.seed))
 
     return model.generate(
-        sat_image,
+        sat_images,
         coords_map=coords_map,
         coords_valid_mask=coords_valid_mask,
         intrinsics=intrinsics,
@@ -658,7 +761,17 @@ def _generate_one(
         guidance_scale=args.guidance_scale,
         generator=generator,
         sat_condition_mode=sat_condition_mode,
-    )[0].cpu()
+    ).cpu()
+
+
+@torch.no_grad()
+def _generate_one(
+    model,
+    sample: Dict,
+    args: argparse.Namespace,
+    sat_condition_mode: str,
+) -> torch.Tensor:
+    return _generate_batch(model, [sample], args, sat_condition_mode)[0]
 
 
 def _save_view_outputs(
@@ -709,7 +822,7 @@ def _resolve_single_dataset(args: argparse.Namespace) -> Tuple[Kitti360dDataset,
         raise ValueError("--frame_id is required for single_yaw_sweep")
 
     if args.drive_dir is not None:
-        dataset = _build_base_dataset(Path(args.drive_dir), [int(args.frame_id)], args.seed)
+        dataset = _build_base_dataset(Path(args.drive_dir), [int(args.frame_id)], args)
         return dataset, 0
 
     if args.split_yaml is not None:
@@ -719,12 +832,12 @@ def _resolve_single_dataset(args: argparse.Namespace) -> Tuple[Kitti360dDataset,
         )
         drives = train_dirs if args.dataset_split == "train" else val_dirs
         frames = train_frames if args.dataset_split == "train" else val_frames
-        dataset = _build_base_dataset(drives, frames, args.seed)
+        dataset = _build_base_dataset(drives, frames, args)
         return dataset, _resolve_sample_index(dataset, int(args.frame_id), args.drive)
 
     if args.drive is None:
         raise ValueError("Pass --drive_dir, or pass --split_yaml with optional --drive")
-    dataset = _build_base_dataset(Path(args.data_dir) / args.drive, [int(args.frame_id)], args.seed)
+    dataset = _build_base_dataset(Path(args.data_dir) / args.drive, [int(args.frame_id)], args)
     return dataset, 0
 
 
@@ -737,7 +850,10 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
     view_specs: List[Tuple[str, Optional[float]]] = []
     if args.include_front:
         view_specs.append(("front", None))
-    view_specs.extend((_view_token("yaw", yaw), float(yaw)) for yaw in yaws)
+    if not args.front_only:
+        view_specs.extend((_view_token("yaw", yaw), float(yaw)) for yaw in yaws)
+    if not view_specs:
+        raise ValueError("No views selected; use --include_front or disable --front_only.")
 
     model, checkpoint_meta = _load_model(args)
 
@@ -749,16 +865,26 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_yaw_sweep"
 
+        view_samples: List[Dict] = []
         for view_name, yaw in view_specs:
             logger.info(
-                "Generating frame=%s, view=%s, yaw=%s, ablation=%s",
+                "Preparing frame=%s, view=%s, yaw=%s, ablation=%s",
                 f"{base_sample.frame_id:010d}",
                 view_name,
                 yaw,
                 ablation_name or "custom",
             )
-            sample = _get_view_sample(dataset, sample_index, view_name, yaw)
-            generated = _generate_one(model, sample, args, sat_mode)
+            view_samples.append(_get_view_sample(dataset, sample_index, view_name, yaw))
+
+        logger.info(
+            "Generating frame=%s, %d yaw-sweep view(s) in one batch, ablation=%s",
+            f"{base_sample.frame_id:010d}",
+            len(view_samples),
+            ablation_name or "custom",
+        )
+        generated_views = _generate_batch(model, view_samples, args, sat_mode)
+
+        for (view_name, yaw), sample, generated in zip(view_specs, view_samples, generated_views):
             _save_view_outputs(
                 sample,
                 generated,
@@ -795,20 +921,23 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
     )
     drives = train_dirs if args.dataset_split == "train" else val_dirs
     frames = train_frames if args.dataset_split == "train" else val_frames
-    dataset = _build_base_dataset(drives, frames, args.seed)
+    dataset = _build_base_dataset(drives, frames, args)
     sample_indices = _filter_sample_indices(dataset, args.start_frame, args.end_frame, args.max_frames)
 
     model, checkpoint_meta = _load_model(args)
 
     output_root = Path(args.output_dir)
     ablation_runs = _resolve_ablation_runs(args)
+    fixed_view_specs: List[Tuple[str, Optional[float]]] = [("front", None)]
+    if not args.front_only:
+        fixed_view_specs.extend((_view_token("yaw", yaw), float(yaw)) for yaw in args.fixed_yaws)
     for ablation_name, sat_mode in ablation_runs:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         progress = tqdm(sample_indices, desc=f"Split fixed-view inference [{ablation_name or 'custom'}]")
         for sample_index in progress:
             base_sample = dataset.samples[sample_index]
             frame_dir = active_output_root / base_sample.drive_dir.name / f"frame_{base_sample.frame_id:010d}"
-            for view_name, yaw in FIXED_VIEW_SPECS:
+            for view_name, yaw in fixed_view_specs:
                 progress.set_postfix(
                     frame=f"{base_sample.frame_id:010d}",
                     view=view_name,
@@ -842,7 +971,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     "sat_condition_mode": sat_mode,
                     "fixed_views": [
                         {"view_name": view_name, "vehicle_yaw_deg": yaw}
-                        for view_name, yaw in FIXED_VIEW_SPECS
+                        for view_name, yaw in fixed_view_specs
                     ],
                 },
                 f,

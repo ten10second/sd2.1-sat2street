@@ -1,32 +1,38 @@
-# Stable Diffusion 推理配置
+# Stable Diffusion inference config.
+#
+# scripts/infer.py reads this file for defaults. CLI flags still override these
+# values, so experiment-specific paths can stay on the command line.
 
-# 基本配置
 seed: 42
 device: 'cuda'
-image_size: [256, 256]
+mixed_precision: 'no'
+hf_endpoint: 'https://hf-mirror.com'
+hf_home: '.hf-home'
 
-# 数据配置
 data:
-  dataset: 'kitti360'
-  data_dir: '/media/zhimiao/Lenovo/KITTI-360'
-  batch_size: 1
-  num_workers: 4
-  mode: 'front'
+  data_dir: '/media/shizhm/Lenovo/KITTI-360'
+  split_yaml: 'splits/sync03_sync04_split.yaml'
+  dataset_split: 'val'
   front_resize: [640, 256]
-  sat_size: 512
-  resolution: 0.2
+  virtual_size: [640, 256]
+  # Optional selectors:
+  # drive: null
+  # drive_dir: null
+  # frame_id: null
+  # start_frame: null
+  # end_frame: null
+  # max_frames: null
 
-# 模型配置
 model:
-  base_model: 'stabilityai/stable-diffusion-2-1'
-  checkpoint_path: './checkpoints/last.ckpt'
+  base_model: 'sd2-community/stable-diffusion-2-1-base'
+  checkpoint_path: 'output/sat2street_single_gpu/checkpoints/checkpoint_epoch_100.pt'
+  base_model_revision: null
 
-  # 卫星图编码器配置
   satellite_encoder:
     name: 'satellite_condition_encoder'
     embed_dim: 768
     patch_size: 16
-    xy_feature_source: 'resnet'  # resnet, patch
+    xy_feature_source: 'resnet'
     resnet_name: 'resnet34'
     resnet_stage: 'layer3'
     resnet_pretrained: false
@@ -34,15 +40,6 @@ model:
     num_heads: 12
     use_relative_pos: true
 
-  # 坐标位置编码配置
-  coordinate_encoder:
-    name: 'relative_coordinate_encoder'
-    encode_type: 'fourier'
-    embed_dim: 256
-    fourier_scale: 10.0
-    num_frequencies: 10
-
-  # Native attn2 conditioning tokens: global scene + view-aware satellite tokens
   reading_block:
     enable: true
     sat_in_dim: 768
@@ -66,7 +63,7 @@ model:
     ray_num_samples: 32
     ray_depth_min: 1.0
     ray_depth_max: 80.0
-    ray_offset_scale: 0.50  # meters
+    ray_offset_scale: 0.50
     ray_scene_extent_x_m: 51.2
     ray_scene_extent_y_m: 51.2
     ray_scene_z_min_m: 0.0
@@ -81,30 +78,16 @@ model:
     view_injection_sites: [down2, down3, mid, up0, up1]
     view_modulation_scale: 0.4
 
-# 推理配置
 inference:
-  # 去噪步数
-  num_inference_steps: 50
-  # 指导强度
-  guidance_scale: 7.5
-  # 采样器
-  sampler: 'euler_a'  # euler, euler_a, dpm_solver++
-  # 批处理大小
-  batch_size: 1
+  mode: 'single_yaw_sweep'
+  include_front: true
+  # Cover the trained fixed yaw anchors plus denser test angles.
+  vehicle_yaws: [-120.0, -90.0, -60.0, -40.0, 40.0, 60.0, 90.0, 120.0]
+  fixed_yaws: [-120.0, -90.0, -60.0, -40.0, 40.0, 60.0, 90.0, 120.0]
+  num_inference_steps: 30
+  guidance_scale: 3.0
+  sat_condition_mode: 'normal'
+  # ablation_modes: ['normal', 'sat_zero']
 
-# 保存配置
 output:
-  output_dir: './results'
-  save_images: true
-  save_metrics: true
-
-# 验证配置
-validation:
-  compute_metrics: true
-  metrics: ['psnr', 'ssim', 'lpips']
-
-# 可视化配置
-visualization:
-  save_comparison: true
-  comparison_layout: 'horizontal'  # horizontal, vertical
-  max_visualization_samples: 50
+  output_dir: 'output/inference_epoch100_aligned'
