@@ -295,15 +295,11 @@ def _resize_satellite_for_front(sat_image: torch.Tensor, target_h: int) -> torch
 def _materialize_lazy_modules(
     model,
     sat_images: torch.Tensor,
-    coords_map: Optional[torch.Tensor],
+    front_bev_xy: Optional[torch.Tensor],
+    front_ground_valid_mask: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
-    sat_encoded = model.encode_satellite(sat_images, coords_map)
-    if isinstance(sat_encoded, tuple):
-        sat_tokens, sat_xy = sat_encoded
-    else:
-        sat_tokens = sat_encoded
-        sat_xy = None
+    sat_state = model.encode_satellite(sat_images)
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -311,7 +307,7 @@ def _materialize_lazy_modules(
     latents = torch.randn(
         (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
         device=sat_images.device,
-        dtype=sat_tokens.dtype,
+        dtype=sat_state.tokens.dtype,
     )
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
 
@@ -319,9 +315,11 @@ def _materialize_lazy_modules(
         latents,
         timestep,
         encoder_hidden_states=None,
-        sat_tokens=sat_tokens,
-        sat_xy=sat_xy,
-        front_bev_xy=coords_map,
+        sat_tokens=sat_state.tokens,
+        sat_xy=sat_state.xy,
+        sat_bev_coords=sat_state.bev_coords,
+        front_bev_xy=front_bev_xy,
+        front_ground_valid_mask=front_ground_valid_mask,
         return_attn_map=False,
     )
 
@@ -345,6 +343,9 @@ def main() -> None:
 
     sat_image = sample_90["sat"].unsqueeze(0).to(args.device)
     target_size = tuple(int(x) for x in sample_90["image"].shape[-2:])
+    front_ground_valid_mask_90 = sample_90.get("front_ground_valid_mask")
+    if front_ground_valid_mask_90 is not None:
+        front_ground_valid_mask_90 = front_ground_valid_mask_90.unsqueeze(0).to(args.device)
 
     model_torch_dtype = None
     if args.device.startswith("cuda") and args.mixed_precision == "fp16":
@@ -356,7 +357,7 @@ def main() -> None:
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        reading_block_config={"enable": True},
+        refinement_block_config={"enable": True},
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
@@ -368,15 +369,11 @@ def main() -> None:
     model.to(args.device)
     model.eval()
 
-    coords_map_90 = sample_90["coords_map"].unsqueeze(0).to(args.device)
-    logger.info("Materializing lazy reading blocks before loading checkpoint")
-    _materialize_lazy_modules(model, sat_image, coords_map_90, target_size)
+    front_bev_xy_90 = sample_90["front_bev_xy"].unsqueeze(0).to(args.device)
+    logger.info("Materializing lazy refinement blocks before loading checkpoint")
+    _materialize_lazy_modules(model, sat_image, front_bev_xy_90, front_ground_valid_mask_90, target_size)
 
-    load_model_checkpoint(
-        model,
-        Path(args.checkpoint),
-        args.device,
-    )
+    load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()
 
     output_root = Path(args.output_dir)
@@ -395,15 +392,19 @@ def main() -> None:
         logger.info(f"Generating yaw={yaw:g}")
         sample = _get_sample_with_vehicle_yaw(dataset, sample_index, yaw)
         real_image = sample["image"]
-        coords_map = sample["coords_map"].unsqueeze(0).to(args.device)
+        front_bev_xy = sample["front_bev_xy"].unsqueeze(0).to(args.device)
+        front_ground_valid_mask = sample.get("front_ground_valid_mask")
+        if front_ground_valid_mask is not None:
+            front_ground_valid_mask = front_ground_valid_mask.unsqueeze(0).to(args.device)
         plucker_map = sample["plucker_map"].unsqueeze(0).to(args.device)
 
         generator = torch.Generator(device=generator_device)
         generator.manual_seed(args.seed)
         generated = model.generate(
             sat_image,
-            coords_map=coords_map,
+            front_bev_xy=front_bev_xy,
             plucker_map=plucker_map,
+            front_ground_valid_mask=front_ground_valid_mask,
             target_size=target_size,
             num_inference_steps=args.inference_steps,
             guidance_scale=args.guidance_scale,

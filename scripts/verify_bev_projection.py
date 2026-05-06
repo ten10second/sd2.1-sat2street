@@ -75,7 +75,10 @@ def main() -> None:
 
     bev_xy = sample["front_bev_xy"]
     image = sample["image"].permute(1, 2, 0).cpu()
-    valid_mask = ((bev_xy[0] != 0) | (bev_xy[1] != 0)).to(torch.float32)
+    valid_mask = sample.get("front_ground_valid_mask")
+    if valid_mask is None:
+        valid_mask = ((bev_xy[0] != 0) | (bev_xy[1] != 0)).to(torch.float32).unsqueeze(0)
+    valid_mask = valid_mask.squeeze(0).to(torch.float32)
 
     height, width = bev_xy.shape[1:]
     bottom_center = bev_xy[:, height - 1, width // 2]

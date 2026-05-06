@@ -22,23 +22,14 @@ import random
 import logging
 import yaml
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from models.sd_trainer import create_sd_model, load_model_checkpoint, SDTrainer
-from data.kitti360d_dataset import Kitti360dDataset
+from data import GroupedMultiViewDataset, Kitti360dDataset
 from torch.utils.data import DataLoader, default_collate
 from torch.utils.data.distributed import DistributedSampler
 
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("train.log"),
-        logging.StreamHandler(),
-    ],
-)
 logger = logging.getLogger(__name__)
 
 DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
@@ -134,11 +125,76 @@ def _safe_collate(batch):
     collated = {}
     for key in batch[0].keys():
         values = [item[key] for item in batch]
-        if key == "meta" or any(value is None for value in values):
+        if key in {"meta", "view_names"} or any(value is None for value in values):
             collated[key] = values
             continue
         collated[key] = default_collate(values)
     return collated
+
+
+def _load_runtime_config(config_path: Path) -> Dict[str, Any]:
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Config file must contain a mapping at the top level: {config_path}")
+    return config
+
+
+def _config_get(config: Dict[str, Any], path: Tuple[str, ...], default: Any = None) -> Any:
+    node: Any = config
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return default
+        node = node[key]
+    return default if node is None else node
+
+
+def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
+    if current == cli_default and config_value is not None:
+        return config_value
+    return current
+
+
+def _resolve_output_dir(
+    current: str,
+    cli_default: str,
+    config: Dict[str, Any],
+) -> str:
+    if current != cli_default:
+        return current
+
+    configured_output_dir = _config_get(config, ("output_dir",))
+    if configured_output_dir:
+        return str(configured_output_dir)
+
+    checkpoint_save_dir = _config_get(config, ("checkpoint", "save_dir"))
+    if checkpoint_save_dir:
+        checkpoint_path = Path(str(checkpoint_save_dir))
+        if checkpoint_path.name == "checkpoints":
+            parent = checkpoint_path.parent
+            return str(parent if str(parent) else Path("."))
+        return str(checkpoint_path)
+
+    return current
+
+
+def _configure_logging(log_dir: Path) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_dir / "train.log"),
+            logging.StreamHandler(),
+        ],
+        force=True,
+    )
 
 
 def main():
@@ -310,6 +366,60 @@ def main():
     )
 
     args = parser.parse_args()
+    config = _load_runtime_config(Path(args.config))
+
+    args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
+    args.device = str(_prefer_config(args.device, "cuda", _config_get(config, ("device",))))
+    args.mixed_precision = str(
+        _prefer_config(args.mixed_precision, "fp16", _config_get(config, ("mixed_precision",)))
+    )
+    args.data_dir = str(
+        _prefer_config(
+            args.data_dir,
+            "/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
+            _config_get(config, ("data", "data_dir")),
+        )
+    )
+    args.output_dir = _resolve_output_dir(args.output_dir, "./output", config)
+    args.batch_size = int(_prefer_config(args.batch_size, 2, _config_get(config, ("data", "batch_size"))))
+    args.epochs = int(_prefer_config(args.epochs, 50, _config_get(config, ("training", "epochs"))))
+    args.lr = float(_prefer_config(args.lr, 1e-4, _config_get(config, ("training", "learning_rate"))))
+    args.warmup = int(_prefer_config(args.warmup, 5, _config_get(config, ("training", "warmup_epochs"))))
+    args.resume = args.resume or _config_get(config, ("checkpoint", "resume_from"))
+    args.num_workers = int(_prefer_config(args.num_workers, 8, _config_get(config, ("data", "num_workers"))))
+    args.gradient_accumulation = int(
+        _prefer_config(
+            args.gradient_accumulation,
+            2,
+            _config_get(config, ("training", "gradient_accumulation_steps")),
+        )
+    )
+    args.max_grad_norm = float(
+        _prefer_config(args.max_grad_norm, 1.0, _config_get(config, ("training", "gradient_clip_val")))
+    )
+    args.base_model = str(
+        _prefer_config(args.base_model, DEFAULT_SD21_BASE_REPO, _config_get(config, ("model", "base_model")))
+    )
+    args.use_wandb = bool(_prefer_config(args.use_wandb, False, _config_get(config, ("logging", "use_wandb"))))
+    args.wandb_project = str(
+        _prefer_config(args.wandb_project, "kitti360_sd", _config_get(config, ("logging", "project_name")))
+    )
+    args.dataset_mode = str(_prefer_config(args.dataset_mode, "front", _config_get(config, ("data", "mode"))))
+
+    freeze_base = bool(_config_get(config, ("model", "freeze_base"), True))
+    gradient_checkpointing = bool(_config_get(config, ("gradient_checkpointing",), True))
+    weight_decay = float(_config_get(config, ("training", "weight_decay"), 1e-4))
+    lr_scheduler_type = str(_config_get(config, ("training", "scheduler"), "cosine"))
+    save_every = int(_config_get(config, ("checkpoint", "save_every"), 50))
+    log_every = int(_config_get(config, ("logging", "log_every"), 100))
+    front_resize_cfg = _config_get(config, ("data", "front_resize"), [640, 256])
+    front_resize = tuple(int(x) for x in front_resize_cfg)
+    log_dir = Path(str(_config_get(config, ("logging", "log_dir"), args.output_dir)))
+    refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
+    refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
+
+    _configure_logging(log_dir)
+
     distributed, rank, local_rank, world_size = _init_distributed(args)
     is_main_process = rank == 0
 
@@ -354,8 +464,8 @@ def main():
         mode=args.dataset_mode,
         yaw_mode=args.yaw_mode,
         view_set=args.view_set,
-        virtual_size=(640, 256),
-        front_resize=(640, 256),
+        virtual_size=front_resize,
+        front_resize=front_resize,
         front_center_crop=None,
         random_fisheye_relative_yaw=False,
         random_vehicle_relative_yaw=False,
@@ -388,6 +498,10 @@ def main():
         frames=val_frames,
         **val_dataset_kwargs,
     )
+
+    if args.view_set != "single":
+        train_dataset = GroupedMultiViewDataset(train_dataset)
+        val_dataset = GroupedMultiViewDataset(val_dataset)
 
     train_sampler = DistributedSampler(
         train_dataset,
@@ -427,8 +541,9 @@ def main():
         logger.info("Loading model...")
     model = create_sd_model(
         base_model=args.base_model,
-        freeze_base=True,
-        reading_block_config={"enable": True},
+        freeze_base=freeze_base,
+        refinement_block_config=refinement_block_config,
+        refinement_injection_sites=tuple(refinement_injection_sites) if refinement_injection_sites is not None else None,
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
@@ -438,7 +553,7 @@ def main():
             logger.info(
             "Training keeps model weights in fp32; mixed precision is applied via autocast only"
             )
-    if hasattr(model.unet, "enable_gradient_checkpointing"):
+    if gradient_checkpointing and hasattr(model.unet, "enable_gradient_checkpointing"):
         model.unet.enable_gradient_checkpointing()
         if is_main_process:
             logger.info("Enabled UNet gradient checkpointing")
@@ -459,14 +574,14 @@ def main():
         train_dataloader=train_loader,
         val_dataloader=val_loader,
         learning_rate=args.lr,
-        weight_decay=1e-4,
+        weight_decay=weight_decay,
         num_train_epochs=args.epochs,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=lr_scheduler_type,
         warmup_epochs=args.warmup,
         gradient_accumulation_steps=args.gradient_accumulation,
         output_dir=args.output_dir,
-        save_every=50,
-        log_every=100,
+        save_every=save_every,
+        log_every=log_every,
         device=args.device,
         use_wandb=args.use_wandb,
         project_name=args.wandb_project,
@@ -494,7 +609,6 @@ def main():
             trainer.unwrapped_model,
             Path(args.init_checkpoint),
             args.device,
-            allow_missing_prefixes=("unet.reading_blocks.",),
         )
 
     # Start training

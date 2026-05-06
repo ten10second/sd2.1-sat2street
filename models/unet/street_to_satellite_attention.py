@@ -1,5 +1,5 @@
 """
-Satellite reading attention with GeoRoPE and geometry bias.
+Street-to-satellite attention for bidirectional cross-view refinement.
 """
 
 from __future__ import annotations
@@ -14,12 +14,9 @@ import torch.nn as nn
 from .continuous_xy_georope import ContinuousXYGeoRoPE
 
 
-class SatelliteReadingAttention(nn.Module):
+class StreetToSatelliteAttention(nn.Module):
     """
-    Build Q/K/V, apply GeoRoPE, read satellite tokens for front queries.
-
-    Queries combine geometric position and the current U-Net front feature so the
-    reading policy can change across denoising steps and feature hierarchies.
+    Use street-view features to update the satellite memory at aligned ground locations.
     """
 
     def __init__(
@@ -35,7 +32,7 @@ class SatelliteReadingAttention(nn.Module):
         geom_hidden_dim: int = 128,
         geom_head_dim: int = 16,
         use_geom_bias: bool = True,
-        use_sat_layer_norm: bool = True,
+        use_front_layer_norm: bool = True,
         attn_dropout: float = 0.0,
     ):
         super().__init__()
@@ -46,9 +43,9 @@ class SatelliteReadingAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.model_dim = model_dim
-        self.lambda_geo = lambda_geo
+        self.lambda_geo = float(lambda_geo)
         self.lambda_geom = float(lambda_geom)
-        self.use_geom_bias = use_geom_bias
+        self.use_geom_bias = bool(use_geom_bias)
         self.geom_head_dim = int(geom_head_dim)
         self.geom_model_dim = self.num_heads * self.geom_head_dim
         if geom_hidden_dim <= 0:
@@ -56,7 +53,11 @@ class SatelliteReadingAttention(nn.Module):
         if self.geom_head_dim <= 0:
             raise ValueError(f"geom_head_dim must be positive, got {self.geom_head_dim}")
 
-        self.position_mlp = nn.Sequential(
+        self.sat_adapter = nn.Sequential(
+            nn.Linear(sat_in_dim, model_dim),
+            nn.LayerNorm(model_dim),
+        )
+        self.front_position_mlp = nn.Sequential(
             nn.Linear(2, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
@@ -65,22 +66,25 @@ class SatelliteReadingAttention(nn.Module):
             nn.Linear(front_in_dim, model_dim),
             nn.LayerNorm(model_dim),
         )
-        self.query_norm = nn.LayerNorm(model_dim)
-
-        adapter = [nn.Linear(sat_in_dim, model_dim)]
-        if use_sat_layer_norm:
-            adapter.append(nn.LayerNorm(model_dim))
-        self.sat_adapter = nn.Sequential(*adapter)
+        self.front_norm = nn.LayerNorm(model_dim)
 
         self.q_proj = nn.Linear(model_dim, model_dim)
         self.k_proj = nn.Linear(model_dim, model_dim)
         self.v_proj = nn.Linear(model_dim, model_dim)
-        self.plk_encoder = nn.Sequential(
+        self.out_proj = nn.Linear(model_dim, sat_in_dim)
+        self.out_norm = nn.LayerNorm(sat_in_dim)
+
+        self.sat_xy_encoder = nn.Sequential(
+            nn.Linear(2, geom_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(geom_hidden_dim, geom_hidden_dim),
+        )
+        self.front_plucker_encoder = nn.Sequential(
             nn.Linear(6, geom_hidden_dim),
             nn.SiLU(),
             nn.Linear(geom_hidden_dim, geom_hidden_dim),
         )
-        self.sat_xy_encoder = nn.Sequential(
+        self.front_xy_encoder = nn.Sequential(
             nn.Linear(2, geom_hidden_dim),
             nn.SiLU(),
             nn.Linear(geom_hidden_dim, geom_hidden_dim),
@@ -97,6 +101,11 @@ class SatelliteReadingAttention(nn.Module):
         )
         self.attn_dropout = nn.Dropout(attn_dropout)
 
+        if use_front_layer_norm:
+            self.front_token_norm = nn.LayerNorm(model_dim)
+        else:
+            self.front_token_norm = nn.Identity()
+
     def _reshape_heads(self, tensor: torch.Tensor, head_dim: Optional[int] = None) -> torch.Tensor:
         head_dim = self.head_dim if head_dim is None else int(head_dim)
         batch_size, token_count, _ = tensor.shape
@@ -108,9 +117,23 @@ class SatelliteReadingAttention(nn.Module):
             )
         return tensor.reshape(batch_size, token_count, self.num_heads, head_dim).transpose(1, 2)
 
-    def _geometry_bias(self, q_xy: torch.Tensor, k_xy: torch.Tensor) -> torch.Tensor:
-        dist2 = (q_xy.unsqueeze(2) - k_xy.unsqueeze(1)).pow(2).sum(dim=-1)
+    def _geometry_bias(self, sat_xy: torch.Tensor, front_xy: torch.Tensor) -> torch.Tensor:
+        dist2 = (sat_xy.unsqueeze(2) - front_xy.unsqueeze(1)).pow(2).sum(dim=-1)
         return -self.lambda_geo * dist2
+
+    @staticmethod
+    def _apply_key_mask(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if mask.ndim != 2:
+            raise ValueError(f"Expected key mask [B,N], got {list(mask.shape)}")
+        return logits.masked_fill(~mask[:, None, None, :], -1e4)
+
+    @staticmethod
+    def _normalize_masked_attention(attn_map: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return attn_map
+        masked = attn_map * mask[:, None, None, :].to(dtype=attn_map.dtype)
+        denom = masked.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        return masked / denom
 
     def forward(
         self,
@@ -128,11 +151,7 @@ class SatelliteReadingAttention(nn.Module):
             raise ValueError("front_bev_xy, sat_tokens, sat_xy must all be rank-3 tensors")
         if front_bev_xy.shape[-1] != 2 or sat_xy.shape[-1] != 2:
             raise ValueError("front_bev_xy/sat_xy last dim must be 2")
-        if (
-            front_feat.shape[0] != front_bev_xy.shape[0] or
-            sat_tokens.shape[0] != front_bev_xy.shape[0] or
-            sat_xy.shape[0] != front_bev_xy.shape[0]
-        ):
+        if sat_tokens.shape[0] != front_bev_xy.shape[0] or sat_xy.shape[0] != sat_tokens.shape[0]:
             raise ValueError("Batch size mismatch among front_bev_xy/sat_tokens/sat_xy")
         if sat_tokens.shape[1] != sat_xy.shape[1]:
             raise ValueError("sat_tokens and sat_xy token count mismatch")
@@ -144,19 +163,7 @@ class SatelliteReadingAttention(nn.Module):
             raise ValueError(
                 f"front_bev_xy token count mismatch: expected {expected_nf}, got {front_bev_xy.shape[1]}"
             )
-        if front_feat_flat.shape[:2] != front_bev_xy.shape[:2]:
-            raise ValueError(
-                f"front_feat token count mismatch: expected {list(front_bev_xy.shape[:2])}, "
-                f"got {list(front_feat_flat.shape[:2])}"
-            )
-        if front_plucker is not None:
-            if front_plucker.ndim != 3 or front_plucker.shape[-1] != 6:
-                raise ValueError("front_plucker must be [B,Nf,6]")
-            if front_plucker.shape[:2] != front_bev_xy.shape[:2]:
-                raise ValueError(
-                    f"front_plucker token count mismatch: expected {list(front_bev_xy.shape[:2])}, "
-                    f"got {list(front_plucker.shape[:2])}"
-                )
+
         if front_ground_valid_mask is not None:
             if front_ground_valid_mask.ndim == 3 and front_ground_valid_mask.shape[-1] == 1:
                 front_ground_valid_mask = front_ground_valid_mask.squeeze(-1)
@@ -167,51 +174,61 @@ class SatelliteReadingAttention(nn.Module):
                 )
             front_ground_valid_mask = front_ground_valid_mask.to(device=front_feat.device, dtype=torch.bool)
 
-        pos_embed = self.position_mlp(front_bev_xy)
-        feat_embed = self.front_adapter(front_feat_flat)
-        q_embed = self.query_norm(pos_embed + feat_embed)
-        sat_feat = self.sat_adapter(sat_tokens)
+        front_pos_embed = self.front_position_mlp(front_bev_xy)
+        front_feat_embed = self.front_adapter(front_feat_flat)
+        front_tokens = self.front_token_norm(front_pos_embed + front_feat_embed)
+        sat_queries = self.sat_adapter(sat_tokens)
 
-        q = self._reshape_heads(self.q_proj(q_embed), self.head_dim)
-        k = self._reshape_heads(self.k_proj(sat_feat), self.head_dim)
-        v = self._reshape_heads(self.v_proj(sat_feat))
+        q = self._reshape_heads(self.q_proj(sat_queries))
+        k = self._reshape_heads(self.k_proj(front_tokens))
+        v = self._reshape_heads(self.v_proj(front_tokens))
 
-        q_tilde, k_tilde = self.rope(q, k, front_bev_xy, sat_xy)
+        q_tilde, k_tilde = self.rope(q, k, sat_xy, front_bev_xy)
 
         logits_sem = torch.matmul(q_tilde, k_tilde.transpose(-2, -1)) / math.sqrt(self.head_dim)
         logits = logits_sem
         if front_plucker is not None:
-            plk_feat = self.geom_q_norm(self.plk_encoder(front_plucker))
-            sat_geom_feat = self.geom_k_norm(self.sat_xy_encoder(sat_xy))
-            q_geom = self._reshape_heads(self.q_geom_proj(plk_feat), self.geom_head_dim)
-            k_geom = self._reshape_heads(self.k_geom_proj(sat_geom_feat), self.geom_head_dim)
+            if front_plucker.ndim != 3 or front_plucker.shape[-1] != 6:
+                raise ValueError("front_plucker must be [B,Nf,6]")
+            if front_plucker.shape[:2] != front_bev_xy.shape[:2]:
+                raise ValueError(
+                    f"front_plucker token count mismatch: expected {list(front_bev_xy.shape[:2])}, "
+                    f"got {list(front_plucker.shape[:2])}"
+                )
+            sat_geom_feat = self.geom_q_norm(self.sat_xy_encoder(sat_xy))
+            front_geom_source = self.front_plucker_encoder(front_plucker)
+            q_geom = self._reshape_heads(self.q_geom_proj(sat_geom_feat), self.geom_head_dim)
+            k_geom = self._reshape_heads(self.k_geom_proj(self.geom_k_norm(front_geom_source)), self.geom_head_dim)
             logits_geom = torch.matmul(q_geom, k_geom.transpose(-2, -1)) / math.sqrt(self.geom_head_dim)
             logits = logits + self.lambda_geom * logits_geom
         else:
-            logits_geom = None
-        if self.use_geom_bias:
-            logits = logits + self._geometry_bias(front_bev_xy, sat_xy).unsqueeze(1)
+            front_geom_source = self.front_xy_encoder(front_bev_xy)
+            q_geom = self._reshape_heads(self.q_geom_proj(self.geom_q_norm(self.sat_xy_encoder(sat_xy))), self.geom_head_dim)
+            k_geom = self._reshape_heads(self.k_geom_proj(self.geom_k_norm(front_geom_source)), self.geom_head_dim)
+            logits_geom = torch.matmul(q_geom, k_geom.transpose(-2, -1)) / math.sqrt(self.geom_head_dim)
+            logits = logits + self.lambda_geom * logits_geom
 
+        if self.use_geom_bias:
+            logits = logits + self._geometry_bias(sat_xy, front_bev_xy).unsqueeze(1)
         if front_ground_valid_mask is not None:
-            logits = logits.masked_fill(~front_ground_valid_mask[:, None, :, None], -1e4)
+            logits = self._apply_key_mask(logits, front_ground_valid_mask)
+
         attn_map = torch.softmax(logits, dim=-1)
         attn_map = self.attn_dropout(attn_map)
-        if front_ground_valid_mask is not None:
-            query_mask = front_ground_valid_mask[:, None, :, None].to(dtype=attn_map.dtype)
-            attn_map = attn_map * query_mask
+        attn_map = self._normalize_masked_attention(attn_map, front_ground_valid_mask)
 
-        read_tokens = torch.matmul(attn_map, v)
-        read_tokens = read_tokens.transpose(1, 2).reshape(batch_size, front_bev_xy.shape[1], self.model_dim)
+        sat_update = torch.matmul(attn_map, v)
+        sat_update = sat_update.transpose(1, 2).reshape(batch_size, sat_xy.shape[1], self.model_dim)
+        sat_tokens_out = self.out_norm(sat_tokens + self.out_proj(sat_update))
 
         logits_sem_std = logits_sem.float().std(unbiased=False)
-        if logits_geom is None:
-            logits_geom_std = logits_sem_std.new_zeros(())
-        else:
-            logits_geom_std = (self.lambda_geom * logits_geom).float().std(unbiased=False)
+        logits_geom_std = (self.lambda_geom * logits_geom).float().std(unbiased=False)
+        update_norm = (sat_tokens_out - sat_tokens).float().norm(dim=-1).mean()
         stats = {
             "logits_sem_std": logits_sem_std.detach(),
             "logits_geom_std": logits_geom_std.detach(),
             "logits_geom_to_sem_ratio": (logits_geom_std / logits_sem_std.clamp_min(1e-8)).detach(),
+            "sat_update_norm": update_norm.detach(),
         }
 
-        return read_tokens, (attn_map if return_attn_map else None), stats
+        return sat_tokens_out, (attn_map if return_attn_map else None), stats

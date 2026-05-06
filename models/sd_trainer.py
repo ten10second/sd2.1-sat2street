@@ -27,6 +27,7 @@ from typing import Optional, Dict, Any, Sequence, Tuple
 import logging
 from PIL import Image
 
+from models.conditioning import SatelliteMemoryState
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import SatelliteConditionedUNet
 
@@ -34,17 +35,17 @@ from models.sd_model import SatelliteConditionedUNet
 logger = logging.getLogger(__name__)
 
 
-def _aggregate_reading_stats(
-    reading_stats: Optional[Dict[str, Dict[str, torch.Tensor]]],
+def _aggregate_refinement_stats(
+    refinement_stats: Optional[Dict[str, Dict[str, torch.Tensor]]],
 ) -> Dict[str, torch.Tensor]:
-    if not reading_stats:
+    if not refinement_stats:
         return {}
 
     aggregated: Dict[str, torch.Tensor] = {}
     sem_values = []
     geom_values = []
     ratio_values = []
-    for site, site_stats in reading_stats.items():
+    for site, site_stats in refinement_stats.items():
         sem = site_stats.get("logits_sem_std")
         geom = site_stats.get("logits_geom_std")
         ratio = site_stats.get("logits_geom_to_sem_ratio")
@@ -58,38 +59,23 @@ def _aggregate_reading_stats(
             aggregated[f"{site}_logits_geom_to_sem_ratio"] = ratio
             ratio_values.append(ratio)
     if sem_values:
-        aggregated["reading_logits_sem_std_mean"] = torch.stack(sem_values).mean()
+        aggregated["refinement_logits_sem_std_mean"] = torch.stack(sem_values).mean()
     if geom_values:
-        aggregated["reading_logits_geom_std_mean"] = torch.stack(geom_values).mean()
+        aggregated["refinement_logits_geom_std_mean"] = torch.stack(geom_values).mean()
     if ratio_values:
-        aggregated["reading_logits_geom_to_sem_ratio_mean"] = torch.stack(ratio_values).mean()
+        aggregated["refinement_logits_geom_to_sem_ratio_mean"] = torch.stack(ratio_values).mean()
     return aggregated
-
-
-def _filter_compatible_keys(keys: Sequence[str], allowed_prefixes: Sequence[str]) -> Sequence[str]:
-    if not allowed_prefixes:
-        return list(keys)
-    return [
-        key
-        for key in keys
-        if not any(key.startswith(prefix) for prefix in allowed_prefixes)
-    ]
 
 
 def load_model_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
-    *,
-    allow_missing_prefixes: Sequence[str] = (),
-    allow_unexpected_prefixes: Sequence[str] = (),
 ) -> Tuple[Sequence[str], Sequence[str]]:
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    filtered_missing = _filter_compatible_keys(missing_keys, allow_missing_prefixes)
-    filtered_unexpected = _filter_compatible_keys(unexpected_keys, allow_unexpected_prefixes)
-    if filtered_missing:
-        raise RuntimeError(f"Missing keys when loading checkpoint: {filtered_missing}")
-    if filtered_unexpected:
-        raise RuntimeError(f"Unexpected keys when loading checkpoint: {filtered_unexpected}")
+    if missing_keys:
+        raise RuntimeError(f"Missing keys when loading checkpoint: {missing_keys}")
+    if unexpected_keys:
+        raise RuntimeError(f"Unexpected keys when loading checkpoint: {unexpected_keys}")
     return missing_keys, unexpected_keys
 
 
@@ -97,18 +83,10 @@ def load_model_checkpoint(
     model: nn.Module,
     checkpoint_path: Path,
     device: str,
-    *,
-    allow_missing_prefixes: Sequence[str] = (),
-    allow_unexpected_prefixes: Sequence[str] = (),
 ) -> Dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-    load_model_state_dict(
-        model,
-        state_dict,
-        allow_missing_prefixes=allow_missing_prefixes,
-        allow_unexpected_prefixes=allow_unexpected_prefixes,
-    )
+    load_model_state_dict(model, state_dict)
     return checkpoint if isinstance(checkpoint, dict) else {}
 
 
@@ -151,15 +129,11 @@ def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> 
 def _materialize_lazy_modules(
     model: "SatelliteConditionedSDModel",
     sat_images: torch.Tensor,
-    coords_map: Optional[torch.Tensor],
+    front_bev_xy: Optional[torch.Tensor],
+    front_ground_valid_mask: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
-    sat_encoded = model.encode_satellite(sat_images, coords_map)
-    if isinstance(sat_encoded, tuple):
-        sat_tokens, sat_xy = sat_encoded
-    else:
-        sat_tokens = sat_encoded
-        sat_xy = None
+    sat_state = model.encode_satellite(sat_images)
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -167,7 +141,7 @@ def _materialize_lazy_modules(
     latents = torch.randn(
         (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
         device=sat_images.device,
-        dtype=sat_tokens.dtype,
+        dtype=sat_state.tokens.dtype,
     )
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
 
@@ -175,9 +149,11 @@ def _materialize_lazy_modules(
         latents,
         timestep,
         encoder_hidden_states=None,
-        sat_tokens=sat_tokens,
-        sat_xy=sat_xy,
-        front_bev_xy=coords_map,
+        sat_tokens=sat_state.tokens,
+        sat_xy=sat_state.xy,
+        sat_bev_coords=sat_state.bev_coords,
+        front_bev_xy=front_bev_xy,
+        front_ground_valid_mask=front_ground_valid_mask,
         return_attn_map=False,
     )
 
@@ -260,9 +236,9 @@ class SatelliteConditionedSDModel(nn.Module):
         logger.info("  Main attn2 route: satellite tokens")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
-    def encode_satellite(self, sat_images: torch.Tensor, coords_map: torch.Tensor = None) -> torch.Tensor:
-        """Encode satellite images to embeddings."""
-        return self.satellite_encoder(sat_images, coords_map, return_sat_xy=True)
+    def encode_satellite(self, sat_images: torch.Tensor) -> SatelliteMemoryState:
+        """Encode satellite images into a structured satellite memory state."""
+        return self.satellite_encoder(sat_images)
 
     @staticmethod
     def _normalize_images_for_vae(images: torch.Tensor) -> torch.Tensor:
@@ -279,99 +255,126 @@ class SatelliteConditionedSDModel(nn.Module):
     def _build_unet_kwargs(
         self,
         encoder_hidden_states: Optional[torch.Tensor],
-        sat_tokens: torch.Tensor,
-        sat_xy: Optional[torch.Tensor],
-        coords_map: Optional[torch.Tensor],
+        sat_state: SatelliteMemoryState,
+        front_bev_xy: Optional[torch.Tensor],
         plucker_map: Optional[torch.Tensor],
+        front_ground_valid_mask: Optional[torch.Tensor],
         condition_mask: Optional[torch.Tensor],
     ) -> Dict[str, Any]:
         unet_kwargs: Dict[str, Any] = {}
         if encoder_hidden_states is not None:
             unet_kwargs['encoder_hidden_states'] = encoder_hidden_states
-        if getattr(self.unet, 'supports_satellite_reading', False):
+        if getattr(self.unet, 'supports_cross_view_refinement', False):
             unet_kwargs.update({
-                'sat_tokens': sat_tokens,
-                'sat_xy': sat_xy,
-                'front_bev_xy': coords_map,
+                'sat_tokens': sat_state.tokens,
+                'sat_xy': sat_state.xy,
+                'sat_bev_coords': sat_state.bev_coords,
+                'front_bev_xy': front_bev_xy,
                 'front_plucker': plucker_map,
+                'front_ground_valid_mask': front_ground_valid_mask,
                 'condition_mask': condition_mask,
                 'return_attn_map': False,
             })
         return unet_kwargs
 
-    def forward(
+    def _sample_condition_mask(
         self,
-        sat_images: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        condition_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+        if self.training and self.cond_drop_prob > 0.0:
+            condition_mask = torch.rand(batch_size, device=device) >= self.cond_drop_prob
+            if not bool(condition_mask.any().item()):
+                keep_index = torch.randint(0, batch_size, (1,), device=device)
+                condition_mask[keep_index] = True
+        return condition_mask
+
+    def _apply_condition_dropout(
+        self,
+        sat_state: SatelliteMemoryState,
+        condition_mask: torch.Tensor,
+    ) -> SatelliteMemoryState:
+        return sat_state.replace(
+            tokens=sat_state.tokens * self._expand_condition_mask(condition_mask, sat_state.tokens),
+            xy=sat_state.xy * self._expand_condition_mask(condition_mask, sat_state.xy),
+            bev_coords=(
+                sat_state.bev_coords * self._expand_condition_mask(condition_mask, sat_state.bev_coords)
+                if sat_state.bev_coords is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _merge_satellite_states(
+        base_state: SatelliteMemoryState,
+        updated_state: SatelliteMemoryState,
+        condition_mask: torch.Tensor,
+    ) -> SatelliteMemoryState:
+        keep_mask = condition_mask.to(device=base_state.tokens.device, dtype=base_state.tokens.dtype).view(-1, 1, 1)
+        merged_tokens = keep_mask * updated_state.tokens + (1.0 - keep_mask) * base_state.tokens
+        merged_xy = keep_mask * updated_state.xy + (1.0 - keep_mask) * base_state.xy
+
+        base_bev = base_state.bev_coords
+        updated_bev = updated_state.bev_coords
+        if base_bev is None or updated_bev is None:
+            merged_bev = updated_bev if base_bev is None else base_bev
+        else:
+            merged_bev = keep_mask * updated_bev + (1.0 - keep_mask) * base_bev
+
+        return SatelliteMemoryState(tokens=merged_tokens, xy=merged_xy, bev_coords=merged_bev)
+
+    def forward_view_with_satellite_state(
+        self,
+        sat_state: SatelliteMemoryState,
         target_images: torch.Tensor,
-        coords_map: torch.Tensor = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
         plucker_map: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
+        condition_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for training.
+        Run one street-view update/read step against a provided satellite memory.
 
-        Args:
-            sat_images: (B, 3, H_sat, W_sat) - Satellite images
-            target_images: (B, 3, H, W) - Target frontview images
-            coords_map: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
-            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
-
-        Returns:
-            dict with 'loss' and other info
+        Returns the per-view diffusion loss together with the updated satellite state.
         """
-        B = sat_images.shape[0]
-        device = sat_images.device
+        batch_size = target_images.shape[0]
+        device = target_images.device
 
-        # Encode satellite images
-        sat_encoded = self.encode_satellite(sat_images, coords_map)
-        if isinstance(sat_encoded, tuple):
-            sat_tokens, sat_xy = sat_encoded
-        else:
-            sat_tokens = sat_encoded
-            sat_xy = None
-        condition_mask = torch.ones(B, device=device, dtype=torch.bool)
-        if self.training and self.cond_drop_prob > 0.0:
-            condition_mask = torch.rand(B, device=device) >= self.cond_drop_prob
-            if not bool(condition_mask.any().item()):
-                keep_index = torch.randint(0, B, (1,), device=device)
-                condition_mask[keep_index] = True
-            sat_tokens = sat_tokens * self._expand_condition_mask(condition_mask, sat_tokens)
-            if sat_xy is not None:
-                sat_xy = sat_xy * self._expand_condition_mask(condition_mask, sat_xy)
+        if condition_mask is None:
+            condition_mask = self._sample_condition_mask(batch_size=batch_size, device=device)
+        conditioned_sat_state = self._apply_condition_dropout(sat_state, condition_mask)
         encoder_hidden_states = None
 
-        # Encode target images to latents
         with torch.no_grad():
             target_images_vae = self._normalize_images_for_vae(target_images)
             latents = self.vae.encode(target_images_vae).latent_dist.sample()
             latents = latents * self.vae.config.scaling_factor
 
-        # Sample noise
         noise = torch.randn_like(latents)
         timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps, (B,),
-            device=device, dtype=torch.long
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (batch_size,),
+            device=device,
+            dtype=torch.long,
         )
-
-        # Add noise to latents
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Predict noise
         unet_kwargs = self._build_unet_kwargs(
             encoder_hidden_states=encoder_hidden_states,
-            sat_tokens=sat_tokens,
-            sat_xy=sat_xy,
-            coords_map=coords_map,
+            sat_state=conditioned_sat_state,
+            front_bev_xy=front_bev_xy,
             plucker_map=plucker_map,
+            front_ground_valid_mask=front_ground_valid_mask,
             condition_mask=condition_mask,
         )
-
         model_pred = self.unet(
             noisy_latents,
             timesteps,
             **unet_kwargs,
         ).sample
 
-        # Compute loss
         if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
         elif self.noise_scheduler.config.prediction_type == "v_prediction":
@@ -380,17 +383,125 @@ class SatelliteConditionedSDModel(nn.Module):
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
         loss = F.mse_loss(model_pred, target, reduction="mean")
-        reading_stats_by_site = getattr(self.unet, "last_reading_stats", {})
-        reading_stats = _aggregate_reading_stats(reading_stats_by_site)
+        updated_sat_state = getattr(self.unet, "last_satellite_state", None)
+        if updated_sat_state is None:
+            updated_sat_state = conditioned_sat_state
+        updated_sat_state = self._merge_satellite_states(
+            base_state=sat_state,
+            updated_state=updated_sat_state,
+            condition_mask=condition_mask,
+        )
+
+        refinement_stats_by_site = getattr(self.unet, "last_refinement_stats", {})
+        refinement_stats = _aggregate_refinement_stats(refinement_stats_by_site)
 
         return {
-            'loss': loss,
-            'model_pred': model_pred,
-            'target': target,
-            'reading_stats': reading_stats,
-            'reading_stats_by_site': reading_stats_by_site,
-            **reading_stats,
+            "loss": loss,
+            "model_pred": model_pred,
+            "target": target,
+            "sat_state": updated_sat_state,
+            "condition_mask": condition_mask,
+            "refinement_stats": refinement_stats,
+            "refinement_stats_by_site": refinement_stats_by_site,
+            **refinement_stats,
         }
+
+    def forward_grouped_views(
+        self,
+        sat_images: torch.Tensor,
+        target_images: torch.Tensor,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        plucker_map: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Train on grouped multi-view batches with shared per-site satellite memory.
+
+        Args:
+            sat_images: [B, 3, Hs, Ws]
+            target_images: [B, V, 3, H, W]
+            front_bev_xy: [B, V, 2, H, W] or None
+            plucker_map: [B, V, 6, H, W] or None
+            front_ground_valid_mask: [B, V, 1, H, W] or None
+        """
+        if target_images.ndim != 5:
+            raise ValueError(f"grouped target_images must be [B, V, C, H, W], got {list(target_images.shape)}")
+
+        sat_state = self.encode_satellite(sat_images)
+        num_views = int(target_images.shape[1])
+        condition_mask = self._sample_condition_mask(batch_size=sat_images.shape[0], device=sat_images.device)
+        per_view_outputs = []
+
+        for view_index in range(num_views):
+            view_outputs = self.forward_view_with_satellite_state(
+                sat_state=sat_state,
+                target_images=target_images[:, view_index],
+                front_bev_xy=front_bev_xy[:, view_index] if front_bev_xy is not None else None,
+                plucker_map=plucker_map[:, view_index] if plucker_map is not None else None,
+                front_ground_valid_mask=(
+                    front_ground_valid_mask[:, view_index]
+                    if front_ground_valid_mask is not None
+                    else None
+                ),
+                condition_mask=condition_mask,
+            )
+            sat_state = view_outputs["sat_state"]
+            per_view_outputs.append(view_outputs)
+
+        losses = torch.stack([view_output["loss"] for view_output in per_view_outputs], dim=0)
+        loss = losses.mean()
+        final_outputs = per_view_outputs[-1]
+        refinement_stats_by_site = final_outputs.get("refinement_stats_by_site", {})
+        refinement_stats = final_outputs.get("refinement_stats", {})
+
+        output: Dict[str, Any] = {
+            "loss": loss,
+            "per_view_loss": losses.detach(),
+            "sat_state": sat_state,
+            "num_views": torch.tensor(num_views, device=loss.device),
+            "refinement_stats": refinement_stats,
+            "refinement_stats_by_site": refinement_stats_by_site,
+            **refinement_stats,
+        }
+        return output
+
+    def forward(
+        self,
+        sat_images: torch.Tensor,
+        target_images: torch.Tensor,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        plucker_map: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for training.
+
+        Args:
+            sat_images: (B, 3, H_sat, W_sat) - Satellite images
+            target_images: (B, 3, H, W) - Target frontview images
+            front_bev_xy: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
+            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
+
+        Returns:
+            dict with 'loss' and other info
+        """
+        if target_images.ndim == 5:
+            return self.forward_grouped_views(
+                sat_images=sat_images,
+                target_images=target_images,
+                front_bev_xy=front_bev_xy,
+                plucker_map=plucker_map,
+                front_ground_valid_mask=front_ground_valid_mask,
+            )
+
+        sat_state = self.encode_satellite(sat_images)
+        return self.forward_view_with_satellite_state(
+            sat_state=sat_state,
+            target_images=target_images,
+            front_bev_xy=front_bev_xy,
+            plucker_map=plucker_map,
+            front_ground_valid_mask=front_ground_valid_mask,
+        )
 
     @torch.no_grad()
     def _get_vae_scale_factor(self) -> int:
@@ -400,30 +511,30 @@ class SatelliteConditionedSDModel(nn.Module):
         return max(1, 2 ** (len(block_out_channels) - 1))
 
     @staticmethod
-    def _infer_image_size_from_coords_map(coords_map: Optional[torch.Tensor]) -> Optional[Tuple[int, int]]:
-        if coords_map is None or not torch.is_tensor(coords_map):
+    def _infer_image_size_from_front_bev_xy(front_bev_xy: Optional[torch.Tensor]) -> Optional[Tuple[int, int]]:
+        if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
             return None
 
-        if coords_map.ndim == 4 and coords_map.shape[1] == 2:
-            return int(coords_map.shape[2]), int(coords_map.shape[3])
-        if coords_map.ndim == 4 and coords_map.shape[-1] == 2:
-            return int(coords_map.shape[1]), int(coords_map.shape[2])
-        if coords_map.ndim == 3 and coords_map.shape[0] == 2:
-            return int(coords_map.shape[1]), int(coords_map.shape[2])
-        if coords_map.ndim == 3 and coords_map.shape[-1] == 2:
-            return int(coords_map.shape[0]), int(coords_map.shape[1])
+        if front_bev_xy.ndim == 4 and front_bev_xy.shape[1] == 2:
+            return int(front_bev_xy.shape[2]), int(front_bev_xy.shape[3])
+        if front_bev_xy.ndim == 4 and front_bev_xy.shape[-1] == 2:
+            return int(front_bev_xy.shape[1]), int(front_bev_xy.shape[2])
+        if front_bev_xy.ndim == 3 and front_bev_xy.shape[0] == 2:
+            return int(front_bev_xy.shape[1]), int(front_bev_xy.shape[2])
+        if front_bev_xy.ndim == 3 and front_bev_xy.shape[-1] == 2:
+            return int(front_bev_xy.shape[0]), int(front_bev_xy.shape[1])
 
         return None
 
     def _infer_generation_size(
         self,
-        coords_map: Optional[torch.Tensor] = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
     ) -> Tuple[int, int]:
         if target_size is not None:
             return int(target_size[0]), int(target_size[1])
 
-        coords_size = self._infer_image_size_from_coords_map(coords_map)
+        coords_size = self._infer_image_size_from_front_bev_xy(front_bev_xy)
         if coords_size is not None:
             return coords_size
 
@@ -436,8 +547,9 @@ class SatelliteConditionedSDModel(nn.Module):
     def generate(
         self,
         sat_images: torch.Tensor,
-        coords_map: torch.Tensor = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
         plucker_map: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
@@ -449,7 +561,7 @@ class SatelliteConditionedSDModel(nn.Module):
 
         Args:
             sat_images: (B, 3, H_sat, W_sat) - Satellite images
-            coords_map: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
+            front_bev_xy: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
             plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
             target_size: Optional target image size as (H, W)
             num_inference_steps: Number of denoising steps
@@ -464,25 +576,23 @@ class SatelliteConditionedSDModel(nn.Module):
         device = sat_images.device
 
         # Encode satellite images
-        sat_encoded = self.encode_satellite(sat_images, coords_map)
-        if isinstance(sat_encoded, tuple):
-            sat_tokens, sat_xy = sat_encoded
-        else:
-            sat_tokens = sat_encoded
-            sat_xy = None
+        sat_state = self.encode_satellite(sat_images)
 
         if sat_condition_mode == "normal":
             condition_mask = torch.ones(B, device=device, dtype=torch.bool)
         elif sat_condition_mode == "zero":
-            sat_tokens = torch.zeros_like(sat_tokens)
-            sat_xy = torch.zeros_like(sat_xy) if sat_xy is not None else None
+            sat_state = sat_state.replace(
+                tokens=torch.zeros_like(sat_state.tokens),
+                xy=torch.zeros_like(sat_state.xy),
+                bev_coords=(torch.zeros_like(sat_state.bev_coords) if sat_state.bev_coords is not None else None),
+            )
             condition_mask = torch.zeros(B, device=device, dtype=torch.bool)
         else:
             raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
 
         encoder_hidden_states = None
 
-        image_h, image_w = self._infer_generation_size(coords_map=coords_map, target_size=target_size)
+        image_h, image_w = self._infer_generation_size(front_bev_xy=front_bev_xy, target_size=target_size)
         vae_scale_factor = self._get_vae_scale_factor()
         latent_h = max(1, (image_h + vae_scale_factor - 1) // vae_scale_factor)
         latent_w = max(1, (image_w + vae_scale_factor - 1) // vae_scale_factor)
@@ -491,20 +601,35 @@ class SatelliteConditionedSDModel(nn.Module):
         latents = torch.randn(
             (B, self.unet.config.in_channels, latent_h, latent_w),
             device=device,
-            dtype=sat_tokens.dtype,
+            dtype=sat_state.tokens.dtype,
             generator=generator,
         )
 
         # Prepare CFG branches once and reuse them for every timestep.
         use_cfg = guidance_scale > 1.0
         if use_cfg:
-            uncond_tokens = torch.zeros_like(sat_tokens)
-            uncond_sat_xy = torch.zeros_like(sat_xy) if sat_xy is not None else None
+            uncond_state = sat_state.replace(
+                tokens=torch.zeros_like(sat_state.tokens),
+                xy=torch.zeros_like(sat_state.xy),
+                bev_coords=(torch.zeros_like(sat_state.bev_coords) if sat_state.bev_coords is not None else None),
+            )
             encoder_hidden_states_double = None
-            sat_tokens_double = torch.cat([sat_tokens, uncond_tokens], dim=0)
-            sat_xy_double = torch.cat([sat_xy, uncond_sat_xy], dim=0) if sat_xy is not None else None
-            coords_map_double = torch.cat([coords_map, coords_map], dim=0) if coords_map is not None else None
+            sat_state_double = sat_state.replace(
+                tokens=torch.cat([sat_state.tokens, uncond_state.tokens], dim=0),
+                xy=torch.cat([sat_state.xy, uncond_state.xy], dim=0),
+                bev_coords=(
+                    torch.cat([sat_state.bev_coords, uncond_state.bev_coords], dim=0)
+                    if sat_state.bev_coords is not None and uncond_state.bev_coords is not None
+                    else None
+                ),
+            )
+            front_bev_xy_double = torch.cat([front_bev_xy, front_bev_xy], dim=0) if front_bev_xy is not None else None
             plucker_map_double = torch.cat([plucker_map, plucker_map], dim=0) if plucker_map is not None else None
+            front_ground_valid_mask_double = (
+                torch.cat([front_ground_valid_mask, front_ground_valid_mask], dim=0)
+                if front_ground_valid_mask is not None
+                else None
+            )
             condition_mask_double = torch.cat([
                 condition_mask,
                 torch.zeros_like(condition_mask),
@@ -519,10 +644,10 @@ class SatelliteConditionedSDModel(nn.Module):
                 latent_model_input = torch.cat([latents, latents], dim=0)
                 unet_kwargs = self._build_unet_kwargs(
                     encoder_hidden_states=encoder_hidden_states_double,
-                    sat_tokens=sat_tokens_double,
-                    sat_xy=sat_xy_double,
-                    coords_map=coords_map_double,
+                    sat_state=sat_state_double,
+                    front_bev_xy=front_bev_xy_double,
                     plucker_map=plucker_map_double,
+                    front_ground_valid_mask=front_ground_valid_mask_double,
                     condition_mask=condition_mask_double,
                 )
                 noise_pred_both = self.unet(
@@ -537,10 +662,10 @@ class SatelliteConditionedSDModel(nn.Module):
             else:
                 unet_kwargs = self._build_unet_kwargs(
                     encoder_hidden_states=encoder_hidden_states,
-                    sat_tokens=sat_tokens,
-                    sat_xy=sat_xy,
-                    coords_map=coords_map,
+                    sat_state=sat_state,
+                    front_bev_xy=front_bev_xy,
                     plucker_map=plucker_map,
+                    front_ground_valid_mask=front_ground_valid_mask,
                     condition_mask=condition_mask,
                 )
                 noise_pred = self.unet(
@@ -587,8 +712,8 @@ class SatelliteConditionedSDModel(nn.Module):
 def create_sd_model(
     base_model: str = 'stabilityai/stable-diffusion-2-1-base',
     freeze_base: bool = True,
-    reading_block_config: Optional[Dict] = None,
-    reading_injection_sites: Optional[Tuple[str, ...]] = None,
+    refinement_block_config: Optional[Dict] = None,
+    refinement_injection_sites: Optional[Tuple[str, ...]] = None,
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
@@ -628,22 +753,22 @@ def create_sd_model(
         **component_load_kwargs,
     )
 
-    reading_cfg = reading_block_config or {}
+    refinement_cfg = refinement_block_config or {}
     unet = SatelliteConditionedUNet(
-        use_satellite_reading=reading_cfg.get('enable', True),
-        reading_injection_sites=list(reading_injection_sites) if reading_injection_sites is not None else None,
-        reading_block_config={
-            'num_heads': reading_cfg.get('num_heads', 8),
-            'head_dim': reading_cfg.get('head_dim', 64),
-            'geo_ratio': reading_cfg.get('geo_ratio', 0.5),
-            'rope_base': reading_cfg.get('rope_base', 10000.0),
-            'lambda_geo': reading_cfg.get('lambda_geo', 1.0),
-            'lambda_geom': reading_cfg.get('lambda_geom', 1.0),
-            'geom_hidden_dim': reading_cfg.get('geom_hidden_dim', 128),
-            'geom_head_dim': reading_cfg.get('geom_head_dim', 16),
-            'gate_hidden_ratio': reading_cfg.get('gate_hidden_ratio', 0.25),
-            'use_geom_bias': reading_cfg.get('use_geom_bias', True),
-            'use_gated_residual': reading_cfg.get('use_gated_residual', True),
+        enable_cross_view_refinement=refinement_cfg.get('enable', True),
+        refinement_injection_sites=list(refinement_injection_sites) if refinement_injection_sites is not None else None,
+        refinement_block_config={
+            'num_heads': refinement_cfg.get('num_heads', 8),
+            'head_dim': refinement_cfg.get('head_dim', 64),
+            'geo_ratio': refinement_cfg.get('geo_ratio', 0.5),
+            'rope_base': refinement_cfg.get('rope_base', 10000.0),
+            'lambda_geo': refinement_cfg.get('lambda_geo', 1.0),
+            'lambda_geom': refinement_cfg.get('lambda_geom', 1.0),
+            'geom_hidden_dim': refinement_cfg.get('geom_hidden_dim', 128),
+            'geom_head_dim': refinement_cfg.get('geom_head_dim', 16),
+            'gate_hidden_ratio': refinement_cfg.get('gate_hidden_ratio', 0.25),
+            'use_geom_bias': refinement_cfg.get('use_geom_bias', True),
+            'use_gated_residual': refinement_cfg.get('use_gated_residual', True),
         },
         **base_unet.config,
     )
@@ -764,7 +889,7 @@ class SDTrainer:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         self._barrier()
 
-        # Reading blocks are created lazily on first forward. Materialize them before
+        # Refinement blocks are created lazily on first forward. Materialize them before
         # building the optimizer so their parameters are actually trainable.
         self._materialize_lazy_condition_modules()
         self._ensure_trainable_params_fp32()
@@ -858,9 +983,9 @@ class SDTrainer:
     @torch.no_grad()
     def _materialize_lazy_condition_modules(self) -> None:
         unet = getattr(self.model, "unet", None)
-        if unet is None or not getattr(unet, "use_satellite_reading", False):
+        if unet is None or not getattr(unet, "enable_cross_view_refinement", False):
             return
-        if len(getattr(unet, "reading_blocks", {})) > 0:
+        if len(getattr(unet, "refinement_blocks", {})) > 0:
             return
 
         try:
@@ -876,21 +1001,28 @@ class SDTrainer:
             return
 
         sat_images = sat_images[:1].to(self.device)
-        coords_map = batch.get("coords_map")
-        if coords_map is not None:
-            coords_map = coords_map[:1].to(self.device)
+        front_bev_xy = batch.get("front_bev_xy")
+        if front_bev_xy is not None:
+            front_bev_xy = front_bev_xy[:1].to(self.device)
+            if front_bev_xy.ndim == 5:
+                front_bev_xy = front_bev_xy[:, 0]
+        front_ground_valid_mask = batch.get("front_ground_valid_mask")
+        if front_ground_valid_mask is not None:
+            front_ground_valid_mask = front_ground_valid_mask[:1].to(self.device)
+            if front_ground_valid_mask.ndim == 5:
+                front_ground_valid_mask = front_ground_valid_mask[:, 0]
         target_size = tuple(int(x) for x in target_images.shape[-2:])
 
         was_training = self.model.training
         self.model.eval()
-        _materialize_lazy_modules(self.model, sat_images, coords_map, target_size)
+        _materialize_lazy_modules(self.model, sat_images, front_bev_xy, front_ground_valid_mask, target_size)
         if was_training:
             self.model.train()
 
-        reading_param_count = sum(p.numel() for p in unet.reading_blocks.parameters())
+        refinement_param_count = sum(p.numel() for p in unet.refinement_blocks.parameters())
         logger.info(
-            f"Materialized {len(unet.reading_blocks)} reading block(s) before optimizer init "
-            f"({reading_param_count} parameters)"
+            f"Materialized {len(unet.refinement_blocks)} refinement block(s) before optimizer init "
+            f"({refinement_param_count} parameters)"
         )
 
     def _ensure_trainable_params_fp32(self) -> None:
@@ -1067,10 +1199,12 @@ class SDTrainer:
             sat_images = batch['sat'].to(self.device)
             target_images = batch['image'].to(self.device)
 
-            # Get coords_map - BEV coordinates for each camera pixel (透视 token 在 BEV 图上的坐标)
-            coords_map = batch.get('coords_map')
-            if coords_map is not None:
-                coords_map = coords_map.to(self.device)
+            front_bev_xy = batch.get('front_bev_xy')
+            if front_bev_xy is not None:
+                front_bev_xy = front_bev_xy.to(self.device)
+            front_ground_valid_mask = batch.get('front_ground_valid_mask')
+            if front_ground_valid_mask is not None:
+                front_ground_valid_mask = front_ground_valid_mask.to(self.device)
             plucker_map = batch.get('plucker_map')
             if plucker_map is not None:
                 plucker_map = plucker_map.to(self.device)
@@ -1084,8 +1218,9 @@ class SDTrainer:
                 outputs = self.model(
                     sat_images,
                     target_images,
-                    coords_map=coords_map,
+                    front_bev_xy=front_bev_xy,
                     plucker_map=plucker_map,
+                    front_ground_valid_mask=front_ground_valid_mask,
                 )
                 raw_loss = outputs['loss']
 
@@ -1121,7 +1256,7 @@ class SDTrainer:
 
             total_raw_loss += raw_loss.item()
             postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
-            geom_ratio = outputs.get('reading_logits_geom_to_sem_ratio_mean')
+            geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
             if torch.is_tensor(geom_ratio):
                 postfix['geom/sem'] = f"{geom_ratio.item():.2f}"
             if self.is_main_process:
@@ -1129,12 +1264,12 @@ class SDTrainer:
 
             # Log
             if self.is_main_process and (step + 1) % self.log_every == 0:
-                geom_std = outputs.get('reading_logits_geom_std_mean')
-                sem_std = outputs.get('reading_logits_sem_std_mean')
-                geom_ratio = outputs.get('reading_logits_geom_to_sem_ratio_mean')
+                geom_std = outputs.get('refinement_logits_geom_std_mean')
+                sem_std = outputs.get('refinement_logits_sem_std_mean')
+                geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
                 if all(torch.is_tensor(v) for v in (geom_std, sem_std, geom_ratio)):
                     site_ratio_parts = []
-                    for site, site_stats in outputs.get('reading_stats_by_site', {}).items():
+                    for site, site_stats in outputs.get('refinement_stats_by_site', {}).items():
                         ratio = site_stats.get('logits_geom_to_sem_ratio')
                         if torch.is_tensor(ratio):
                             site_ratio_parts.append(f"{site}={ratio.item():.3f}")
@@ -1162,11 +1297,11 @@ class SDTrainer:
                     'train/epoch': epoch + 1,
                 }
                 if torch.is_tensor(sem_std):
-                    log_payload['reading/logits_sem_std_mean'] = sem_std.item()
+                    log_payload['refinement/logits_sem_std_mean'] = sem_std.item()
                 if torch.is_tensor(geom_std):
-                    log_payload['reading/logits_geom_std_mean'] = geom_std.item()
+                    log_payload['refinement/logits_geom_std_mean'] = geom_std.item()
                 if torch.is_tensor(geom_ratio):
-                    log_payload['reading/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
+                    log_payload['refinement/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
         local_mean = total_raw_loss / max(1, num_batches)
@@ -1184,10 +1319,12 @@ class SDTrainer:
             sat_images = batch['sat'].to(self.device)
             target_images = batch['image'].to(self.device)
 
-            # Get coords_map
-            coords_map = batch.get('coords_map')
-            if coords_map is not None:
-                coords_map = coords_map.to(self.device)
+            front_bev_xy = batch.get('front_bev_xy')
+            if front_bev_xy is not None:
+                front_bev_xy = front_bev_xy.to(self.device)
+            front_ground_valid_mask = batch.get('front_ground_valid_mask')
+            if front_ground_valid_mask is not None:
+                front_ground_valid_mask = front_ground_valid_mask.to(self.device)
             plucker_map = batch.get('plucker_map')
             if plucker_map is not None:
                 plucker_map = plucker_map.to(self.device)
@@ -1200,8 +1337,9 @@ class SDTrainer:
                 outputs = eval_model(
                     sat_images,
                     target_images,
-                    coords_map=coords_map,
+                    front_bev_xy=front_bev_xy,
                     plucker_map=plucker_map,
+                    front_ground_valid_mask=front_ground_valid_mask,
                 )
                 loss = outputs['loss']
             total_loss += loss.item()
@@ -1209,6 +1347,16 @@ class SDTrainer:
         if was_training:
             eval_model.train()
         return total_loss / len(self.val_dataloader)
+
+    @staticmethod
+    def _select_visualization_view(
+        tensor: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.ndim >= 5:
+            return tensor[:, 0]
+        return tensor
 
     def _save_checkpoint(self, epoch: int):
         """Save model checkpoint."""
@@ -1266,8 +1414,9 @@ class SDTrainer:
 
         sat_chunks = []
         target_chunks = []
-        coords_chunks = []
+        front_bev_xy_chunks = []
         plucker_chunks = []
+        front_ground_valid_mask_chunks = []
         frame_ids = []
 
         for batch in data_loader:
@@ -1280,9 +1429,12 @@ class SDTrainer:
             sat_chunks.append(batch['sat'][:take])
             target_chunks.append(batch['image'][:take])
 
-            coords_map = batch.get('coords_map')
-            if coords_map is not None:
-                coords_chunks.append(coords_map[:take])
+            front_bev_xy = batch.get('front_bev_xy')
+            if front_bev_xy is not None:
+                front_bev_xy_chunks.append(front_bev_xy[:take])
+            front_ground_valid_mask = batch.get('front_ground_valid_mask')
+            if front_ground_valid_mask is not None:
+                front_ground_valid_mask_chunks.append(front_ground_valid_mask[:take])
             plucker_map = batch.get('plucker_map')
             if plucker_map is not None:
                 plucker_chunks.append(plucker_map[:take])
@@ -1301,8 +1453,17 @@ class SDTrainer:
 
         sat_images = torch.cat(sat_chunks, dim=0).to(self.device)
         target_images = torch.cat(target_chunks, dim=0).to(self.device)
-        coords_map = torch.cat(coords_chunks, dim=0).to(self.device) if coords_chunks else None
+        front_bev_xy = torch.cat(front_bev_xy_chunks, dim=0).to(self.device) if front_bev_xy_chunks else None
         plucker_map = torch.cat(plucker_chunks, dim=0).to(self.device) if plucker_chunks else None
+        front_ground_valid_mask = (
+            torch.cat(front_ground_valid_mask_chunks, dim=0).to(self.device)
+            if front_ground_valid_mask_chunks else None
+        )
+
+        target_images = self._select_visualization_view(target_images)
+        front_bev_xy = self._select_visualization_view(front_bev_xy)
+        plucker_map = self._select_visualization_view(plucker_map)
+        front_ground_valid_mask = self._select_visualization_view(front_ground_valid_mask)
 
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
         generator = torch.Generator(device=generator_device)
@@ -1313,8 +1474,9 @@ class SDTrainer:
         eval_model.eval()
         generated_images = eval_model.generate(
             sat_images,
-            coords_map=coords_map,
+            front_bev_xy=front_bev_xy,
             plucker_map=plucker_map,
+            front_ground_valid_mask=front_ground_valid_mask,
             target_size=tuple(target_images.shape[-2:]),
             num_inference_steps=self.visualization_inference_steps,
             guidance_scale=self.visualization_guidance_scale,

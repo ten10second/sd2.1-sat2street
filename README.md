@@ -1,13 +1,13 @@
 # KITTI-360 Satellite-to-Frontview Generation with Stable Diffusion
 
-基于 Stable Diffusion 的卫星图到前视图生成框架，完全移除 IPM（逆透视映射）中间步骤，直接使用卫星图和相机位姿，通过坐标位置编码和 self-attention 保持空间一致性。
+基于 Stable Diffusion 的卫星图到前视图生成框架，完全移除 IPM（逆透视映射）中间步骤，直接使用卫星图和相机位姿，通过 ground-plane-aware 几何契约和双向迭代 cross-view refinement 保持空间一致性。
 
 ## 核心创新
 
 1. **直接端到端生成**：移除传统 IPM 中间步骤，卫星图 + 位姿 → 前视图
-2. **坐标位置编码**：为卫星图特征添加前视图 token 在 BEV 图上的相对位置编码
-3. **空间一致性保持**：通过 self-attention 保持卫星图内部的空间几何关系
-4. **几何读写对齐**：通过前视 token 的 BEV 坐标与卫星 token 建立读写对齐
+2. **地面平面几何编码**：以前视 token 的 `front_bev_xy` 和有效地面 mask 作为第二种位置编码
+3. **卫星 memory 自校准**：street 特征会反向更新 satellite memory，而不只是单向读取
+4. **空间一致性保持**：更新后的卫星 memory 再经过 self-attention 持续混合
 
 ## 项目架构
 
@@ -18,18 +18,18 @@
 │   └── Kitti360Dataset    # 简化的数据加载器（预留）
 ├── models/               # 模型定义
 │   ├── encoders/         # 卫星图编码器
-│   │   ├── SatelliteConditionEncoder  # 卫星图条件编码器
-│   │   └── RelativeCoordinateEncoder  # 相对坐标编码器
+│   │   └── SatelliteConditionEncoder  # 输出初始 satellite memory
 │   ├── unet/             # U-Net 模块
-│   │   └── RelativePositionAttention  # 相对位置注意力机制
-│   ├── sd_model.py       # 基础 SD 模型包装
+│   │   ├── CrossViewRefinementBlock   # 双向 cross-view refinement
+│   │   ├── StreetToSatelliteAttention # street -> satellite 更新
+│   │   └── SatelliteReadingAttention  # satellite -> street 读取
+│   ├── sd_model.py       # 显式 conditioning state 的 SD 模型包装
 │   └── sd_trainer.py     # 完整的训练器
 ├── utils/                # 工具函数
 │   ├── geometry/         # 几何计算（来自原始项目）
 │   │   ├── differentiable_projection.py  # 可微分投影
 │   │   ├── kitti_transforms.py          # KITTI 变换
 │   │   ├── pose_encoding.py             # 位姿编码
-│   │   ├── bev_to_camera_warp.py        # BEV 到相机图
 │   │   └── ...
 │   └── pos_embed.py      # 位置编码
 ├── metrics/              # 评估指标
@@ -39,7 +39,8 @@
 ├── scripts/              # 训练和推理脚本
 │   ├── train.py          # 主要训练脚本
 │   ├── infer.py          # 推理脚本
-│   └── train_sd.py       # 原始训练脚本（已保留）
+│   ├── visualize_multiseed.py
+│   └── visualize_yaw_sweep.py
 ├── requirements.txt      # 依赖包
 ├── README.md            # 项目说明
 └── .gitignore           # Git 忽略文件

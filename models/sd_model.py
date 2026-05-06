@@ -1,53 +1,46 @@
 """
-Stable Diffusion Model for Satellite-to-Frontview Generation.
-
-Custom Stable Diffusion implementation with satellite condition encoder.
+Cross-view-refined UNet for satellite-to-frontview generation.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from diffusers import StableDiffusionPipeline
+from models.conditioning import CrossViewConditioningState, SatelliteMemoryState
 try:
-    from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+    from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel, UNet2DConditionOutput
 except ImportError:
-    from diffusers.models.unet_2d_condition import UNet2DConditionModel
+    from diffusers.models.unet_2d_condition import UNet2DConditionModel, UNet2DConditionOutput
+from diffusers.utils import USE_PEFT_BACKEND, deprecate, scale_lora_layers, unscale_lora_layers
 
-try:
-    from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
-except ImportError:
-    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
-
-from models.unet.satellite_reading_block import SatelliteReadingBlock
+from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
     """
-    UNet2DConditionModel with satellite condition support.
+    UNet2DConditionModel with explicit cross-view refinement support.
 
     Args:
-        use_satellite_reading: Whether to use satellite reading blocks
-        reading_injection_sites: Which U-Net layers to inject reading blocks into
-        reading_block_config: Configuration for reading blocks
+        enable_cross_view_refinement: Whether to run cross-view refinement blocks
+        refinement_injection_sites: Which U-Net layers run refinement
+        refinement_block_config: Configuration for refinement blocks
         **kwargs: Additional arguments for UNet2DConditionModel
     """
 
     def __init__(
         self,
-        use_satellite_reading: bool = True,
-        reading_injection_sites: Optional[List[str]] = None,
-        reading_block_config: Optional[Dict[str, Any]] = None,
+        enable_cross_view_refinement: bool = True,
+        refinement_injection_sites: Optional[List[str]] = None,
+        refinement_block_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        self.supports_satellite_reading = True
-        self.use_satellite_reading = use_satellite_reading
-        self.reading_injection_sites = reading_injection_sites or ["down2", "mid"]
-        sat_in_dim = int(self.config.cross_attention_dim or 768)
-        self.reading_block_config = {
+        self.supports_cross_view_refinement = True
+        self.enable_cross_view_refinement = enable_cross_view_refinement
+        self.refinement_injection_sites = list(refinement_injection_sites or ["mid", "up0", "up1"])
+        self._refinement_site_set = set(self.refinement_injection_sites)
+        self.refinement_block_config = {
             "num_heads": 8,
             "head_dim": 64,
             "geo_ratio": 0.5,
@@ -60,94 +53,45 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "use_geom_bias": True,
             "use_gated_residual": True,
         }
-        if reading_block_config is not None:
-            self.reading_block_config.update(reading_block_config)
+        if refinement_block_config is not None:
+            self.refinement_block_config.update(refinement_block_config)
 
-        self.reading_blocks = nn.ModuleDict()
-        self._conditioning_context: Dict[str, Any] = {}
-        self._reading_hook_handles = []
-        self._attn2_sat_hook_handles = []
+        self.refinement_blocks = torch.nn.ModuleDict()
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
-        self.last_reading_stats: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.last_refinement_stats: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.last_satellite_state: Optional[SatelliteMemoryState] = None
 
-        self._register_attn2_sat_hooks(sat_in_dim=sat_in_dim)
-        if self.use_satellite_reading:
-            self._register_reading_hooks()
-
-    def _register_reading_hooks(self):
-        for site in self.reading_injection_sites:
-            module = self._resolve_injection_module(site)
-            if module is None:
-                continue
-            handle = module.register_forward_hook(self._make_reading_hook(site))
-            self._reading_hook_handles.append(handle)
-
-    def _register_attn2_sat_hooks(self, sat_in_dim: int):
-        for name, module in list(self.named_modules()):
-            if not name.endswith("attn2"):
-                continue
-            cross_attention_dim = getattr(module, "cross_attention_dim", None)
-            if cross_attention_dim is None or int(cross_attention_dim) != sat_in_dim:
-                raise ValueError(
-                    f"attn2 module {name} has cross_attention_dim={cross_attention_dim}, "
-                    f"expected {sat_in_dim} to match satellite token dim"
-                )
-            handle = module.register_forward_pre_hook(
-                self._make_attn2_sat_hook(name),
-                with_kwargs=True,
-            )
-            self._attn2_sat_hook_handles.append(handle)
-
-    def _resolve_injection_module(self, site: str):
-        if site == "mid":
-            return self.mid_block
-        if site.startswith("down"):
-            try:
-                index = int(site[4:])
-            except ValueError:
-                return None
-            if 0 <= index < len(self.down_blocks):
-                return self.down_blocks[index]
-        if site.startswith("up"):
-            try:
-                index = int(site[2:])
-            except ValueError:
-                return None
-            if 0 <= index < len(self.up_blocks):
-                return self.up_blocks[index]
-        return None
-
-    def _get_or_create_reading_block(
+    def _get_or_create_refinement_block(
         self,
         site: str,
         front_feat: torch.Tensor,
         sat_tokens: torch.Tensor,
-    ) -> SatelliteReadingBlock:
-        if site in self.reading_blocks:
-            block = self.reading_blocks[site]
+    ) -> CrossViewRefinementBlock:
+        if site in self.refinement_blocks:
+            block = self.refinement_blocks[site]
             block_param = next(block.parameters(), None)
             if block_param is not None and block_param.device != front_feat.device:
                 block = block.to(device=front_feat.device)
-                self.reading_blocks[site] = block
+                self.refinement_blocks[site] = block
             return block
 
-        block = SatelliteReadingBlock(
+        block = CrossViewRefinementBlock(
             front_dim=front_feat.shape[1],
             sat_in_dim=sat_tokens.shape[-1],
-            num_heads=self.reading_block_config["num_heads"],
-            head_dim=self.reading_block_config["head_dim"],
-            geo_ratio=self.reading_block_config["geo_ratio"],
-            rope_base=self.reading_block_config["rope_base"],
-            lambda_geo=self.reading_block_config["lambda_geo"],
-            lambda_geom=self.reading_block_config["lambda_geom"],
-            geom_hidden_dim=self.reading_block_config["geom_hidden_dim"],
-            geom_head_dim=self.reading_block_config["geom_head_dim"],
-            gate_hidden_ratio=self.reading_block_config["gate_hidden_ratio"],
-            use_geom_bias=self.reading_block_config["use_geom_bias"],
-            use_gated_residual=self.reading_block_config["use_gated_residual"],
+            num_heads=self.refinement_block_config["num_heads"],
+            head_dim=self.refinement_block_config["head_dim"],
+            geo_ratio=self.refinement_block_config["geo_ratio"],
+            rope_base=self.refinement_block_config["rope_base"],
+            lambda_geo=self.refinement_block_config["lambda_geo"],
+            lambda_geom=self.refinement_block_config["lambda_geom"],
+            geom_hidden_dim=self.refinement_block_config["geom_hidden_dim"],
+            geom_head_dim=self.refinement_block_config["geom_head_dim"],
+            gate_hidden_ratio=self.refinement_block_config["gate_hidden_ratio"],
+            use_geom_bias=self.refinement_block_config["use_geom_bias"],
+            use_gated_residual=self.refinement_block_config["use_gated_residual"],
         )
         block = block.to(device=front_feat.device)
-        self.reading_blocks[site] = block
+        self.refinement_blocks[site] = block
         return block
 
     def _prepare_front_bev_xy(
@@ -228,6 +172,50 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         return None
 
+    def _prepare_front_ground_valid_mask(
+        self,
+        front_ground_valid_mask: Any,
+        site: str,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if front_ground_valid_mask is None:
+            return None
+
+        if isinstance(front_ground_valid_mask, dict):
+            site_mask = front_ground_valid_mask.get(site)
+            if site_mask is None:
+                site_mask = front_ground_valid_mask.get("default")
+            return self._prepare_front_ground_valid_mask(site_mask, site, height, width, device, dtype)
+
+        if not torch.is_tensor(front_ground_valid_mask):
+            return None
+
+        front_ground_valid_mask = front_ground_valid_mask.to(device=device, dtype=dtype)
+
+        if front_ground_valid_mask.ndim == 2:
+            if front_ground_valid_mask.shape == (front_ground_valid_mask.shape[0], height * width):
+                return front_ground_valid_mask
+            return None
+
+        if front_ground_valid_mask.ndim == 3 and front_ground_valid_mask.shape[-1] == 1:
+            if front_ground_valid_mask.shape[1] == height * width:
+                return front_ground_valid_mask.squeeze(-1)
+            return None
+
+        if front_ground_valid_mask.ndim == 4 and front_ground_valid_mask.shape[1] == 1:
+            resized = F.interpolate(front_ground_valid_mask, size=(height, width), mode="nearest")
+            return resized.reshape(front_ground_valid_mask.shape[0], height * width)
+
+        if front_ground_valid_mask.ndim == 4 and front_ground_valid_mask.shape[-1] == 1:
+            mask = front_ground_valid_mask.permute(0, 3, 1, 2)
+            resized = F.interpolate(mask, size=(height, width), mode="nearest")
+            return resized.reshape(front_ground_valid_mask.shape[0], height * width)
+
+        return None
+
     @staticmethod
     def _feature_condition_mask(condition_mask: torch.Tensor, front_feat: torch.Tensor) -> torch.Tensor:
         if condition_mask.ndim != 1 or condition_mask.shape[0] != front_feat.shape[0]:
@@ -244,345 +232,453 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             )
         return condition_mask.to(device=token_states.device, dtype=token_states.dtype).view(-1, 1, 1)
 
-    def _make_attn2_sat_hook(self, module_name: str):
-        def hook(module, args, kwargs):
-            if not self._conditioning_context:
-                return args, kwargs
+    @staticmethod
+    def _move_satellite_state(
+        satellite_state: SatelliteMemoryState,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> SatelliteMemoryState:
+        return SatelliteMemoryState(
+            tokens=satellite_state.tokens.to(device=device, dtype=dtype),
+            xy=satellite_state.xy.to(device=device, dtype=dtype),
+            bev_coords=(
+                satellite_state.bev_coords.to(device=device, dtype=dtype)
+                if satellite_state.bev_coords is not None
+                else None
+            ),
+        )
 
-            sat_tokens = self._conditioning_context.get("sat_tokens")
-            condition_mask = self._conditioning_context.get("condition_mask")
-            if sat_tokens is None:
-                return args, kwargs
+    def _apply_satellite_condition_mask(
+        self,
+        satellite_state: SatelliteMemoryState,
+        condition_mask: Optional[torch.Tensor],
+    ) -> SatelliteMemoryState:
+        if condition_mask is None:
+            return satellite_state
 
-            hidden_states = kwargs.get("hidden_states")
-            if hidden_states is None and args:
-                hidden_states = args[0]
-            if not torch.is_tensor(hidden_states):
-                return args, kwargs
+        token_mask = self._token_condition_mask(condition_mask, satellite_state.tokens)
+        xy_mask = self._token_condition_mask(condition_mask, satellite_state.xy)
+        bev_coords = satellite_state.bev_coords
+        if bev_coords is not None:
+            bev_mask = self._token_condition_mask(condition_mask, bev_coords)
+            bev_coords = bev_coords * bev_mask
 
-            sat_encoder_hidden_states = sat_tokens.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            if condition_mask is not None:
-                sat_encoder_hidden_states = (
-                    sat_encoder_hidden_states
-                    * self._token_condition_mask(condition_mask, sat_encoder_hidden_states)
+        return satellite_state.replace(
+            tokens=satellite_state.tokens * token_mask,
+            xy=satellite_state.xy * xy_mask,
+            bev_coords=bev_coords,
+        )
+
+    def _build_conditioning_state(
+        self,
+        sat_tokens: Optional[torch.Tensor],
+        sat_xy: Optional[torch.Tensor],
+        sat_bev_coords: Optional[torch.Tensor],
+        front_bev_xy: Optional[torch.Tensor],
+        front_plucker: Optional[torch.Tensor],
+        front_ground_valid_mask: Optional[torch.Tensor],
+        condition_mask: Optional[torch.Tensor],
+        return_attn_map: bool,
+        batch_size: int,
+        device: torch.device,
+    ) -> Optional[CrossViewConditioningState]:
+        if sat_tokens is None:
+            return None
+
+        if sat_tokens.ndim != 3:
+            raise ValueError("sat_tokens must be [B, Ns, Cs]")
+        if sat_xy is None or sat_xy.ndim != 3 or sat_xy.shape[-1] != 2:
+            raise ValueError("sat_xy must be provided as [B, Ns, 2] when sat_tokens are used")
+        if sat_tokens.shape[:2] != sat_xy.shape[:2]:
+            raise ValueError(
+                f"sat_tokens and sat_xy token shapes must match, got {list(sat_tokens.shape[:2])} "
+                f"vs {list(sat_xy.shape[:2])}"
+            )
+        if sat_bev_coords is not None and sat_bev_coords.shape[:2] != sat_tokens.shape[:2]:
+            raise ValueError(
+                "sat_bev_coords must match sat_tokens token layout when provided"
+            )
+        if condition_mask is not None:
+            if condition_mask.ndim != 1 or condition_mask.shape[0] != batch_size:
+                raise ValueError(
+                    f"condition_mask must be [B], got {list(condition_mask.shape)} for batch {batch_size}"
                 )
+            condition_mask = condition_mask.to(device=device, dtype=torch.bool)
 
-            kwargs = dict(kwargs)
-            kwargs["encoder_hidden_states"] = sat_encoder_hidden_states
-            return args, kwargs
+        satellite_state = SatelliteMemoryState(
+            tokens=sat_tokens,
+            xy=sat_xy,
+            bev_coords=sat_bev_coords,
+        )
+        satellite_state = self._apply_satellite_condition_mask(satellite_state, condition_mask)
 
-        return hook
+        return CrossViewConditioningState(
+            satellite=satellite_state,
+            front_bev_xy=front_bev_xy,
+            front_plucker=front_plucker,
+            front_ground_valid_mask=front_ground_valid_mask,
+            condition_mask=condition_mask,
+            return_attn_map=return_attn_map,
+        )
 
-    def _make_reading_hook(self, site: str):
-        def hook(_module, _inputs, output):
-            if not self._conditioning_context:
-                return output
-
-            if isinstance(output, tuple):
-                if not output or not torch.is_tensor(output[0]):
-                    return output
-                front_feat = output[0]
-                output_tail = output[1:]
-                is_tuple = True
-            elif torch.is_tensor(output):
-                front_feat = output
-                output_tail = ()
-                is_tuple = False
-            else:
-                return output
-
-            sat_tokens = self._conditioning_context.get("sat_tokens")
-            sat_xy = self._conditioning_context.get("sat_xy")
-            raw_front_bev_xy = self._conditioning_context.get("front_bev_xy")
-            raw_front_plucker = self._conditioning_context.get("front_plucker")
-            condition_mask = self._conditioning_context.get("condition_mask")
-            if sat_tokens is None or sat_xy is None or raw_front_bev_xy is None:
-                return output
-
-            front_bev_xy = self._prepare_front_bev_xy(
-                raw_front_bev_xy,
-                site,
-                front_feat.shape[2],
-                front_feat.shape[3],
-                front_feat.device,
-                front_feat.dtype,
+    def _current_encoder_hidden_states(
+        self,
+        conditioning_state: Optional[CrossViewConditioningState],
+        encoder_hidden_states: Any,
+        hidden_states: torch.Tensor,
+    ) -> Any:
+        if conditioning_state is not None:
+            satellite_state = self._move_satellite_state(
+                conditioning_state.satellite,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
             )
-            if front_bev_xy is None:
-                return output
-            front_plucker = self._prepare_front_plucker(
-                raw_front_plucker,
-                site,
-                front_feat.shape[2],
-                front_feat.shape[3],
-                front_feat.device,
-                front_feat.dtype,
+            satellite_state = self._apply_satellite_condition_mask(
+                satellite_state,
+                conditioning_state.condition_mask,
+            )
+            return satellite_state.tokens
+
+        if torch.is_tensor(encoder_hidden_states):
+            return encoder_hidden_states.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        if isinstance(encoder_hidden_states, tuple):
+            return tuple(
+                value.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                if torch.is_tensor(value)
+                else value
+                for value in encoder_hidden_states
+            )
+        return encoder_hidden_states
+
+    def _run_refinement(
+        self,
+        site: str,
+        front_feat: torch.Tensor,
+        conditioning_state: Optional[CrossViewConditioningState],
+    ) -> torch.Tensor:
+        if conditioning_state is None:
+            return front_feat
+        if not self.enable_cross_view_refinement or site not in self._refinement_site_set:
+            return front_feat
+        if conditioning_state.front_bev_xy is None:
+            return front_feat
+        if conditioning_state.condition_mask is not None and not bool(conditioning_state.condition_mask.any().item()):
+            return front_feat
+
+        front_bev_xy = self._prepare_front_bev_xy(
+            conditioning_state.front_bev_xy,
+            site,
+            front_feat.shape[2],
+            front_feat.shape[3],
+            front_feat.device,
+            front_feat.dtype,
+        )
+        if front_bev_xy is None:
+            return front_feat
+
+        front_plucker = self._prepare_front_plucker(
+            conditioning_state.front_plucker,
+            site,
+            front_feat.shape[2],
+            front_feat.shape[3],
+            front_feat.device,
+            front_feat.dtype,
+        )
+        front_ground_valid_mask = self._prepare_front_ground_valid_mask(
+            conditioning_state.front_ground_valid_mask,
+            site,
+            front_feat.shape[2],
+            front_feat.shape[3],
+            front_feat.device,
+            front_feat.dtype,
+        )
+        satellite_state = self._move_satellite_state(
+            conditioning_state.satellite,
+            device=front_feat.device,
+            dtype=front_feat.dtype,
+        )
+        block = self._get_or_create_refinement_block(site, front_feat, satellite_state.tokens)
+        block_output = block(
+            front_feat=front_feat,
+            satellite_state=satellite_state,
+            front_bev_xy=front_bev_xy,
+            front_plucker=front_plucker,
+            front_ground_valid_mask=front_ground_valid_mask,
+            return_attn_map=conditioning_state.return_attn_map,
+        )
+
+        updated = block_output["front_feat_out"]
+        updated_satellite = block_output["satellite_state"]
+        if conditioning_state.condition_mask is not None:
+            feature_mask = self._feature_condition_mask(conditioning_state.condition_mask, front_feat)
+            updated = feature_mask * updated + (1.0 - feature_mask) * front_feat
+            updated_satellite = self._apply_satellite_condition_mask(
+                updated_satellite,
+                conditioning_state.condition_mask,
             )
 
-            block = self._get_or_create_reading_block(site, front_feat, sat_tokens)
-            block_output = block(
-                front_feat=front_feat,
-                sat_tokens=sat_tokens.to(device=front_feat.device, dtype=front_feat.dtype),
-                sat_xy=sat_xy.to(device=front_feat.device, dtype=front_feat.dtype),
-                front_bev_xy=front_bev_xy,
-                front_plucker=front_plucker,
-                return_attn_map=self._conditioning_context.get("return_attn_map", False),
-            )
+        conditioning_state.satellite = updated_satellite
+        if conditioning_state.return_attn_map:
+            attn_map = block_output.get("attn_map")
+            if attn_map is not None:
+                conditioning_state.attn_maps[site] = attn_map
 
-            updated = block_output["front_feat_out"]
-            if condition_mask is not None:
-                feature_mask = self._feature_condition_mask(condition_mask, front_feat)
-                updated = feature_mask * updated + (1.0 - feature_mask) * front_feat
-            if self._conditioning_context.get("return_attn_map", False):
-                attn_map = block_output.get("attn_map")
-                if attn_map is not None:
-                    self._conditioning_context.setdefault("attn_maps", {})[site] = attn_map.detach()
-            stats = block_output.get("stats")
-            if stats:
-                detached_stats = {}
-                for key, value in stats.items():
-                    if torch.is_tensor(value):
-                        detached_stats[key] = value.detach()
-                if detached_stats:
-                    self._conditioning_context.setdefault("reading_stats", {})[site] = detached_stats
+        stats = block_output.get("stats")
+        if stats:
+            detached_stats = {}
+            for key, value in stats.items():
+                if torch.is_tensor(value):
+                    detached_stats[key] = value.detach()
+            if detached_stats:
+                conditioning_state.refinement_stats[site] = detached_stats
 
-            if is_tuple:
-                return (updated, *output_tail)
-            return updated
-
-        return hook
+        return updated
 
     def forward(
         self,
-        sample: torch.FloatTensor,
-        timestep: torch.Tensor,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: Optional[torch.Tensor] = None,
         sat_tokens: Optional[torch.Tensor] = None,
         sat_xy: Optional[torch.Tensor] = None,
+        sat_bev_coords: Optional[torch.Tensor] = None,
         front_bev_xy: Optional[torch.Tensor] = None,
         front_plucker: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
         return_attn_map: bool = False,
-        **kwargs,
-    ):
-        """
-        Forward pass with satellite conditioning.
-
-        Args:
-            sample: (B, 4, H, W) - Noisy latent representation
-            timestep: (B,) or (1,) - Current timestep
-            encoder_hidden_states: Optional legacy argument, ignored by attn2 hooks
-            sat_tokens: (B, Ns, Cs) - Pre-encoded satellite tokens
-            sat_xy: (B, Ns, 2) - Satellite token BEV coordinates
-            front_bev_xy: (B, Nf, 2) - Frontview pixel BEV coordinates
-            front_plucker: (B, 6, H, W) or (B, Nf, 6) - Per-pixel Plucker ray map
-            condition_mask: (B,) - Per-sample mask controlling whether reading injection is enabled
-            return_attn_map: Whether to return attention maps
-
-        Returns:
-            noise_pred: (B, 4, H, W) - Predicted noise
-        """
-        inferred_sat_tokens = sat_tokens
-        inferred_sat_xy = sat_xy
-        inferred_condition_mask = condition_mask
-
-        if inferred_sat_tokens is not None and inferred_sat_tokens.ndim != 3:
-            raise ValueError("sat_tokens must be [B, Ns, Cs]")
-        if inferred_sat_xy is not None and (inferred_sat_xy.ndim != 3 or inferred_sat_xy.shape[-1] != 2):
-            raise ValueError("sat_xy must be [B, Ns, 2]")
-        if inferred_condition_mask is not None:
-            if inferred_condition_mask.ndim != 1 or inferred_condition_mask.shape[0] != sample.shape[0]:
-                raise ValueError(
-                    f"condition_mask must be [B], got {list(inferred_condition_mask.shape)} for batch {sample.shape[0]}"
-                )
-            inferred_condition_mask = inferred_condition_mask.to(device=sample.device, dtype=torch.bool)
-
-        enable_sat_condition = inferred_sat_tokens is not None
-        enable_reading = (
-            self.use_satellite_reading
-            and enable_sat_condition
-            and inferred_sat_xy is not None
-            and front_bev_xy is not None
+        class_labels: Optional[torch.Tensor] = None,
+        timestep_cond: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+        down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+        mid_block_additional_residual: Optional[torch.Tensor] = None,
+        down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+    ) -> Union[UNet2DConditionOutput, Tuple]:
+        conditioning_state = self._build_conditioning_state(
+            sat_tokens=sat_tokens,
+            sat_xy=sat_xy,
+            sat_bev_coords=sat_bev_coords,
+            front_bev_xy=front_bev_xy,
+            front_plucker=front_plucker,
+            front_ground_valid_mask=front_ground_valid_mask,
+            condition_mask=condition_mask,
+            return_attn_map=return_attn_map,
+            batch_size=sample.shape[0],
+            device=sample.device,
         )
-
-        if enable_sat_condition:
-            self._conditioning_context = {
-                "sat_tokens": inferred_sat_tokens,
-                "sat_xy": inferred_sat_xy,
-                "front_bev_xy": front_bev_xy,
-                "front_plucker": front_plucker,
-                "condition_mask": inferred_condition_mask,
-                "return_attn_map": return_attn_map,
-                "attn_maps": {},
-                "reading_stats": {},
-            }
-        else:
-            self._conditioning_context = {}
+        if conditioning_state is None and encoder_hidden_states is None:
+            raise ValueError("SatelliteConditionedUNet requires sat_tokens or encoder_hidden_states")
 
         self.last_attn_maps = {}
-        self.last_reading_stats = {}
+        self.last_refinement_stats = {}
+        self.last_satellite_state = None
+        default_overall_up_factor = 2 ** self.num_upsamplers
+        forward_upsample_size = False
+        upsample_size = None
 
-        try:
-            output = super().forward(
-                sample=sample,
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                **kwargs,
-            )
-        except Exception:
-            self._conditioning_context = {}
-            raise
+        for dim in sample.shape[-2:]:
+            if dim % default_overall_up_factor != 0:
+                forward_upsample_size = True
+                break
 
-        if enable_reading:
-            self.last_attn_maps = self._conditioning_context.get("attn_maps", {})
-            self.last_reading_stats = self._conditioning_context.get("reading_stats", {})
+        if attention_mask is not None:
+            attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
+            attention_mask = attention_mask.unsqueeze(1)
 
-        # Keep the conditioning context alive after a successful forward so
-        # gradient checkpointing can re-run hooked submodules during backward
-        # with the same satellite inputs. The next forward overwrites it.
-        return output
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = (1 - encoder_attention_mask.to(sample.dtype)) * -10000.0
+            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
+        if self.config.center_input_sample:
+            sample = 2 * sample - 1.0
 
-class SatelliteConditionedSDPipeline(StableDiffusionPipeline):
-    """
-    Stable Diffusion pipeline with satellite condition support.
+        t_emb = self.get_time_embed(sample=sample, timestep=timestep)
+        emb = self.time_embedding(t_emb, timestep_cond)
 
-    Args:
-        satellite_encoder: Satellite condition encoder
-        **kwargs: Additional arguments for StableDiffusionPipeline
-    """
+        class_emb = self.get_class_embed(sample=sample, class_labels=class_labels)
+        if class_emb is not None:
+            if self.config.class_embeddings_concat:
+                emb = torch.cat([emb, class_emb], dim=-1)
+            else:
+                emb = emb + class_emb
 
-    def __init__(
-        self,
-        satellite_encoder: nn.Module,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-
-        self.satellite_encoder = satellite_encoder
-        self.satellite_encoder.eval()
-
-    def _encode_satellite_images(self, sat_images: torch.Tensor):
-        """Encode satellite images to embeddings."""
-        with torch.no_grad():
-            sat_emb = self.satellite_encoder(sat_images)
-        return sat_emb
-
-    def __call__(
-        self,
-        sat_images: torch.Tensor,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        negative_prompt: Optional[str] = None,
-        **kwargs,
-    ):
-        """
-        Generate frontview images from satellite images.
-
-        Args:
-            sat_images: (B, 3, H_sat, W_sat) or (3, H_sat, W_sat) - Satellite images
-            num_inference_steps: Number of diffusion steps
-            guidance_scale: Guidance scale for classifier-free guidance
-            negative_prompt: Negative prompt for guidance
-            **kwargs: Additional arguments
-
-        Returns:
-            output: StableDiffusionPipelineOutput
-        """
-        # Handle single image input
-        if sat_images.ndim == 3:
-            sat_images = sat_images.unsqueeze(0)
-
-        # Move to device
-        sat_images = sat_images.to(self.device)
-
-        # Encode satellite images
-        sat_emb = self._encode_satellite_images(sat_images)
-
-        # Encode negative prompt
-        negative_emb = None
-        if negative_prompt is not None:
-            negative_emb = self._encode_prompt(negative_prompt, sat_images.shape[0])
-
-        # Encode positive prompt (we use empty prompt for now)
-        positive_emb = self._encode_prompt("", sat_images.shape[0])
-
-        # Concatenate embeddings
-        encoder_hidden_states = torch.cat([positive_emb, sat_emb], dim=1)
-        if negative_emb is not None:
-            negative_emb = torch.cat([negative_emb, torch.zeros_like(sat_emb)], dim=1)
-
-        # Call super().__call__
-        return super().__call__(
-            prompt=None,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            negative_prompt=negative_prompt,
-            encoder_hidden_states=encoder_hidden_states,
-            negative_prompt_embeds=negative_emb,
-            **kwargs,
+        aug_encoder_hidden_states = (
+            conditioning_state.satellite.tokens if conditioning_state is not None else encoder_hidden_states
         )
+        aug_emb = self.get_aug_embed(
+            emb=emb,
+            encoder_hidden_states=aug_encoder_hidden_states,
+            added_cond_kwargs=added_cond_kwargs,
+        )
+        if self.config.addition_embed_type == "image_hint":
+            aug_emb, hint = aug_emb
+            sample = torch.cat([sample, hint], dim=1)
 
+        emb = emb + aug_emb if aug_emb is not None else emb
 
-def load_sd_model(
-    base_model: str = 'stabilityai/stable-diffusion-2-1',
-    freeze_base: bool = True,
-    use_satellite_reading: bool = True,
-    reading_injection_sites: Optional[List[str]] = None,
-    reading_block_config: Optional[Dict[str, Any]] = None,
-) -> SatelliteConditionedSDPipeline:
-    """
-    Load Stable Diffusion model with satellite conditioning support.
+        if self.time_embed_act is not None:
+            emb = self.time_embed_act(emb)
 
-    Args:
-        base_model: Base model name from Hugging Face hub
-        freeze_base: Whether to freeze base Stable Diffusion layers
+        if conditioning_state is None:
+            encoder_hidden_states = self.process_encoder_hidden_states(
+                encoder_hidden_states=encoder_hidden_states,
+                added_cond_kwargs=added_cond_kwargs,
+            )
 
-    Returns:
-        pipeline: Satellite-conditioned Stable Diffusion pipeline
-    """
-    # Load base model
-    pipeline = StableDiffusionPipeline.from_pretrained(base_model)
+        sample = self.conv_in(sample)
 
-    base_unet = pipeline.unet
+        if cross_attention_kwargs is not None and cross_attention_kwargs.get("gligen", None) is not None:
+            cross_attention_kwargs = cross_attention_kwargs.copy()
+            gligen_args = cross_attention_kwargs.pop("gligen")
+            cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
 
-    # Create satellite encoder (separate from UNet)
-    satellite_encoder = SatelliteConditionEncoder()
+        if cross_attention_kwargs is not None:
+            cross_attention_kwargs = cross_attention_kwargs.copy()
+            lora_scale = cross_attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
 
-    # Replace UNet with satellite-conditioned version
-    pipeline.unet = SatelliteConditionedUNet(
-        use_satellite_reading=use_satellite_reading,
-        reading_injection_sites=reading_injection_sites,
-        reading_block_config=reading_block_config,
-        **base_unet.config,
-    )
+        if USE_PEFT_BACKEND:
+            scale_lora_layers(self, lora_scale)
 
-    # Load weights from base model
-    pipeline.unet.load_state_dict(base_unet.state_dict(), strict=False)
+        is_controlnet = (
+            mid_block_additional_residual is not None
+            and down_block_additional_residuals is not None
+        )
+        is_adapter = down_intrablock_additional_residuals is not None
+        if not is_adapter and mid_block_additional_residual is None and down_block_additional_residuals is not None:
+            deprecate(
+                "T2I should not use down_block_additional_residuals",
+                "1.3.0",
+                "Passing intrablock residual connections with `down_block_additional_residuals` is deprecated "
+                "and will be removed in diffusers 1.3.0. `down_block_additional_residuals` should only be used "
+                "for ControlNet. Please make sure use `down_intrablock_additional_residuals` instead.",
+                standard_warn=False,
+            )
+            down_intrablock_additional_residuals = down_block_additional_residuals
+            is_adapter = True
 
-    if freeze_base:
-        # Freeze most layers of the base model
-        for param in pipeline.vae.parameters():
-            param.requires_grad = False
-        for param in pipeline.text_encoder.parameters():
-            param.requires_grad = False
-        for param in pipeline.unet.parameters():
-            param.requires_grad = False
+        down_block_res_samples = (sample,)
+        for index, downsample_block in enumerate(self.down_blocks):
+            if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+                additional_residuals = {}
+                if is_adapter and len(down_intrablock_additional_residuals) > 0:
+                    additional_residuals["additional_residuals"] = down_intrablock_additional_residuals.pop(0)
 
-        # Unfreeze top layers
-        for param in pipeline.unet.up_blocks[-1].parameters():
-            param.requires_grad = True
-        for param in pipeline.unet.mid_block.parameters():
-            param.requires_grad = True
+                current_encoder_hidden_states = self._current_encoder_hidden_states(
+                    conditioning_state,
+                    encoder_hidden_states,
+                    sample,
+                )
+                sample, res_samples = downsample_block(
+                    hidden_states=sample,
+                    temb=emb,
+                    encoder_hidden_states=current_encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    **additional_residuals,
+                )
+            else:
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+                if is_adapter and len(down_intrablock_additional_residuals) > 0:
+                    sample = sample + down_intrablock_additional_residuals.pop(0)
 
-    return SatelliteConditionedSDPipeline(
-        satellite_encoder=satellite_encoder,
-        vae=pipeline.vae,
-        text_encoder=pipeline.text_encoder,
-        tokenizer=pipeline.tokenizer,
-        unet=pipeline.unet,
-        scheduler=pipeline.scheduler,
-        safety_checker=pipeline.safety_checker,
-        feature_extractor=pipeline.feature_extractor,
-        image_encoder=None,
-        requires_safety_checker=pipeline.requires_safety_checker,
-    )
+            sample = self._run_refinement(f"down{index}", sample, conditioning_state)
+            down_block_res_samples += res_samples
+
+        if is_controlnet:
+            new_down_block_res_samples = ()
+            for down_block_res_sample, down_block_additional_residual in zip(
+                down_block_res_samples, down_block_additional_residuals
+            ):
+                new_down_block_res_samples = new_down_block_res_samples + (
+                    down_block_res_sample + down_block_additional_residual,
+                )
+            down_block_res_samples = new_down_block_res_samples
+
+        if self.mid_block is not None:
+            if hasattr(self.mid_block, "has_cross_attention") and self.mid_block.has_cross_attention:
+                current_encoder_hidden_states = self._current_encoder_hidden_states(
+                    conditioning_state,
+                    encoder_hidden_states,
+                    sample,
+                )
+                sample = self.mid_block(
+                    sample,
+                    emb,
+                    encoder_hidden_states=current_encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    encoder_attention_mask=encoder_attention_mask,
+                )
+            else:
+                sample = self.mid_block(sample, emb)
+
+            if (
+                is_adapter
+                and len(down_intrablock_additional_residuals) > 0
+                and sample.shape == down_intrablock_additional_residuals[0].shape
+            ):
+                sample = sample + down_intrablock_additional_residuals.pop(0)
+
+        sample = self._run_refinement("mid", sample, conditioning_state)
+
+        if is_controlnet:
+            sample = sample + mid_block_additional_residual
+
+        for index, upsample_block in enumerate(self.up_blocks):
+            is_final_block = index == len(self.up_blocks) - 1
+            res_samples = down_block_res_samples[-len(upsample_block.resnets):]
+            down_block_res_samples = down_block_res_samples[:-len(upsample_block.resnets)]
+
+            if not is_final_block and forward_upsample_size:
+                upsample_size = down_block_res_samples[-1].shape[2:]
+
+            if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+                current_encoder_hidden_states = self._current_encoder_hidden_states(
+                    conditioning_state,
+                    encoder_hidden_states,
+                    sample,
+                )
+                sample = upsample_block(
+                    hidden_states=sample,
+                    temb=emb,
+                    res_hidden_states_tuple=res_samples,
+                    encoder_hidden_states=current_encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    upsample_size=upsample_size,
+                    attention_mask=attention_mask,
+                    encoder_attention_mask=encoder_attention_mask,
+                )
+            else:
+                sample = upsample_block(
+                    hidden_states=sample,
+                    temb=emb,
+                    res_hidden_states_tuple=res_samples,
+                    upsample_size=upsample_size,
+                )
+
+            sample = self._run_refinement(f"up{index}", sample, conditioning_state)
+
+        if self.conv_norm_out:
+            sample = self.conv_norm_out(sample)
+            sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+
+        if USE_PEFT_BACKEND:
+            unscale_lora_layers(self, lora_scale)
+
+        if conditioning_state is not None:
+            self.last_attn_maps = conditioning_state.attn_maps
+            self.last_refinement_stats = conditioning_state.refinement_stats
+            self.last_satellite_state = conditioning_state.satellite
+
+        if not return_dict:
+            return (sample,)
+
+        return UNet2DConditionOutput(sample=sample)

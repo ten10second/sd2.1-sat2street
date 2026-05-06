@@ -26,11 +26,6 @@ from .homography import (
     extract_R_T_from_transform,
 )
 
-from .bev_to_camera_warp import (
-    warp_bev_to_camera,
-    warp_bev_to_camera_with_coords,
-)
-
 try:
     from .camera_to_sat_projection import (
         project_camera_to_satellite,
@@ -40,10 +35,6 @@ except ModuleNotFoundError:
 
 from .differentiable_projection import (
     differentiable_camera_to_sat_warp,
-)
-
-from .pose_loss import (
-    PoseLoss,
 )
 
 # New: camera-to-camera ground-plane warp for pseudo-GT
@@ -71,13 +62,8 @@ __all__ = [
     'compute_homography_ground_plane',
     'compute_homography_from_transform',
     'extract_R_T_from_transform',
-    # BEV to camera warp
-    'warp_bev_to_camera',
-    'warp_bev_to_camera_with_coords',
     # Camera to satellite projection
     'differentiable_camera_to_sat_warp',
-    # Pose loss
-    'PoseLoss',
     # Camera-to-camera ground-plane
     'camera_to_camera_groundplane_pull',
     'apply_yaw_rotation_to_pose',

@@ -303,15 +303,15 @@ def _coords_to_satellite_pixels(
     return points, bbox
 
 
-def _coords_map_to_satellite_pixels(
-    coords_map: Optional[torch.Tensor],
+def _front_bev_xy_to_satellite_pixels(
+    front_bev_xy: Optional[torch.Tensor],
     sat_width: int,
     sat_height: int,
 ) -> Tuple[List[Tuple[float, float]], Optional[Tuple[float, float, float, float]]]:
-    if coords_map is None or not torch.is_tensor(coords_map):
+    if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
         return [], None
 
-    coords = coords_map.detach().cpu().to(torch.float32)
+    coords = front_bev_xy.detach().cpu().to(torch.float32)
     if coords.ndim == 3 and coords.shape[0] == 2:
         coords = coords.permute(1, 2, 0).reshape(-1, 2)
     elif coords.ndim == 3 and coords.shape[-1] == 2:
@@ -324,15 +324,15 @@ def _coords_map_to_satellite_pixels(
     return _coords_to_satellite_pixels(coords, sat_width, sat_height)
 
 
-def _coords_map_to_fov_polygon(
-    coords_map: Optional[torch.Tensor],
+def _front_bev_xy_to_fov_polygon(
+    front_bev_xy: Optional[torch.Tensor],
     sat_width: int,
     sat_height: int,
 ) -> List[Tuple[float, float]]:
-    if coords_map is None or not torch.is_tensor(coords_map):
+    if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
         return []
 
-    coords = coords_map.detach().cpu().to(torch.float32)
+    coords = front_bev_xy.detach().cpu().to(torch.float32)
     if coords.ndim == 3 and coords.shape[0] == 2:
         coords_hw = coords.permute(1, 2, 0)
     elif coords.ndim == 3 and coords.shape[-1] == 2:
@@ -352,7 +352,7 @@ def _coords_map_to_fov_polygon(
     points, _ = _coords_to_satellite_pixels(boundary, sat_width, sat_height)
 
     if len(points) < 3:
-        all_points, bbox = _coords_map_to_satellite_pixels(coords_hw, sat_width, sat_height)
+        all_points, bbox = _front_bev_xy_to_satellite_pixels(coords_hw, sat_width, sat_height)
         if bbox is None:
             return []
         left_px, top_px, right_px, bottom_px = bbox
@@ -367,14 +367,14 @@ def _coords_map_to_fov_polygon(
 
 def _draw_satellite_coverage(
     sat_image: torch.Tensor,
-    coords_map: Optional[torch.Tensor],
+    front_bev_xy: Optional[torch.Tensor],
     view_name: str,
     yaw: Optional[float],
 ) -> Image.Image:
     image = _tensor_to_pil(sat_image).convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
     width, height = image.size
-    polygon = _coords_map_to_fov_polygon(coords_map, width, height)
+    polygon = _front_bev_xy_to_fov_polygon(front_bev_xy, width, height)
 
     # Ego vehicle is at the satellite crop center by construction.
     center = (width / 2.0, height / 2.0)
@@ -496,18 +496,18 @@ def _materialize_lazy_modules(
     device: str,
 ) -> None:
     sat_images = sample["sat"].unsqueeze(0).to(device)
-    coords_map = sample.get("coords_map")
-    coords_map = coords_map.unsqueeze(0).to(device) if coords_map is not None else None
+    front_bev_xy = sample.get("front_bev_xy")
+    front_bev_xy = front_bev_xy.unsqueeze(0).to(device) if front_bev_xy is not None else None
+    front_ground_valid_mask = sample.get("front_ground_valid_mask")
+    front_ground_valid_mask = (
+        front_ground_valid_mask.unsqueeze(0).to(device)
+        if front_ground_valid_mask is not None else None
+    )
     plucker_map = sample.get("plucker_map")
     plucker_map = plucker_map.unsqueeze(0).to(device) if plucker_map is not None else None
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
 
-    sat_encoded = model.encode_satellite(sat_images, coords_map)
-    if isinstance(sat_encoded, tuple):
-        sat_tokens, sat_xy = sat_encoded
-    else:
-        sat_tokens = sat_encoded
-        sat_xy = None
+    sat_state = model.encode_satellite(sat_images)
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -515,7 +515,7 @@ def _materialize_lazy_modules(
     latents = torch.randn(
         (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
         device=sat_images.device,
-        dtype=sat_tokens.dtype,
+        dtype=sat_state.tokens.dtype,
     )
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
 
@@ -523,10 +523,12 @@ def _materialize_lazy_modules(
         latents,
         timestep,
         encoder_hidden_states=None,
-        sat_tokens=sat_tokens,
-        sat_xy=sat_xy,
-        front_bev_xy=coords_map,
+        sat_tokens=sat_state.tokens,
+        sat_xy=sat_state.xy,
+        sat_bev_coords=sat_state.bev_coords,
+        front_bev_xy=front_bev_xy,
         front_plucker=plucker_map,
+        front_ground_valid_mask=front_ground_valid_mask,
         return_attn_map=False,
     )
 
@@ -542,7 +544,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        reading_block_config={"enable": True},
+        refinement_block_config={"enable": True},
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
@@ -554,7 +556,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     model.to(args.device)
     model.eval()
 
-    logger.info("Materializing lazy reading blocks before loading checkpoint")
+    logger.info("Materializing lazy refinement blocks before loading checkpoint")
     _materialize_lazy_modules(model, materialize_sample, args.device)
     checkpoint_meta = load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()
@@ -570,8 +572,13 @@ def _generate_one(
     plucker_condition_mode: str,
 ) -> torch.Tensor:
     sat_image = sample["sat"].unsqueeze(0).to(args.device)
-    coords_map = sample.get("coords_map")
-    coords_map = coords_map.unsqueeze(0).to(args.device) if coords_map is not None else None
+    front_bev_xy = sample.get("front_bev_xy")
+    front_bev_xy = front_bev_xy.unsqueeze(0).to(args.device) if front_bev_xy is not None else None
+    front_ground_valid_mask = sample.get("front_ground_valid_mask")
+    front_ground_valid_mask = (
+        front_ground_valid_mask.unsqueeze(0).to(args.device)
+        if front_ground_valid_mask is not None else None
+    )
     plucker_map = sample.get("plucker_map")
     plucker_map = plucker_map.unsqueeze(0).to(args.device) if plucker_map is not None else None
     if plucker_condition_mode == "zero" and plucker_map is not None:
@@ -586,8 +593,9 @@ def _generate_one(
 
     return model.generate(
         sat_image,
-        coords_map=coords_map,
+        front_bev_xy=front_bev_xy,
         plucker_map=plucker_map,
+        front_ground_valid_mask=front_ground_valid_mask,
         target_size=target_size,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
@@ -611,7 +619,7 @@ def _save_view_outputs(
     sat_resized = _resize_satellite_for_front(sample["sat"], int(gt_image.shape[-2]))
     sat_overlay = _draw_satellite_coverage(
         sample["sat"],
-        sample.get("coords_map"),
+        sample.get("front_bev_xy"),
         view_name,
         yaw,
     ).resize((sat_resized.shape[-1], sat_resized.shape[-2]), resample=Image.BILINEAR)

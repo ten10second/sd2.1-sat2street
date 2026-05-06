@@ -18,7 +18,7 @@ data:
 
 # 模型配置
 model:
-  base_model: 'stabilityai/stable-diffusion-2-1'
+  base_model: 'sd2-community/stable-diffusion-2-1-base'
   checkpoint_path: './checkpoints/last.ckpt'
 
   # 卫星图编码器配置
@@ -29,16 +29,8 @@ model:
     num_layers: 12
     num_heads: 12
 
-  # 坐标位置编码配置
-  coordinate_encoder:
-    name: 'relative_coordinate_encoder'
-    encode_type: 'fourier'
-    embed_dim: 256
-    fourier_scale: 10.0
-    num_frequencies: 10
-
-  # Satellite reading block (V1)
-  reading_block:
+  # Cross-view refinement block (bidirectional iterative)
+  refinement_block:
     enable: true
     injection_sites: ['mid', 'up0', 'up1']
     num_heads: 8
@@ -46,6 +38,9 @@ model:
     geo_ratio: 0.5
     rope_base: 10000.0
     lambda_geo: 1.0
+    lambda_geom: 1.0
+    geom_hidden_dim: 128
+    geom_head_dim: 16
     gate_hidden_ratio: 0.25
     use_geom_bias: true
     use_gated_residual: true

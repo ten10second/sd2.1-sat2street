@@ -6,9 +6,9 @@ Encodes satellite images with coordinate positional encoding for Stable Diffusio
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional
 
+from models.conditioning import SatelliteMemoryState
 from ..unet.relative_position_attention import RelativePositionAttention
 
 
@@ -157,22 +157,17 @@ class SatelliteConditionEncoder(nn.Module):
     def forward(
         self,
         sat_images: torch.Tensor,
-        coords_map: Optional[torch.Tensor] = None,
-        return_sat_xy: bool = False,
-    ):
+    ) -> SatelliteMemoryState:
         """
-        Encode satellite images.
+        Encode satellite images into the initial satellite memory state.
 
         Args:
             sat_images: (B, 3, H, W) - Satellite images
-            coords_map: (B, 2, H_cam, W_cam) - Optional, not used in this implementation
-                        Kept for backward compatibility
 
         Returns:
-            sat_emb: (B, N, embed_dim) - Encoded satellite features
-            sat_xy: (B, N, 2) - Optional normalized patch-center coordinates in [-1, 1]
+            Structured satellite memory with token features, normalized xy, and metric BEV coords.
         """
-        B, C, H, W = sat_images.shape
+        B, _, H, W = sat_images.shape
 
         # Step 1: Patch embedding
         patches = self.patch_embed(sat_images)  # (B, D, H/P, W/P)
@@ -197,8 +192,9 @@ class SatelliteConditionEncoder(nn.Module):
         # Step 6: Apply final layer norm
         x = self.norm(x)
 
-        if not return_sat_xy:
-            return x
-
         sat_xy = self._compute_patch_normalized_coords(B, H, W).to(sat_images.device)
-        return x, sat_xy
+        return SatelliteMemoryState(
+            tokens=x,
+            xy=sat_xy,
+            bev_coords=bev_coords,
+        )
