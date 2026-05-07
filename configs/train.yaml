@@ -9,7 +9,7 @@ gradient_checkpointing: true
 # 数据配置
 data:
   dataset: 'kitti360'
-  data_dir: '/media/zhimiao/Lenovo/KITTI-360'
+  data_dir: '/media/shizhm/Lenovo/KITTI-360'
   batch_size: 2
   num_workers: 8
   image_size: [256, 256]
@@ -77,7 +77,7 @@ training:
 # 保存配置
 checkpoint:
   save_dir: './checkpoints'
-  save_every: 10
+  save_every: 50
   max_checkpoints: 5
   resume_from: null
 
@@ -90,5 +90,5 @@ logging:
 
 # 验证配置
 validation:
-  validate_every: 5
-  num_validation_samples: 100
+  validate_every: 10
+  num_validation_samples: 4

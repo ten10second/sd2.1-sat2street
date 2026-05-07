@@ -1134,10 +1134,17 @@ class SDTrainer:
         """Run training."""
         start_epoch = 0
 
-        if resume_from is not None:
-            self._load_checkpoint(resume_from)
-
         try:
+            if resume_from is not None:
+                start_epoch = self._load_checkpoint(resume_from)
+            if start_epoch >= self.num_train_epochs:
+                logger.info(
+                    "Checkpoint already reached configured training horizon: "
+                    "start_epoch=%d num_train_epochs=%d",
+                    start_epoch,
+                    self.num_train_epochs,
+                )
+                return
             for epoch in range(start_epoch, self.num_train_epochs):
                 if self.is_main_process:
                     logger.info(f"Epoch {epoch + 1}/{self.num_train_epochs}")
@@ -1512,10 +1519,24 @@ class SDTrainer:
             step=self._global_step(epoch, max(0, len(self.train_dataloader) - 1)),
         )
 
-    def _load_checkpoint(self, checkpoint_path: str):
-        """Load from checkpoint."""
+    def _load_checkpoint(self, checkpoint_path: str) -> int:
+        """Load from checkpoint and return the next zero-based epoch index."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         load_model_state_dict(self.unwrapped_model, checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        logger.info(f"Checkpoint loaded: {checkpoint_path}")
+        checkpoint_epoch = checkpoint.get('epoch')
+        start_epoch = int(checkpoint_epoch) + 1 if checkpoint_epoch is not None else 0
+        if checkpoint_epoch is None:
+            logger.info(
+                "Checkpoint loaded: %s (no epoch metadata found; restarting epoch count from 1)",
+                checkpoint_path,
+            )
+        else:
+            logger.info(
+                "Checkpoint loaded: %s (resuming at epoch %d/%d)",
+                checkpoint_path,
+                start_epoch + 1,
+                self.num_train_epochs,
+            )
+        return start_epoch
