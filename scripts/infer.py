@@ -44,12 +44,10 @@ DEFAULT_HF_HOME = _project_root / ".hf-home"
 
 FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = (
     ("front", None),
-    ("yaw_m120", -120.0),
-    ("yaw_m90", -90.0),
-    ("yaw_m40", -40.0),
-    ("yaw_p40", 40.0),
-    ("yaw_p90", 90.0),
-    ("yaw_p120", 120.0),
+    ("left_forward_45", -45.0),
+    ("left_side", -90.0),
+    ("right_forward_45", 45.0),
+    ("right_side", 90.0),
 )
 
 ABLATION_MODE_CONFIGS: Dict[str, Tuple[str, str]] = {
@@ -131,6 +129,16 @@ def _parse_args() -> argparse.Namespace:
         default="single_yaw_sweep",
         choices=["single_yaw_sweep", "split_fixed_views"],
         help="Inference mode.",
+    )
+    parser.add_argument(
+        "--fixed_view_memory_mode",
+        type=str,
+        default="independent",
+        choices=["independent", "sequential"],
+        help=(
+            "For split_fixed_views, independent regenerates every view from the original satellite memory; "
+            "sequential carries the U-Net-updated satellite memory across views like grouped training."
+        ),
     )
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint.")
     parser.add_argument(
@@ -259,6 +267,18 @@ def _compose_panels(panels: Sequence[Tuple[str, torch.Tensor]]) -> Image.Image:
     for image in labeled:
         canvas.paste(image, (x_offset, 0))
         x_offset += image.width
+    return canvas
+
+
+def _stack_panel_rows(rows: Sequence[Image.Image], spacing: int = 8) -> Image.Image:
+    width = max(image.width for image in rows)
+    height = sum(image.height for image in rows) + spacing * max(0, len(rows) - 1)
+    canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+
+    y_offset = 0
+    for image in rows:
+        canvas.paste(image, (0, y_offset))
+        y_offset += image.height + spacing
     return canvas
 
 
@@ -604,6 +624,77 @@ def _generate_one(
     )[0].cpu()
 
 
+@torch.no_grad()
+def _prepare_view_tensors(
+    sample: Dict,
+    args: argparse.Namespace,
+    plucker_condition_mode: str,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Tuple[int, int]]:
+    sat_image = sample["sat"].unsqueeze(0).to(args.device)
+    front_bev_xy = sample.get("front_bev_xy")
+    front_bev_xy = front_bev_xy.unsqueeze(0).to(args.device) if front_bev_xy is not None else None
+    front_ground_valid_mask = sample.get("front_ground_valid_mask")
+    front_ground_valid_mask = (
+        front_ground_valid_mask.unsqueeze(0).to(args.device)
+        if front_ground_valid_mask is not None else None
+    )
+    plucker_map = sample.get("plucker_map")
+    plucker_map = plucker_map.unsqueeze(0).to(args.device) if plucker_map is not None else None
+    if plucker_condition_mode == "zero" and plucker_map is not None:
+        plucker_map = torch.zeros_like(plucker_map)
+    elif plucker_condition_mode != "normal":
+        raise ValueError(f"Unknown plucker_condition_mode: {plucker_condition_mode}")
+    target_size = tuple(int(x) for x in sample["image"].shape[-2:])
+    return sat_image, front_bev_xy, plucker_map, front_ground_valid_mask, target_size
+
+
+@torch.no_grad()
+def _generate_fixed_views_sequential(
+    model,
+    samples: Sequence[Dict],
+    args: argparse.Namespace,
+    sat_condition_mode: str,
+    plucker_condition_mode: str,
+) -> List[torch.Tensor]:
+    if not samples:
+        return []
+
+    sat_image, _, _, _, _ = _prepare_view_tensors(samples[0], args, plucker_condition_mode)
+    sat_state = model.encode_satellite(sat_image)
+    if sat_condition_mode == "zero":
+        sat_state = sat_state.replace(
+            tokens=torch.zeros_like(sat_state.tokens),
+            xy=torch.zeros_like(sat_state.xy),
+            bev_coords=(torch.zeros_like(sat_state.bev_coords) if sat_state.bev_coords is not None else None),
+        )
+    elif sat_condition_mode != "normal":
+        raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
+
+    generator_device = args.device if args.device.startswith("cuda") else "cpu"
+    generated_views: List[torch.Tensor] = []
+    for view_index, sample in enumerate(samples):
+        _, front_bev_xy, plucker_map, front_ground_valid_mask, target_size = _prepare_view_tensors(
+            sample,
+            args,
+            plucker_condition_mode,
+        )
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(int(args.seed) + view_index)
+        generated, sat_state = model.generate_with_satellite_state(
+            sat_state,
+            front_bev_xy=front_bev_xy,
+            plucker_map=plucker_map,
+            front_ground_valid_mask=front_ground_valid_mask,
+            target_size=target_size,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            generator=generator,
+            sat_condition_mode=sat_condition_mode,
+        )
+        generated_views.append(generated[0].cpu())
+    return generated_views
+
+
 def _save_view_outputs(
     sample: Dict,
     generated: torch.Tensor,
@@ -613,7 +704,7 @@ def _save_view_outputs(
     ablation_mode: Optional[str],
     sat_condition_mode: str,
     plucker_condition_mode: str,
-) -> None:
+) -> Image.Image:
     output_dir.mkdir(parents=True, exist_ok=True)
     gt_image = sample["image"]
     sat_resized = _resize_satellite_for_front(sample["sat"], int(gt_image.shape[-2]))
@@ -646,6 +737,7 @@ def _save_view_outputs(
     }
     with open(output_dir / "metadata.yaml", "w") as f:
         yaml.safe_dump(metadata, f, sort_keys=False)
+    return comparison
 
 
 def _resolve_single_dataset(args: argparse.Namespace) -> Tuple[Kitti360dDataset, int]:
@@ -693,6 +785,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
     for ablation_name, sat_mode, plucker_mode in ablation_runs:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_yaw_sweep"
+        summary_rows: List[Image.Image] = []
 
         for view_name, yaw in view_specs:
             logger.info(
@@ -704,7 +797,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
             )
             sample = _get_view_sample(dataset, sample_index, view_name, yaw)
             generated = _generate_one(model, sample, args, sat_mode, plucker_mode)
-            _save_view_outputs(
+            comparison = _save_view_outputs(
                 sample,
                 generated,
                 sample_dir / _view_token(view_name, yaw),
@@ -714,6 +807,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                 sat_mode,
                 plucker_mode,
             )
+            summary_rows.append(comparison)
 
         with open(sample_dir / "run_metadata.yaml", "w") as f:
             yaml.safe_dump(
@@ -729,6 +823,8 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                 f,
                 sort_keys=False,
             )
+        if summary_rows:
+            _stack_panel_rows(summary_rows).save(sample_dir / "summary.png")
         logger.info(f"Saved single-frame yaw sweep to: {sample_dir}")
 
 
@@ -756,24 +852,45 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
         for sample_index in progress:
             base_sample = dataset.samples[sample_index]
             frame_dir = active_output_root / base_sample.drive_dir.name / f"frame_{base_sample.frame_id:010d}"
-            for view_name, yaw in FIXED_VIEW_SPECS:
+            summary_rows: List[Image.Image] = []
+            view_samples = [
+                _get_view_sample(dataset, sample_index, view_name, yaw)
+                for view_name, yaw in FIXED_VIEW_SPECS
+            ]
+            if args.fixed_view_memory_mode == "sequential":
+                generated_views = _generate_fixed_views_sequential(
+                    model,
+                    view_samples,
+                    args,
+                    sat_mode,
+                    plucker_mode,
+                )
+            else:
+                generated_views = [
+                    _generate_one(model, sample, args, sat_mode, plucker_mode)
+                    for sample in view_samples
+                ]
+
+            for (view_name, yaw), sample, generated in zip(FIXED_VIEW_SPECS, view_samples, generated_views):
                 progress.set_postfix(
                     frame=f"{base_sample.frame_id:010d}",
                     view=view_name,
                     ablation=ablation_name or "custom",
+                    memory=args.fixed_view_memory_mode,
                 )
-                sample = _get_view_sample(dataset, sample_index, view_name, yaw)
-                generated = _generate_one(model, sample, args, sat_mode, plucker_mode)
-                _save_view_outputs(
+                comparison = _save_view_outputs(
                     sample,
                     generated,
-                    frame_dir / _view_token(view_name, yaw),
+                    frame_dir / view_name,
                     view_name,
                     yaw,
                     ablation_name,
                     sat_mode,
                     plucker_mode,
                 )
+                summary_rows.append(comparison)
+            if summary_rows:
+                _stack_panel_rows(summary_rows).save(frame_dir / "summary.png")
 
         with open(active_output_root / "run_metadata.yaml", "w") as f:
             yaml.safe_dump(
@@ -781,6 +898,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     "checkpoint": str(Path(args.checkpoint).resolve()),
                     "checkpoint_epoch": checkpoint_meta.get("epoch"),
                     "mode": args.mode,
+                    "fixed_view_memory_mode": args.fixed_view_memory_mode,
                     "dataset_split": args.dataset_split,
                     "split_yaml": str(Path(args.split_yaml)),
                     "start_frame": args.start_frame,

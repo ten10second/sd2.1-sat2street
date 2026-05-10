@@ -15,7 +15,11 @@ data:
   image_size: [256, 256]
   sat_size: 512
   resolution: 0.2
-  mode: 'front'
+  mode: 'fisheye_virtual'
+  yaw_mode: 'vehicle_relative'
+  view_set: 'fixed5'
+  vehicle_yaw_min_deg: 60.0
+  vehicle_yaw_max_deg: 120.0
   front_resize: [640, 256]
 
 # 模型配置

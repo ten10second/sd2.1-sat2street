@@ -161,6 +161,16 @@ def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
     return current
 
 
+def _config_bool(
+    current: bool,
+    cli_default: bool,
+    config_value: Any,
+) -> bool:
+    if current == cli_default and config_value is not None:
+        return bool(config_value)
+    return bool(current)
+
+
 def _resolve_output_dir(
     current: str,
     cli_default: str,
@@ -400,11 +410,76 @@ def main():
     args.base_model = str(
         _prefer_config(args.base_model, DEFAULT_SD21_BASE_REPO, _config_get(config, ("model", "base_model")))
     )
-    args.use_wandb = bool(_prefer_config(args.use_wandb, False, _config_get(config, ("logging", "use_wandb"))))
+    args.base_model_revision = _prefer_config(
+        args.base_model_revision,
+        None,
+        _config_get(config, ("model", "base_model_revision")),
+    )
+    args.cond_drop_prob = float(
+        _prefer_config(args.cond_drop_prob, 0.1, _config_get(config, ("training", "cond_drop_prob")))
+    )
+    args.init_checkpoint = _prefer_config(
+        args.init_checkpoint,
+        None,
+        _config_get(config, ("checkpoint", "init_checkpoint")),
+    )
+    args.use_wandb = _config_bool(args.use_wandb, False, _config_get(config, ("logging", "use_wandb")))
     args.wandb_project = str(
         _prefer_config(args.wandb_project, "kitti360_sd", _config_get(config, ("logging", "project_name")))
     )
+    args.wandb_run_name = _prefer_config(args.wandb_run_name, None, _config_get(config, ("logging", "run_name")))
+    args.wandb_entity = _prefer_config(args.wandb_entity, None, _config_get(config, ("logging", "entity")))
+    args.wandb_mode = str(_prefer_config(args.wandb_mode, "online", _config_get(config, ("logging", "wandb_mode"))))
+    args.use_tensorboard = _config_bool(
+        args.use_tensorboard,
+        True,
+        _config_get(config, ("logging", "use_tensorboard")),
+    )
+    args.tensorboard_log_dir = _prefer_config(
+        args.tensorboard_log_dir,
+        None,
+        _config_get(config, ("logging", "tensorboard_log_dir")),
+    )
     args.dataset_mode = str(_prefer_config(args.dataset_mode, "front", _config_get(config, ("data", "mode"))))
+    args.yaw_mode = str(_prefer_config(args.yaw_mode, "fisheye_relative", _config_get(config, ("data", "yaw_mode"))))
+    args.view_set = str(_prefer_config(args.view_set, "single", _config_get(config, ("data", "view_set"))))
+    args.vehicle_yaw_min_deg = float(
+        _prefer_config(
+            args.vehicle_yaw_min_deg,
+            60.0,
+            _config_get(config, ("data", "vehicle_yaw_min_deg")),
+        )
+    )
+    args.vehicle_yaw_max_deg = float(
+        _prefer_config(
+            args.vehicle_yaw_max_deg,
+            120.0,
+            _config_get(config, ("data", "vehicle_yaw_max_deg")),
+        )
+    )
+    args.guidance_scale = float(
+        _prefer_config(args.guidance_scale, 3.0, _config_get(config, ("validation", "guidance_scale")))
+    )
+    args.visualize_every = int(
+        _prefer_config(args.visualize_every, 10, _config_get(config, ("validation", "visualize_every")))
+    )
+    args.num_visualizations = int(
+        _prefer_config(
+            args.num_visualizations,
+            4,
+            _config_get(config, ("validation", "num_validation_samples")),
+        )
+    )
+    args.visualization_inference_steps = int(
+        _prefer_config(
+            args.visualization_inference_steps,
+            20,
+            _config_get(config, ("validation", "visualization_inference_steps")),
+        )
+    )
+    args.visualization_seed = int(
+        _prefer_config(args.visualization_seed, 42, _config_get(config, ("validation", "visualization_seed")))
+    )
 
     freeze_base = bool(_config_get(config, ("model", "freeze_base"), True))
     gradient_checkpointing = bool(_config_get(config, ("gradient_checkpointing",), True))
