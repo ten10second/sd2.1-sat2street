@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
+DEFAULT_CAMERA_CONTROL_CONFIG = {
+    "enable": True,
+    "mode": "plucker_tokens",
+    "patch_size": 16,
+    "zero_init": True,
+    "token_scale": 0.1,
+}
 
 
 def _load_frame_ids(frames_file: Path) -> List[int]:
@@ -139,6 +146,25 @@ def _parse_args() -> argparse.Namespace:
         "--base_model_revision", type=str, default=None,
         help="Optional model revision/branch, e.g. fp16",
     )
+    parser.add_argument(
+        "--disable_refinement",
+        action="store_true",
+        help="Instantiate the model without cross-view refinement blocks.",
+    )
+    camera_group = parser.add_mutually_exclusive_group()
+    camera_group.add_argument(
+        "--camera_control_enable",
+        dest="camera_control_enable",
+        action="store_true",
+        help="Enable Plucker camera projector control.",
+    )
+    camera_group.add_argument(
+        "--camera_control_disable",
+        dest="camera_control_enable",
+        action="store_false",
+        help="Disable Plucker camera projector control.",
+    )
+    parser.set_defaults(camera_control_enable=False)
     parser.add_argument(
         "--output_dir", type=str, default="output/multiseed_visualizations",
         help="Directory to save outputs",
@@ -306,6 +332,7 @@ def _materialize_lazy_modules(
     model,
     sat_images: torch.Tensor,
     front_bev_xy: Optional[torch.Tensor],
+    plucker_map: Optional[torch.Tensor],
     front_ground_valid_mask: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
@@ -329,6 +356,7 @@ def _materialize_lazy_modules(
         sat_xy=sat_state.xy,
         sat_bev_coords=sat_state.bev_coords,
         front_bev_xy=front_bev_xy,
+        front_plucker=plucker_map,
         front_ground_valid_mask=front_ground_valid_mask,
         return_attn_map=False,
     )
@@ -377,7 +405,8 @@ def main() -> None:
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        refinement_block_config={"enable": True},
+        refinement_block_config={"enable": not bool(args.disable_refinement)},
+        camera_control_config=dict(DEFAULT_CAMERA_CONTROL_CONFIG) if args.camera_control_enable else {},
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
@@ -389,8 +418,8 @@ def main() -> None:
     model.to(args.device)
     model.eval()
 
-    logger.info("Materializing lazy refinement blocks before loading checkpoint")
-    _materialize_lazy_modules(model, sat_image, front_bev_xy, front_ground_valid_mask, target_size)
+    logger.info("Materializing lazy condition modules before loading checkpoint")
+    _materialize_lazy_modules(model, sat_image, front_bev_xy, plucker_map, front_ground_valid_mask, target_size)
 
     checkpoint_meta = load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()

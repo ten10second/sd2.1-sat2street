@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -49,6 +49,14 @@ FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = (
     ("right_forward_45", 45.0),
     ("right_side", 90.0),
 )
+
+DEFAULT_CAMERA_CONTROL_CONFIG: Dict[str, Any] = {
+    "enable": True,
+    "mode": "plucker_tokens",
+    "patch_size": 16,
+    "zero_init": True,
+    "token_scale": 0.1,
+}
 
 ABLATION_MODE_CONFIGS: Dict[str, Tuple[str, str]] = {
     "normal": ("normal", "normal"),
@@ -124,6 +132,12 @@ def _parse_args() -> argparse.Namespace:
         description="Inference for satellite-to-street generation"
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional inference YAML. model.refinement_block and model.camera_control are used for model construction.",
+    )
+    parser.add_argument(
         "--mode",
         type=str,
         default="single_yaw_sweep",
@@ -131,16 +145,27 @@ def _parse_args() -> argparse.Namespace:
         help="Inference mode.",
     )
     parser.add_argument(
-        "--fixed_view_memory_mode",
+        "--view_memory_mode",
         type=str,
-        default="independent",
+        default=None,
         choices=["independent", "sequential"],
         help=(
-            "For split_fixed_views, independent regenerates every view from the original satellite memory; "
-            "sequential carries the U-Net-updated satellite memory across views like grouped training."
+            "How multi-view inference carries satellite memory. "
+            "sequential bootstraps from the first view and carries the U-Net-updated memory forward; "
+            "independent regenerates every view from the original satellite memory. "
+            "Defaults to sequential for single_yaw_sweep and independent for split_fixed_views."
         ),
     )
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint.")
+    parser.add_argument(
+        "--fixed_view_memory_mode",
+        type=str,
+        default=None,
+        choices=["independent", "sequential"],
+        help=(
+            "Deprecated alias for --view_memory_mode when using split_fixed_views."
+        ),
+    )
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained checkpoint.")
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -176,6 +201,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--base_model", type=str, default=DEFAULT_SD21_BASE_REPO)
     parser.add_argument("--base_model_revision", type=str, default=None)
+    parser.add_argument(
+        "--disable_refinement",
+        action="store_true",
+        help="Instantiate the model without cross-view refinement blocks.",
+    )
+    camera_group = parser.add_mutually_exclusive_group()
+    camera_group.add_argument(
+        "--camera_control_enable",
+        dest="camera_control_enable",
+        action="store_true",
+        help="Enable Plucker camera projector control.",
+    )
+    camera_group.add_argument(
+        "--camera_control_disable",
+        dest="camera_control_enable",
+        action="store_false",
+        help="Disable Plucker camera projector control.",
+    )
+    parser.set_defaults(camera_control_enable=None)
     parser.add_argument("--hf_endpoint", type=str, default=DEFAULT_HF_ENDPOINT)
     parser.add_argument("--hf_home", type=str, default=str(DEFAULT_HF_HOME))
     parser.add_argument(
@@ -204,7 +248,91 @@ def _parse_args() -> argparse.Namespace:
             "and writes each ablation under a separate output subdirectory."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    config = _load_runtime_config(Path(args.config)) if args.config is not None else {}
+    _apply_config_defaults(args, config)
+    return args
+
+
+def _load_runtime_config(config_path: Path) -> Dict[str, Any]:
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Config file must contain a mapping at the top level: {config_path}")
+    return config
+
+
+def _config_get(config: Dict[str, Any], path: Tuple[str, ...], default: Any = None) -> Any:
+    node: Any = config
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return default
+        node = node[key]
+    return default if node is None else node
+
+
+def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
+    if current == cli_default and config_value is not None:
+        return config_value
+    return current
+
+
+def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> None:
+    if not config:
+        args.refinement_block_config = {"enable": not bool(args.disable_refinement)}
+        args.camera_control_config = dict(DEFAULT_CAMERA_CONTROL_CONFIG) if args.camera_control_enable else {}
+        _resolve_view_memory_mode(args)
+        return
+
+    args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
+    args.device = str(_prefer_config(args.device, "cuda", _config_get(config, ("device",))))
+    args.data_dir = str(
+        _prefer_config(
+            args.data_dir,
+            "/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
+            _config_get(config, ("data", "data_dir")),
+        )
+    )
+    args.base_model = str(
+        _prefer_config(args.base_model, DEFAULT_SD21_BASE_REPO, _config_get(config, ("model", "base_model")))
+    )
+    args.base_model_revision = _prefer_config(
+        args.base_model_revision,
+        None,
+        _config_get(config, ("model", "base_model_revision")),
+    )
+    checkpoint_path = _prefer_config(args.checkpoint, None, _config_get(config, ("model", "checkpoint_path")))
+    args.checkpoint = None if checkpoint_path is None else str(checkpoint_path)
+    args.num_inference_steps = int(
+        _prefer_config(args.num_inference_steps, 30, _config_get(config, ("inference", "num_inference_steps")))
+    )
+    args.guidance_scale = float(
+        _prefer_config(args.guidance_scale, 1.0, _config_get(config, ("inference", "guidance_scale")))
+    )
+    args.output_dir = str(_prefer_config(args.output_dir, "./inference_results", _config_get(config, ("output", "output_dir"))))
+
+    refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
+    if args.disable_refinement:
+        refinement_block_config["enable"] = False
+    args.refinement_block_config = refinement_block_config or {"enable": not bool(args.disable_refinement)}
+
+    camera_control_config = dict(_config_get(config, ("model", "camera_control"), {}) or {})
+    if args.camera_control_enable is not None:
+        camera_control_config["enable"] = bool(args.camera_control_enable)
+    args.camera_control_config = camera_control_config
+    _resolve_view_memory_mode(args)
+
+
+def _resolve_view_memory_mode(args: argparse.Namespace) -> None:
+    if args.view_memory_mode is None and args.fixed_view_memory_mode is not None:
+        args.view_memory_mode = args.fixed_view_memory_mode
+    if args.view_memory_mode is None:
+        args.view_memory_mode = "sequential" if args.mode == "single_yaw_sweep" else "independent"
+    args.fixed_view_memory_mode = args.view_memory_mode
 
 
 def _training_range_yaws(min_abs: float, max_abs: float) -> List[float]:
@@ -560,11 +688,21 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     elif args.device.startswith("cuda") and args.mixed_precision == "bf16":
         model_torch_dtype = torch.bfloat16
 
+    refinement_block_config = dict(getattr(args, "refinement_block_config", {}) or {})
+    refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
+    camera_control_config = dict(getattr(args, "camera_control_config", {}) or {})
+
     logger.info("Loading model")
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        refinement_block_config={"enable": True},
+        refinement_block_config=refinement_block_config,
+        refinement_injection_sites=(
+            tuple(refinement_injection_sites)
+            if refinement_injection_sites is not None
+            else None
+        ),
+        camera_control_config=camera_control_config,
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
@@ -576,8 +714,10 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     model.to(args.device)
     model.eval()
 
-    logger.info("Materializing lazy refinement blocks before loading checkpoint")
+    logger.info("Materializing lazy condition modules before loading checkpoint")
     _materialize_lazy_modules(model, materialize_sample, args.device)
+    if args.checkpoint is None:
+        raise ValueError("Pass --checkpoint or set model.checkpoint_path in --config")
     checkpoint_meta = load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()
     return model, checkpoint_meta
@@ -786,17 +926,33 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_yaw_sweep"
         summary_rows: List[Image.Image] = []
+        view_samples = [
+            _get_view_sample(dataset, sample_index, view_name, yaw)
+            for view_name, yaw in view_specs
+        ]
+        if args.view_memory_mode == "sequential":
+            generated_views = _generate_fixed_views_sequential(
+                model,
+                view_samples,
+                args,
+                sat_mode,
+                plucker_mode,
+            )
+        else:
+            generated_views = [
+                _generate_one(model, sample, args, sat_mode, plucker_mode)
+                for sample in view_samples
+            ]
 
-        for view_name, yaw in view_specs:
+        for (view_name, yaw), sample, generated in zip(view_specs, view_samples, generated_views):
             logger.info(
-                "Generating frame=%s, view=%s, yaw=%s, ablation=%s",
+                "Saving frame=%s, view=%s, yaw=%s, ablation=%s, memory=%s",
                 f"{base_sample.frame_id:010d}",
                 view_name,
                 yaw,
                 ablation_name or "custom",
+                args.view_memory_mode,
             )
-            sample = _get_view_sample(dataset, sample_index, view_name, yaw)
-            generated = _generate_one(model, sample, args, sat_mode, plucker_mode)
             comparison = _save_view_outputs(
                 sample,
                 generated,
@@ -815,6 +971,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                     "checkpoint": str(Path(args.checkpoint).resolve()),
                     "checkpoint_epoch": checkpoint_meta.get("epoch"),
                     "mode": args.mode,
+                    "view_memory_mode": args.view_memory_mode,
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
                     "plucker_condition_mode": plucker_mode,
@@ -898,6 +1055,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     "checkpoint": str(Path(args.checkpoint).resolve()),
                     "checkpoint_epoch": checkpoint_meta.get("epoch"),
                     "mode": args.mode,
+                    "view_memory_mode": args.view_memory_mode,
                     "fixed_view_memory_mode": args.fixed_view_memory_mode,
                     "dataset_split": args.dataset_split,
                     "split_yaml": str(Path(args.split_yaml)),
@@ -921,6 +1079,8 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.checkpoint is None:
+        raise ValueError("Pass --checkpoint or set model.checkpoint_path in --config")
     os.environ["HF_ENDPOINT"] = args.hf_endpoint
     os.environ["HF_HOME"] = args.hf_home
     logger.info(f"HF_ENDPOINT={os.environ['HF_ENDPOINT']}")

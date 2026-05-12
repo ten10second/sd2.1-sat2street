@@ -37,11 +37,14 @@ class CrossViewRefinementBlock(nn.Module):
         geom_head_dim: int = 16,
         gate_hidden_ratio: float = 0.25,
         use_geom_bias: bool = True,
+        street_to_sat_use_plucker_geom: bool = False,
         use_gated_residual: bool = True,
         sat_self_attn_dropout: float = 0.1,
+        enable_front_refinement: bool = True,
     ):
         super().__init__()
         self.model_dim = num_heads * head_dim
+        self.enable_front_refinement = bool(enable_front_refinement)
 
         self.street_to_sat = StreetToSatelliteAttention(
             sat_in_dim=sat_in_dim,
@@ -55,6 +58,7 @@ class CrossViewRefinementBlock(nn.Module):
             geom_hidden_dim=geom_hidden_dim,
             geom_head_dim=geom_head_dim,
             use_geom_bias=use_geom_bias,
+            use_plucker_geom=street_to_sat_use_plucker_geom,
         )
         self.sat_self_refine = RelativePositionAttention(
             embed_dim=sat_in_dim,
@@ -62,25 +66,29 @@ class CrossViewRefinementBlock(nn.Module):
             dropout=sat_self_attn_dropout,
             use_relative_pos=True,
         )
-        self.sat_to_street = SatelliteReadingAttention(
-            sat_in_dim=sat_in_dim,
-            front_in_dim=front_dim,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            geo_ratio=geo_ratio,
-            rope_base=rope_base,
-            lambda_geo=lambda_geo,
-            lambda_geom=lambda_geom,
-            geom_hidden_dim=geom_hidden_dim,
-            geom_head_dim=geom_head_dim,
-            use_geom_bias=use_geom_bias,
-        )
-        self.inject = GatedResidualInject(
-            front_dim=front_dim,
-            read_dim=self.model_dim,
-            gate_hidden_ratio=gate_hidden_ratio,
-            use_gated_residual=use_gated_residual,
-        )
+        if self.enable_front_refinement:
+            self.sat_to_street = SatelliteReadingAttention(
+                sat_in_dim=sat_in_dim,
+                front_in_dim=front_dim,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                geo_ratio=geo_ratio,
+                rope_base=rope_base,
+                lambda_geo=lambda_geo,
+                lambda_geom=lambda_geom,
+                geom_hidden_dim=geom_hidden_dim,
+                geom_head_dim=geom_head_dim,
+                use_geom_bias=use_geom_bias,
+            )
+            self.inject = GatedResidualInject(
+                front_dim=front_dim,
+                read_dim=self.model_dim,
+                gate_hidden_ratio=gate_hidden_ratio,
+                use_gated_residual=use_gated_residual,
+            )
+        else:
+            self.sat_to_street = None
+            self.inject = None
 
     def forward(
         self,
@@ -118,23 +126,28 @@ class CrossViewRefinementBlock(nn.Module):
         )
         updated_satellite_state = satellite_state.replace(tokens=sat_tokens_refined)
 
-        read_tokens, sat_to_street_attn, read_stats = self.sat_to_street(
-            front_feat=front_feat,
-            front_bev_xy=front_bev_xy,
-            sat_tokens=updated_satellite_state.tokens,
-            sat_xy=updated_satellite_state.xy,
-            front_plucker=front_plucker,
-            front_ground_valid_mask=front_ground_valid_mask,
-            return_attn_map=return_attn_map,
-        )
-        front_feat_out, read_feat, gate = self.inject(front_feat, read_tokens)
-
         stats = dict(update_stats)
-        for key, value in read_stats.items():
-            if key not in stats:
-                stats[key] = value
-            else:
-                stats[f"read_{key}"] = value
+        if self.enable_front_refinement:
+            read_tokens, sat_to_street_attn, read_stats = self.sat_to_street(
+                front_feat=front_feat,
+                front_bev_xy=front_bev_xy,
+                sat_tokens=updated_satellite_state.tokens,
+                sat_xy=updated_satellite_state.xy,
+                front_plucker=front_plucker,
+                front_ground_valid_mask=front_ground_valid_mask,
+                return_attn_map=return_attn_map,
+            )
+            front_feat_out, read_feat, gate = self.inject(front_feat, read_tokens)
+            for key, value in read_stats.items():
+                if key not in stats:
+                    stats[key] = value
+                else:
+                    stats[f"read_{key}"] = value
+        else:
+            sat_to_street_attn = None
+            front_feat_out = front_feat
+            read_feat = None
+            gate = None
 
         attn_maps = None
         if return_attn_map:

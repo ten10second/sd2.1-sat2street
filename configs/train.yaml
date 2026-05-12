@@ -59,17 +59,34 @@ model:
     geom_head_dim: 16
     gate_hidden_ratio: 0.25
     use_geom_bias: true
+    # V1-clean keeps front_bev_xy/valid_mask as the memory-write router.
+    # Plucker is reserved for the main camera-token branch by default.
+    street_to_sat_use_plucker_geom: false
     use_gated_residual: true
+    # Keep sequential street->sat memory update, but do not inject the
+    # geometry-refined satellite read back into current front-view features.
+    enable_front_refinement: false
+
+  # Explicit camera/view control. This is the V1-clean main pose branch:
+  # Plucker rays are patchified into spatial tokens and appended to sat tokens.
+  camera_control:
+    enable: true
+    mode: 'plucker_tokens'
+    patch_size: 16
+    zero_init: true
+    # Keep the new camera-token branch conservative at startup; Plucker still
+    # reaches every UNet cross-attention layer, just at a safer scale.
+    token_scale: 0.1
 
 # 训练配置
 training:
   epochs: 100
   warmup_epochs: 5
-  learning_rate: 1e-4
+  learning_rate: 2e-5
   weight_decay: 1e-4
   scheduler: 'cosine'
   gradient_accumulation_steps: 4
-  gradient_clip_val: 1.0
+  gradient_clip_val: 0.5
 
   # Loss 配置
   loss:

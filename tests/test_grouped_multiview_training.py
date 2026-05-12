@@ -7,7 +7,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from models.conditioning import SatelliteMemoryState
+from models.sd_model import PluckerCameraTokenProjector, SatelliteConditionedUNet
 from models.sd_trainer import SDTrainer, SatelliteConditionedSDModel
+from models.unet.street_to_satellite_attention import StreetToSatelliteAttention
 
 
 class _DummyLatentDistribution:
@@ -142,6 +144,70 @@ class _ResumeTestModel(_TestSatelliteConditionedSDModel):
         }
 
 
+class _NonFiniteLossModel(_ResumeTestModel):
+    def forward_view_with_satellite_state(
+        self,
+        sat_state: SatelliteMemoryState,
+        target_images: torch.Tensor,
+        front_bev_xy: torch.Tensor = None,
+        plucker_map: torch.Tensor = None,
+        front_ground_valid_mask: torch.Tensor = None,
+        condition_mask: torch.Tensor = None,
+    ):
+        del sat_state, target_images, front_bev_xy, plucker_map, front_ground_valid_mask, condition_mask
+        finite_anchor = self.trainable_weight * 0.0
+        return {
+            "loss": finite_anchor + torch.tensor(float("nan"), device=finite_anchor.device),
+            "sat_state": self.encode_satellite(torch.zeros((1, 3, 8, 8), dtype=finite_anchor.dtype, device=finite_anchor.device)),
+            "refinement_stats": {},
+            "refinement_stats_by_site": {},
+        }
+
+
+class _VisualizationSequentialModel(_TestSatelliteConditionedSDModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.generate_sat_token_means = []
+        self.dummy_trainable = nn.Parameter(torch.tensor(0.0))
+
+    def generate_with_satellite_state(
+        self,
+        sat_state: SatelliteMemoryState,
+        front_bev_xy: torch.Tensor = None,
+        plucker_map: torch.Tensor = None,
+        front_ground_valid_mask: torch.Tensor = None,
+        target_size=None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        generator=None,
+        sat_condition_mode: str = "normal",
+    ):
+        del plucker_map, front_ground_valid_mask, num_inference_steps, guidance_scale, generator, sat_condition_mode
+        self.generate_sat_token_means.append(float(sat_state.tokens.mean().item()))
+        batch_size = sat_state.tokens.shape[0]
+        height, width = target_size
+        generated = torch.full(
+            (batch_size, 3, height, width),
+            fill_value=float(len(self.generate_sat_token_means)),
+            dtype=sat_state.tokens.dtype,
+            device=sat_state.tokens.device,
+        )
+        view_signal = front_bev_xy.mean(dim=(1, 2, 3), keepdim=True).to(sat_state.tokens.dtype)
+        updated_state = sat_state.replace(tokens=sat_state.tokens + view_signal)
+        return generated, updated_state
+
+
+class _CameraTokenHarness(nn.Module):
+    _get_camera_plucker = SatelliteConditionedUNet._get_camera_plucker
+    _camera_tokens = SatelliteConditionedUNet._camera_tokens
+
+    def __init__(self, projector: nn.Module, token_scale: float) -> None:
+        super().__init__()
+        self.enable_camera_control = True
+        self.camera_projector = projector
+        self.camera_token_scale = token_scale
+
+
 class GroupedMultiViewTrainingTest(unittest.TestCase):
     def test_grouped_forward_reuses_updated_satellite_state(self) -> None:
         torch.manual_seed(0)
@@ -217,6 +283,133 @@ class GroupedMultiViewTrainingTest(unittest.TestCase):
             trainer.train(resume_from=checkpoint_path)
 
             self.assertEqual(observed_epochs, [3, 4])
+
+    def test_street_to_sat_plucker_geometry_can_be_disabled(self) -> None:
+        torch.manual_seed(0)
+        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
+        front_bev_xy = torch.tensor(
+            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
+            dtype=torch.float32,
+        )
+        sat_tokens = torch.randn((1, 3, 6), dtype=torch.float32)
+        sat_xy = torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32)
+        zero_plucker = torch.zeros((1, 4, 6), dtype=torch.float32)
+        shifted_plucker = torch.randn((1, 4, 6), dtype=torch.float32) * 10.0
+
+        disabled = StreetToSatelliteAttention(
+            sat_in_dim=6,
+            front_in_dim=4,
+            num_heads=2,
+            head_dim=8,
+            geom_head_dim=2,
+            use_plucker_geom=False,
+        )
+        disabled.eval()
+        with torch.no_grad():
+            disabled_zero, _, _ = disabled(front_feat, front_bev_xy, sat_tokens, sat_xy, zero_plucker)
+            disabled_shifted, _, _ = disabled(front_feat, front_bev_xy, sat_tokens, sat_xy, shifted_plucker)
+        self.assertTrue(torch.allclose(disabled_zero, disabled_shifted, atol=1e-6))
+
+        enabled = StreetToSatelliteAttention(
+            sat_in_dim=6,
+            front_in_dim=4,
+            num_heads=2,
+            head_dim=8,
+            geom_head_dim=2,
+            use_plucker_geom=True,
+        )
+        enabled.load_state_dict(disabled.state_dict())
+        enabled.eval()
+        with torch.no_grad():
+            enabled_zero, _, _ = enabled(front_feat, front_bev_xy, sat_tokens, sat_xy, zero_plucker)
+            enabled_shifted, _, _ = enabled(front_feat, front_bev_xy, sat_tokens, sat_xy, shifted_plucker)
+        self.assertFalse(torch.allclose(enabled_zero, enabled_shifted, atol=1e-6))
+
+    def test_camera_token_scale_is_applied(self) -> None:
+        torch.manual_seed(0)
+        projector = PluckerCameraTokenProjector(token_dim=4, patch_size=2, zero_init=False)
+        unet = _CameraTokenHarness(projector=projector, token_scale=0.25)
+
+        plucker_map = torch.randn((1, 6, 4, 4), dtype=torch.float32)
+        reference = torch.zeros((1, 2, 4), dtype=torch.float32)
+
+        expected = projector(plucker_map) * 0.25
+        actual = unet._camera_tokens(plucker_map, reference, condition_mask=None)
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
+    def test_nonfinite_loss_skips_optimizer_update(self) -> None:
+        model = _NonFiniteLossModel()
+        dataloader = DataLoader(_SingleSampleDataset(), batch_size=1, shuffle=False)
+
+        with TemporaryDirectory() as tmpdir:
+            trainer = SDTrainer(
+                model=model,
+                train_dataloader=dataloader,
+                val_dataloader=None,
+                num_train_epochs=1,
+                output_dir=tmpdir,
+                save_every=10,
+                log_every=1,
+                device="cpu",
+                use_wandb=False,
+                use_tensorboard=False,
+                mixed_precision=None,
+                visualize_every=0,
+            )
+
+            before = model.trainable_weight.detach().clone()
+            epoch_loss = trainer._train_epoch(0)
+
+            self.assertEqual(epoch_loss, 0.0)
+            self.assertTrue(torch.allclose(model.trainable_weight.detach(), before))
+            self.assertEqual(trainer.optimizer.state_dict()["state"], {})
+
+    def test_visualization_generation_reuses_updated_satellite_state(self) -> None:
+        model = _VisualizationSequentialModel()
+
+        class _GroupedVisualizationDataset(Dataset):
+            def __len__(self) -> int:
+                return 1
+
+            def __getitem__(self, idx: int):
+                del idx
+                front_bev_xy = torch.zeros((2, 2, 8, 8), dtype=torch.float32)
+                front_bev_xy[0] = 1.0
+                front_bev_xy[1] = 2.0
+                return {
+                    "sat": torch.zeros((3, 8, 8), dtype=torch.float32),
+                    "image": torch.zeros((2, 3, 8, 8), dtype=torch.float32),
+                    "front_bev_xy": front_bev_xy,
+                    "front_ground_valid_mask": torch.ones((2, 1, 8, 8), dtype=torch.float32),
+                    "plucker_map": torch.zeros((2, 6, 8, 8), dtype=torch.float32),
+                    "frame_id": torch.tensor(7),
+                    "view_names": ["front", "left_side"],
+                }
+
+        dataloader = DataLoader(_GroupedVisualizationDataset(), batch_size=1, shuffle=False)
+
+        with TemporaryDirectory() as tmpdir:
+            trainer = SDTrainer(
+                model=model,
+                train_dataloader=dataloader,
+                val_dataloader=dataloader,
+                num_train_epochs=1,
+                output_dir=tmpdir,
+                save_every=10,
+                log_every=10,
+                device="cpu",
+                use_wandb=False,
+                use_tensorboard=False,
+                mixed_precision=None,
+                visualize_every=1,
+                num_visualizations=1,
+                visualization_inference_steps=1,
+            )
+
+            trainer._save_visualizations(epoch=0)
+
+            self.assertEqual(model.generate_sat_token_means, [0.0, 1.0])
+            self.assertTrue((trainer.visualization_dir / "epoch_0001" / "sample_00_frame_0000000007.png").is_file())
 
 
 if __name__ == "__main__":

@@ -43,8 +43,20 @@ model:
     geom_head_dim: 16
     gate_hidden_ratio: 0.25
     use_geom_bias: true
+    # Match V1-clean training: keep BEV xy routing for memory writes, and
+    # leave Plucker view control to the main spatial camera-token branch.
+    street_to_sat_use_plucker_geom: false
     use_gated_residual: true
+    enable_front_refinement: false
     return_attn_map: false
+
+  # Explicit camera/view control. Must match V1-clean training checkpoints.
+  camera_control:
+    enable: true
+    mode: 'plucker_tokens'
+    patch_size: 16
+    zero_init: true
+    token_scale: 0.1
 
 # 推理配置
 inference:

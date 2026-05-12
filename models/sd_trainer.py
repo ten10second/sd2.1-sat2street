@@ -130,6 +130,7 @@ def _materialize_lazy_modules(
     model: "SatelliteConditionedSDModel",
     sat_images: torch.Tensor,
     front_bev_xy: Optional[torch.Tensor],
+    plucker_map: Optional[torch.Tensor],
     front_ground_valid_mask: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
@@ -153,6 +154,7 @@ def _materialize_lazy_modules(
         sat_xy=sat_state.xy,
         sat_bev_coords=sat_state.bev_coords,
         front_bev_xy=front_bev_xy,
+        front_plucker=plucker_map,
         front_ground_valid_mask=front_ground_valid_mask,
         return_attn_map=False,
     )
@@ -217,7 +219,11 @@ class SatelliteConditionedSDModel(nn.Module):
             # Freeze the pretrained UNet backbone. Satellite-specific modules are
             # trained separately to preserve the SD prior and avoid scene drift.
             for name, param in self.unet.named_parameters():
-                if ".attn2.to_k." in name or ".attn2.to_v." in name:
+                if (
+                    ".attn2.to_k." in name
+                    or ".attn2.to_v." in name
+                    or name.startswith("camera_projector.")
+                ):
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -235,6 +241,21 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         logger.info("  Main attn2 route: satellite tokens")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
+        if getattr(self.unet, "enable_camera_control", False):
+            camera_params = sum(
+                p.numel()
+                for n, p in self.unet.named_parameters()
+                if n.startswith("camera_projector.")
+            )
+            trainable_camera_params = sum(
+                p.numel()
+                for n, p in self.unet.named_parameters()
+                if n.startswith("camera_projector.") and p.requires_grad
+            )
+            logger.info(
+                f"  Camera control: plucker_tokens "
+                f"({trainable_camera_params}/{camera_params} trainable params)"
+            )
 
     def encode_satellite(self, sat_images: torch.Tensor) -> SatelliteMemoryState:
         """Encode satellite images into a structured satellite memory state."""
@@ -771,6 +792,7 @@ def create_sd_model(
     freeze_base: bool = True,
     refinement_block_config: Optional[Dict] = None,
     refinement_injection_sites: Optional[Tuple[str, ...]] = None,
+    camera_control_config: Optional[Dict] = None,
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
@@ -825,8 +847,11 @@ def create_sd_model(
             'geom_head_dim': refinement_cfg.get('geom_head_dim', 16),
             'gate_hidden_ratio': refinement_cfg.get('gate_hidden_ratio', 0.25),
             'use_geom_bias': refinement_cfg.get('use_geom_bias', True),
+            'street_to_sat_use_plucker_geom': refinement_cfg.get('street_to_sat_use_plucker_geom', False),
             'use_gated_residual': refinement_cfg.get('use_gated_residual', True),
+            'enable_front_refinement': refinement_cfg.get('enable_front_refinement', True),
         },
+        camera_control_config=camera_control_config,
         **base_unet.config,
     )
     unet.load_state_dict(base_unet.state_dict(), strict=False)
@@ -1037,6 +1062,14 @@ class SDTrainer:
         tensor /= float(self.world_size)
         return float(tensor.item())
 
+    def _any_rank_true(self, value: bool) -> bool:
+        if not self.distributed or not dist.is_initialized():
+            return bool(value)
+        device = torch.device(self.device)
+        flag = torch.tensor(1 if value else 0, device=device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
     @torch.no_grad()
     def _materialize_lazy_condition_modules(self) -> None:
         unet = getattr(self.model, "unet", None)
@@ -1068,11 +1101,16 @@ class SDTrainer:
             front_ground_valid_mask = front_ground_valid_mask[:1].to(self.device)
             if front_ground_valid_mask.ndim == 5:
                 front_ground_valid_mask = front_ground_valid_mask[:, 0]
+        plucker_map = batch.get("plucker_map")
+        if plucker_map is not None:
+            plucker_map = plucker_map[:1].to(self.device)
+            if plucker_map.ndim == 5:
+                plucker_map = plucker_map[:, 0]
         target_size = tuple(int(x) for x in target_images.shape[-2:])
 
         was_training = self.model.training
         self.model.eval()
-        _materialize_lazy_modules(self.model, sat_images, front_bev_xy, front_ground_valid_mask, target_size)
+        _materialize_lazy_modules(self.model, sat_images, front_bev_xy, plucker_map, front_ground_valid_mask, target_size)
         if was_training:
             self.model.train()
 
@@ -1117,6 +1155,104 @@ class SDTrainer:
                 "Found trainable fp16 parameters after AMP preparation. "
                 f"These must stay fp32 for GradScaler: {preview}"
             )
+
+    @staticmethod
+    def _tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
+        with torch.no_grad():
+            detached = tensor.detach()
+            finite_mask = torch.isfinite(detached)
+            finite_count = int(finite_mask.sum().item())
+            total_count = detached.numel()
+            summary = (
+                f"{name}: shape={list(detached.shape)} dtype={detached.dtype} "
+                f"finite={finite_count}/{total_count}"
+            )
+            if finite_count > 0:
+                finite_values = detached[finite_mask].float()
+                summary += (
+                    f" min={finite_values.min().item():.4g}"
+                    f" max={finite_values.max().item():.4g}"
+                    f" mean={finite_values.mean().item():.4g}"
+                )
+            return summary
+
+    @staticmethod
+    def _first_nonfinite_named_tensor(
+        named_tensors: Sequence[Tuple[str, Optional[torch.Tensor]]],
+    ) -> Optional[str]:
+        for name, tensor in named_tensors:
+            if tensor is None or not torch.is_tensor(tensor):
+                continue
+            if not bool(torch.isfinite(tensor.detach()).all().item()):
+                return SDTrainer._tensor_debug_summary(name, tensor)
+        return None
+
+    @staticmethod
+    def _grad_global_norm(parameters: Sequence[torch.nn.Parameter], device: str) -> torch.Tensor:
+        norms = []
+        for param in parameters:
+            if param.grad is None:
+                continue
+            norms.append(torch.linalg.vector_norm(param.grad.detach().float()))
+        if not norms:
+            return torch.tensor(0.0, device=device)
+        return torch.linalg.vector_norm(torch.stack([norm.to(device=device) for norm in norms]))
+
+    def _log_nonfinite_training_state(
+        self,
+        reason: str,
+        epoch: int,
+        step: int,
+        outputs: Optional[Dict[str, Any]] = None,
+        batch_tensors: Optional[Dict[str, Optional[torch.Tensor]]] = None,
+    ) -> None:
+        if not self.is_main_process:
+            return
+
+        logger.warning(
+            "Skipping optimizer update because non-finite values were detected "
+            "(reason=%s, epoch=%d, step=%d)",
+            reason,
+            epoch + 1,
+            step + 1,
+        )
+
+        if outputs:
+            output_tensors: List[Tuple[str, Optional[torch.Tensor]]] = []
+            for key in ("loss", "per_view_loss", "model_pred", "target"):
+                value = outputs.get(key)
+                if torch.is_tensor(value):
+                    output_tensors.append((f"outputs.{key}", value))
+            sat_state = outputs.get("sat_state")
+            if isinstance(sat_state, SatelliteMemoryState):
+                output_tensors.extend(
+                    [
+                        ("outputs.sat_state.tokens", sat_state.tokens),
+                        ("outputs.sat_state.xy", sat_state.xy),
+                        ("outputs.sat_state.bev_coords", sat_state.bev_coords),
+                    ]
+                )
+            refinement_stats = outputs.get("refinement_stats", {})
+            if isinstance(refinement_stats, dict):
+                for key, value in refinement_stats.items():
+                    if torch.is_tensor(value):
+                        output_tensors.append((f"outputs.refinement_stats.{key}", value))
+            issue = self._first_nonfinite_named_tensor(output_tensors)
+            if issue is not None:
+                logger.warning("  First non-finite output: %s", issue)
+
+        if batch_tensors:
+            issue = self._first_nonfinite_named_tensor(
+                [(f"batch.{key}", value) for key, value in batch_tensors.items()]
+            )
+            if issue is not None:
+                logger.warning("  First non-finite batch tensor: %s", issue)
+
+        param_issue = self._first_nonfinite_named_tensor(
+            [(name, param) for name, param in self.unwrapped_model.named_parameters()]
+        )
+        if param_issue is not None:
+            logger.warning("  First non-finite parameter: %s", param_issue)
 
     def _global_step(self, epoch: int, step: int) -> int:
         return epoch * max(1, len(self.train_dataloader)) + step + 1
@@ -1245,8 +1381,12 @@ class SDTrainer:
         """Train for one epoch."""
         self.model.train()
         total_raw_loss = 0.0
+        finite_loss_batches = 0
         num_batches = len(self.train_dataloader)
         self.optimizer.zero_grad(set_to_none=True)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        skip_accumulation_until = -1
+        last_grad_norm = None
 
         sampler = getattr(self.train_dataloader, "sampler", None)
         if hasattr(sampler, "set_epoch"):
@@ -1259,6 +1399,16 @@ class SDTrainer:
         )
 
         for step, batch in enumerate(progress_bar):
+            accumulation_start = (step // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
+            accumulation_end = min(accumulation_start + self.gradient_accumulation_steps, num_batches)
+            accumulation_window_size = max(1, accumulation_end - accumulation_start)
+            if step < skip_accumulation_until:
+                if self.is_main_process:
+                    progress_bar.set_postfix({"raw_loss": "skipped"})
+                if (step + 1) == skip_accumulation_until:
+                    skip_accumulation_until = -1
+                continue
+
             # Move data to device
             sat_images = batch['sat'].to(self.device)
             target_images = batch['image'].to(self.device)
@@ -1288,10 +1438,37 @@ class SDTrainer:
                 )
                 raw_loss = outputs['loss']
 
+            batch_tensors = {
+                "sat": sat_images,
+                "image": target_images,
+                "front_bev_xy": front_bev_xy,
+                "front_ground_valid_mask": front_ground_valid_mask,
+                "plucker_map": plucker_map,
+            }
+            loss_is_finite = bool(torch.isfinite(raw_loss.detach()).all().item())
+            if self._any_rank_true(not loss_is_finite):
+                self._log_nonfinite_training_state(
+                    reason="loss",
+                    epoch=epoch,
+                    step=step,
+                    outputs=outputs,
+                    batch_tensors=batch_tensors,
+                )
+                if self.is_main_process:
+                    self._log_scalars(
+                        {
+                            "train/skipped_nonfinite_update": 1.0,
+                            "train/epoch": epoch + 1,
+                        },
+                        step=self._global_step(epoch, step),
+                    )
+                self.optimizer.zero_grad(set_to_none=True)
+                skip_accumulation_until = accumulation_end
+                if (step + 1) == accumulation_end:
+                    skip_accumulation_until = -1
+                continue
+
             # Backward pass
-            accumulation_start = (step // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
-            accumulation_end = min(accumulation_start + self.gradient_accumulation_steps, num_batches)
-            accumulation_window_size = max(1, accumulation_end - accumulation_start)
             loss = raw_loss / accumulation_window_size
             if self.use_amp and self.amp_dtype == torch.float16:
                 self.scaler.scale(loss).backward()
@@ -1300,25 +1477,57 @@ class SDTrainer:
 
             if (step + 1) == accumulation_end:
                 if self.use_amp and self.amp_dtype == torch.float16:
+                    self.scaler.unscale_(self.optimizer)
                     if self.max_grad_norm > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in self.model.parameters() if p.requires_grad],
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            trainable_params,
                             self.max_grad_norm,
                         )
+                    else:
+                        grad_norm = self._grad_global_norm(trainable_params, self.device)
+                else:
+                    if self.max_grad_norm > 0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            trainable_params,
+                            self.max_grad_norm,
+                        )
+                    else:
+                        grad_norm = self._grad_global_norm(trainable_params, self.device)
+
+                last_grad_norm = float(grad_norm.detach().float().item())
+                grad_is_finite = bool(torch.isfinite(grad_norm.detach()).all().item())
+                if self._any_rank_true(not grad_is_finite):
+                    self._log_nonfinite_training_state(
+                        reason="grad",
+                        epoch=epoch,
+                        step=step,
+                        outputs=outputs,
+                        batch_tensors=batch_tensors,
+                    )
+                    if self.is_main_process:
+                        self._log_scalars(
+                            {
+                                "train/skipped_nonfinite_update": 1.0,
+                                "train/grad_norm": last_grad_norm,
+                                "train/epoch": epoch + 1,
+                            },
+                            step=self._global_step(epoch, step),
+                        )
+                    if self.use_amp and self.amp_dtype == torch.float16:
+                        self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                if self.use_amp and self.amp_dtype == torch.float16:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    if self.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in self.model.parameters() if p.requires_grad],
-                            self.max_grad_norm,
-                        )
                     self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
             total_raw_loss += raw_loss.item()
+            finite_loss_batches += 1
             postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
             geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
             if torch.is_tensor(geom_ratio):
@@ -1360,6 +1569,8 @@ class SDTrainer:
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
                     'train/epoch': epoch + 1,
                 }
+                if last_grad_norm is not None:
+                    log_payload['train/grad_norm'] = last_grad_norm
                 if torch.is_tensor(sem_std):
                     log_payload['refinement/logits_sem_std_mean'] = sem_std.item()
                 if torch.is_tensor(geom_std):
@@ -1368,7 +1579,7 @@ class SDTrainer:
                     log_payload['refinement/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
-        local_mean = total_raw_loss / max(1, num_batches)
+        local_mean = total_raw_loss / max(1, finite_loss_batches)
         return self._reduce_mean(local_mean, self.device)
 
     @torch.no_grad()
@@ -1564,6 +1775,7 @@ class SDTrainer:
         was_training = eval_model.training
         eval_model.eval()
         generated_by_view: List[torch.Tensor] = []
+        sat_state = eval_model.encode_satellite(sat_images)
         for view_index in range(num_views):
             target_view = self._select_visualization_view_index(target_images, view_index)
             front_bev_xy_view = self._select_visualization_view_index(front_bev_xy, view_index)
@@ -1575,18 +1787,17 @@ class SDTrainer:
 
             generator = torch.Generator(device=generator_device)
             generator.manual_seed(self.visualization_seed + view_index)
-            generated_by_view.append(
-                eval_model.generate(
-                    sat_images,
-                    front_bev_xy=front_bev_xy_view,
-                    plucker_map=plucker_map_view,
-                    front_ground_valid_mask=front_ground_valid_mask_view,
-                    target_size=tuple(target_view.shape[-2:]),
-                    num_inference_steps=self.visualization_inference_steps,
-                    guidance_scale=self.visualization_guidance_scale,
-                    generator=generator,
-                )
+            generated_images, sat_state = eval_model.generate_with_satellite_state(
+                sat_state,
+                front_bev_xy=front_bev_xy_view,
+                plucker_map=plucker_map_view,
+                front_ground_valid_mask=front_ground_valid_mask_view,
+                target_size=tuple(target_view.shape[-2:]),
+                num_inference_steps=self.visualization_inference_steps,
+                guidance_scale=self.visualization_guidance_scale,
+                generator=generator,
             )
+            generated_by_view.append(generated_images)
         if was_training:
             eval_model.train()
 
