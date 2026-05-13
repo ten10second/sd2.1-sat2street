@@ -88,6 +88,7 @@ class _DummyUNet(nn.Module):
                 "logits_geom_std": signal_scalar + 2.0,
                 "logits_geom_to_sem_ratio": signal_scalar + 3.0,
                 "sat_update_norm": signal_scalar + 4.0,
+                "adapter_residual_norm": signal_scalar + 5.0,
             }
         }
         return SimpleNamespace(sample=noisy_latents)
@@ -237,6 +238,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertIn("refinement_logits_geom_to_sem_ratio_mean", outputs)
         self.assertIn("refinement_sat_update_norm_mean", outputs)
         self.assertAlmostEqual(float(outputs["refinement_sat_update_norm_mean"].item()), 5.0, places=5)
+        self.assertIn("refinement_adapter_residual_norm_mean", outputs)
 
     def test_rank5_view_group_forward_is_rejected(self) -> None:
         model = _TestSatelliteConditionedSDModel()
@@ -393,8 +395,47 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertIn("sat_update_l0_sat_update_norm", stats)
         self.assertIn("sat_update_l1_sat_update_norm", stats)
         self.assertIn("sat_update_norm", stats)
+        self.assertIn("adapter_residual_norm", stats)
         self.assertTrue(torch.allclose(stats["sat_update_norm"], stats["sat_update_l1_sat_update_norm"]))
         self.assertEqual(output["satellite_state"].tokens.shape, sat_state.tokens.shape)
+        self.assertIsNotNone(output["adapter_residual"])
+        self.assertEqual(output["adapter_residual"].shape, front_feat.shape)
+        self.assertTrue(torch.allclose(output["adapter_residual"], torch.zeros_like(front_feat)))
+
+    def test_cross_view_refinement_adapter_residual_can_affect_front_feature(self) -> None:
+        torch.manual_seed(0)
+        block = CrossViewRefinementBlock(
+            front_dim=4,
+            sat_in_dim=6,
+            num_heads=2,
+            head_dim=8,
+            geom_head_dim=2,
+            sat_update_layers=1,
+            adapter_residual=True,
+        )
+        block.eval()
+        with torch.no_grad():
+            block.adapter_out.weight.fill_(0.05)
+            block.adapter_out.bias.fill_(0.01)
+
+        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
+        front_bev_xy = torch.tensor(
+            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
+            dtype=torch.float32,
+        )
+        sat_state = SatelliteMemoryState(
+            tokens=torch.randn((1, 3, 6), dtype=torch.float32),
+            xy=torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32),
+            bev_coords=None,
+        )
+
+        with torch.no_grad():
+            output = block(front_feat, sat_state, front_bev_xy)
+
+        residual = output["adapter_residual"]
+        self.assertIsNotNone(residual)
+        self.assertEqual(residual.shape, front_feat.shape)
+        self.assertGreater(float(output["stats"]["adapter_residual_norm"].item()), 0.0)
 
     def test_cross_view_refinement_rejects_empty_sat_update_stack(self) -> None:
         with self.assertRaisesRegex(ValueError, "sat_update_layers must be positive"):

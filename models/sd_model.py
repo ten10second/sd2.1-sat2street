@@ -51,6 +51,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "geom_head_dim": 16,
             "sat_update_layers": 1,
             "use_geom_bias": True,
+            "adapter_residual": True,
+            "adapter_residual_scale": 1.0,
         }
         if refinement_block_config is not None:
             self.refinement_block_config.update(refinement_block_config)
@@ -87,6 +89,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             geom_head_dim=self.refinement_block_config["geom_head_dim"],
             sat_update_layers=self.refinement_block_config["sat_update_layers"],
             use_geom_bias=self.refinement_block_config["use_geom_bias"],
+            adapter_residual=self.refinement_block_config["adapter_residual"],
+            adapter_residual_scale=self.refinement_block_config["adapter_residual_scale"],
         )
         block = block.to(device=front_feat.device)
         self.refinement_blocks[site] = block
@@ -369,6 +373,15 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             if detached_stats:
                 conditioning_state.refinement_stats[site] = detached_stats
 
+        adapter_residual = block_output.get("adapter_residual")
+        if torch.is_tensor(adapter_residual):
+            if conditioning_state.condition_mask is not None:
+                residual_mask = conditioning_state.condition_mask.to(
+                    device=adapter_residual.device,
+                    dtype=adapter_residual.dtype,
+                ).view(-1, 1, 1, 1)
+                adapter_residual = adapter_residual * residual_mask
+            return front_feat + adapter_residual
         return front_feat
 
     def forward(

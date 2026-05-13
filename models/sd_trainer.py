@@ -46,11 +46,13 @@ def _aggregate_refinement_stats(
     geom_values = []
     ratio_values = []
     update_norm_values = []
+    adapter_residual_norm_values = []
     for site, site_stats in refinement_stats.items():
         sem = site_stats.get("logits_sem_std")
         geom = site_stats.get("logits_geom_std")
         ratio = site_stats.get("logits_geom_to_sem_ratio")
         update_norm = site_stats.get("sat_update_norm")
+        adapter_residual_norm = site_stats.get("adapter_residual_norm")
         if sem is not None:
             aggregated[f"{site}_logits_sem_std"] = sem
             sem_values.append(sem)
@@ -63,6 +65,9 @@ def _aggregate_refinement_stats(
         if update_norm is not None:
             aggregated[f"{site}_sat_update_norm"] = update_norm
             update_norm_values.append(update_norm)
+        if adapter_residual_norm is not None:
+            aggregated[f"{site}_adapter_residual_norm"] = adapter_residual_norm
+            adapter_residual_norm_values.append(adapter_residual_norm)
     if sem_values:
         aggregated["refinement_logits_sem_std_mean"] = torch.stack(sem_values).mean()
     if geom_values:
@@ -71,6 +76,8 @@ def _aggregate_refinement_stats(
         aggregated["refinement_logits_geom_to_sem_ratio_mean"] = torch.stack(ratio_values).mean()
     if update_norm_values:
         aggregated["refinement_sat_update_norm_mean"] = torch.stack(update_norm_values).mean()
+    if adapter_residual_norm_values:
+        aggregated["refinement_adapter_residual_norm_mean"] = torch.stack(adapter_residual_norm_values).mean()
     return aggregated
 
 
@@ -757,6 +764,8 @@ def create_sd_model(
             'geom_head_dim': refinement_cfg.get('geom_head_dim', 16),
             'sat_update_layers': refinement_cfg.get('sat_update_layers', 1),
             'use_geom_bias': refinement_cfg.get('use_geom_bias', True),
+            'adapter_residual': refinement_cfg.get('adapter_residual', True),
+            'adapter_residual_scale': refinement_cfg.get('adapter_residual_scale', 1.0),
         },
         **base_unet.config,
     )
@@ -1440,6 +1449,7 @@ class SDTrainer:
                 sem_std = outputs.get('refinement_logits_sem_std_mean')
                 geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
                 sat_update_norm = outputs.get('refinement_sat_update_norm_mean')
+                adapter_residual_norm = outputs.get('refinement_adapter_residual_norm_mean')
                 if all(torch.is_tensor(v) for v in (geom_std, sem_std, geom_ratio)):
                     site_ratio_parts = []
                     for site, site_stats in outputs.get('refinement_stats_by_site', {}).items():
@@ -1452,8 +1462,13 @@ class SDTrainer:
                         if torch.is_tensor(sat_update_norm)
                         else ""
                     )
+                    adapter_residual_norm_text = (
+                        f" adapter_residual={adapter_residual_norm.item():.6f}"
+                        if torch.is_tensor(adapter_residual_norm)
+                        else ""
+                    )
                     logger.info(
-                        "Train step %d/%d: raw_loss=%.6f sem_std=%.6f geom_std=%.6f geom/sem=%.3f%s%s",
+                        "Train step %d/%d: raw_loss=%.6f sem_std=%.6f geom_std=%.6f geom/sem=%.3f%s%s%s",
                         step + 1,
                         num_batches,
                         raw_loss.item(),
@@ -1462,6 +1477,7 @@ class SDTrainer:
                         geom_ratio.item(),
                         site_ratio_text,
                         update_norm_text,
+                        adapter_residual_norm_text,
                     )
                 else:
                     logger.info(
@@ -1485,6 +1501,8 @@ class SDTrainer:
                     log_payload['refinement/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
                 if torch.is_tensor(sat_update_norm):
                     log_payload['refinement/sat_update_norm_mean'] = sat_update_norm.item()
+                if torch.is_tensor(adapter_residual_norm):
+                    log_payload['refinement/adapter_residual_norm_mean'] = adapter_residual_norm.item()
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
         local_mean = total_raw_loss / max(1, finite_loss_batches)

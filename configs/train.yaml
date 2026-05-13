@@ -60,6 +60,8 @@ model:
     geom_head_dim: 16
     sat_update_layers: 2
     use_geom_bias: true
+    adapter_residual: true
+    adapter_residual_scale: 1.0
 
 # 训练配置
 training:

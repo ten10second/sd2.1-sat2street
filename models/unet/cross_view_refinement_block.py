@@ -36,11 +36,15 @@ class CrossViewRefinementBlock(nn.Module):
         use_geom_bias: bool = True,
         sat_update_layers: int = 1,
         sat_self_attn_dropout: float = 0.1,
+        adapter_residual: bool = True,
+        adapter_residual_scale: float = 1.0,
     ):
         super().__init__()
         if sat_update_layers <= 0:
             raise ValueError(f"sat_update_layers must be positive, got {sat_update_layers}")
         self.sat_update_layers = int(sat_update_layers)
+        self.adapter_residual = bool(adapter_residual)
+        self.adapter_residual_scale = float(adapter_residual_scale)
 
         self.street_to_sat_layers = nn.ModuleList()
         self.sat_self_refine_layers = nn.ModuleList()
@@ -68,6 +72,51 @@ class CrossViewRefinementBlock(nn.Module):
                     use_relative_pos=True,
                 )
             )
+        self.adapter_query_mlp = nn.Sequential(
+            nn.Linear(2, sat_in_dim),
+            nn.SiLU(),
+            nn.Linear(sat_in_dim, sat_in_dim),
+        )
+        self.adapter_sat_norm = nn.LayerNorm(sat_in_dim)
+        self.adapter_query_norm = nn.LayerNorm(sat_in_dim)
+        self.adapter_out = nn.Conv2d(sat_in_dim, front_dim, kernel_size=1)
+        nn.init.zeros_(self.adapter_out.weight)
+        nn.init.zeros_(self.adapter_out.bias)
+
+    def _build_adapter_residual(
+        self,
+        front_bev_xy: torch.Tensor,
+        sat_tokens: torch.Tensor,
+        sat_xy: torch.Tensor,
+        height: int,
+        width: int,
+        front_ground_valid_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        queries = self.adapter_query_norm(self.adapter_query_mlp(front_bev_xy))
+        keys = self.adapter_sat_norm(sat_tokens)
+        values = keys
+
+        logits = torch.matmul(queries, keys.transpose(1, 2)) / (queries.shape[-1] ** 0.5)
+        dist2 = (front_bev_xy.unsqueeze(2) - sat_xy.unsqueeze(1)).pow(2).sum(dim=-1)
+        logits = logits - dist2
+
+        attn = torch.softmax(logits, dim=-1)
+        view_tokens = torch.matmul(attn, values)
+        view_feature = view_tokens.transpose(1, 2).reshape(
+            front_bev_xy.shape[0],
+            sat_tokens.shape[-1],
+            height,
+            width,
+        )
+        residual = self.adapter_out(view_feature)
+        if front_ground_valid_mask is not None:
+            mask = front_ground_valid_mask.to(device=residual.device, dtype=residual.dtype).reshape(
+                residual.shape[0], 1, height, width
+            )
+            residual = residual * mask
+        if self.adapter_residual_scale != 1.0:
+            residual = residual * self.adapter_residual_scale
+        return residual
 
     def forward(
         self,
@@ -110,6 +159,17 @@ class CrossViewRefinementBlock(nn.Module):
                 if layer_index == self.sat_update_layers - 1:
                     stats[key] = value
         updated_satellite_state = satellite_state.replace(tokens=sat_tokens_refined)
+        adapter_residual = None
+        if self.adapter_residual:
+            adapter_residual = self._build_adapter_residual(
+                front_bev_xy=front_bev_xy,
+                sat_tokens=sat_tokens_refined,
+                sat_xy=satellite_state.xy,
+                height=height,
+                width=width,
+                front_ground_valid_mask=front_ground_valid_mask,
+            )
+            stats["adapter_residual_norm"] = adapter_residual.float().norm(dim=1).mean().detach()
 
         attn_maps = None
         if return_attn_map:
@@ -119,6 +179,7 @@ class CrossViewRefinementBlock(nn.Module):
 
         return {
             "attn_map": attn_maps,
+            "adapter_residual": adapter_residual,
             "stats": stats,
             "satellite_state": updated_satellite_state,
         }
