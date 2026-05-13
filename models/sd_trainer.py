@@ -25,7 +25,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Sequence, Tuple
 import logging
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from models.conditioning import SatelliteMemoryState
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
@@ -45,10 +45,12 @@ def _aggregate_refinement_stats(
     sem_values = []
     geom_values = []
     ratio_values = []
+    update_norm_values = []
     for site, site_stats in refinement_stats.items():
         sem = site_stats.get("logits_sem_std")
         geom = site_stats.get("logits_geom_std")
         ratio = site_stats.get("logits_geom_to_sem_ratio")
+        update_norm = site_stats.get("sat_update_norm")
         if sem is not None:
             aggregated[f"{site}_logits_sem_std"] = sem
             sem_values.append(sem)
@@ -58,12 +60,17 @@ def _aggregate_refinement_stats(
         if ratio is not None:
             aggregated[f"{site}_logits_geom_to_sem_ratio"] = ratio
             ratio_values.append(ratio)
+        if update_norm is not None:
+            aggregated[f"{site}_sat_update_norm"] = update_norm
+            update_norm_values.append(update_norm)
     if sem_values:
         aggregated["refinement_logits_sem_std_mean"] = torch.stack(sem_values).mean()
     if geom_values:
         aggregated["refinement_logits_geom_std_mean"] = torch.stack(geom_values).mean()
     if ratio_values:
         aggregated["refinement_logits_geom_to_sem_ratio_mean"] = torch.stack(ratio_values).mean()
+    if update_norm_values:
+        aggregated["refinement_sat_update_norm_mean"] = torch.stack(update_norm_values).mean()
     return aggregated
 
 
@@ -1432,6 +1439,7 @@ class SDTrainer:
                 geom_std = outputs.get('refinement_logits_geom_std_mean')
                 sem_std = outputs.get('refinement_logits_sem_std_mean')
                 geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
+                sat_update_norm = outputs.get('refinement_sat_update_norm_mean')
                 if all(torch.is_tensor(v) for v in (geom_std, sem_std, geom_ratio)):
                     site_ratio_parts = []
                     for site, site_stats in outputs.get('refinement_stats_by_site', {}).items():
@@ -1439,8 +1447,13 @@ class SDTrainer:
                         if torch.is_tensor(ratio):
                             site_ratio_parts.append(f"{site}={ratio.item():.3f}")
                     site_ratio_text = f" ({', '.join(site_ratio_parts)})" if site_ratio_parts else ""
+                    update_norm_text = (
+                        f" sat_update={sat_update_norm.item():.6f}"
+                        if torch.is_tensor(sat_update_norm)
+                        else ""
+                    )
                     logger.info(
-                        "Train step %d/%d: raw_loss=%.6f sem_std=%.6f geom_std=%.6f geom/sem=%.3f%s",
+                        "Train step %d/%d: raw_loss=%.6f sem_std=%.6f geom_std=%.6f geom/sem=%.3f%s%s",
                         step + 1,
                         num_batches,
                         raw_loss.item(),
@@ -1448,6 +1461,7 @@ class SDTrainer:
                         geom_std.item(),
                         geom_ratio.item(),
                         site_ratio_text,
+                        update_norm_text,
                     )
                 else:
                     logger.info(
@@ -1469,6 +1483,8 @@ class SDTrainer:
                     log_payload['refinement/logits_geom_std_mean'] = geom_std.item()
                 if torch.is_tensor(geom_ratio):
                     log_payload['refinement/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
+                if torch.is_tensor(sat_update_norm):
+                    log_payload['refinement/sat_update_norm_mean'] = sat_update_norm.item()
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
         local_mean = total_raw_loss / max(1, finite_loss_batches)
@@ -1534,11 +1550,141 @@ class SDTrainer:
         image = (image * 255).to(torch.uint8).numpy()
         return Image.fromarray(image)
 
+    @staticmethod
+    def _coords_to_satellite_pixels(
+        coords: torch.Tensor,
+        sat_width: int,
+        sat_height: int,
+    ) -> Tuple[List[Tuple[float, float]], Optional[Tuple[float, float, float, float]]]:
+        if coords.numel() == 0:
+            return [], None
+
+        valid = (
+            torch.isfinite(coords).all(dim=-1)
+            & ~((coords[:, 0].abs() < 1e-6) & (coords[:, 1].abs() < 1e-6))
+            & (coords[:, 0] >= -1.0)
+            & (coords[:, 0] <= 1.0)
+            & (coords[:, 1] >= -1.0)
+            & (coords[:, 1] <= 1.0)
+        )
+        coords = coords[valid]
+        if coords.numel() == 0:
+            return [], None
+
+        x_px = (coords[:, 0] + 1.0) * 0.5 * float(max(1, sat_width - 1))
+        y_px = (1.0 - (coords[:, 1] + 1.0) * 0.5) * float(max(1, sat_height - 1))
+        points = list(zip(x_px.tolist(), y_px.tolist()))
+        bbox = (
+            float(x_px.min().item()),
+            float(y_px.min().item()),
+            float(x_px.max().item()),
+            float(y_px.max().item()),
+        )
+        return points, bbox
+
+    @classmethod
+    def _front_bev_xy_to_satellite_pixels(
+        cls,
+        front_bev_xy: Optional[torch.Tensor],
+        sat_width: int,
+        sat_height: int,
+    ) -> Tuple[List[Tuple[float, float]], Optional[Tuple[float, float, float, float]]]:
+        if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
+            return [], None
+
+        coords = front_bev_xy.detach().cpu().to(torch.float32)
+        if coords.ndim == 3 and coords.shape[0] == 2:
+            coords = coords.permute(1, 2, 0).reshape(-1, 2)
+        elif coords.ndim == 3 and coords.shape[-1] == 2:
+            coords = coords.reshape(-1, 2)
+        elif coords.ndim == 2 and coords.shape[-1] == 2:
+            pass
+        else:
+            return [], None
+
+        return cls._coords_to_satellite_pixels(coords, sat_width, sat_height)
+
+    @classmethod
+    def _front_bev_xy_to_fov_polygon(
+        cls,
+        front_bev_xy: Optional[torch.Tensor],
+        sat_width: int,
+        sat_height: int,
+    ) -> List[Tuple[float, float]]:
+        if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
+            return []
+
+        coords = front_bev_xy.detach().cpu().to(torch.float32)
+        if coords.ndim == 3 and coords.shape[0] == 2:
+            coords_hw = coords.permute(1, 2, 0)
+        elif coords.ndim == 3 and coords.shape[-1] == 2:
+            coords_hw = coords
+        else:
+            return []
+
+        height, width = int(coords_hw.shape[0]), int(coords_hw.shape[1])
+        if height < 2 or width < 2:
+            return []
+
+        top = coords_hw[0, :, :]
+        right = coords_hw[:, width - 1, :]
+        bottom = torch.flip(coords_hw[height - 1, :, :], dims=[0])
+        left = torch.flip(coords_hw[:, 0, :], dims=[0])
+        boundary = torch.cat([top, right, bottom, left], dim=0)
+        points, _ = cls._coords_to_satellite_pixels(boundary, sat_width, sat_height)
+
+        if len(points) < 3:
+            _, bbox = cls._front_bev_xy_to_satellite_pixels(coords_hw, sat_width, sat_height)
+            if bbox is None:
+                return []
+            left_px, top_px, right_px, bottom_px = bbox
+            return [
+                (left_px, top_px),
+                (right_px, top_px),
+                (right_px, bottom_px),
+                (left_px, bottom_px),
+            ]
+        return points
+
+    @classmethod
+    def _draw_satellite_view_coverage(
+        cls,
+        sat_image: torch.Tensor,
+        front_bev_xy: Optional[torch.Tensor],
+        view_label: Optional[str],
+        yaw_deg: Optional[float],
+    ) -> Image.Image:
+        image = cls._tensor_to_pil(sat_image).convert("RGB")
+        draw = ImageDraw.Draw(image, "RGBA")
+        width, height = image.size
+        polygon = cls._front_bev_xy_to_fov_polygon(front_bev_xy, width, height)
+
+        center = (width / 2.0, height / 2.0)
+        cross = max(4, int(round(min(width, height) * 0.027)))
+        draw.line((center[0] - cross, center[1], center[0] + cross, center[1]), fill=(255, 255, 255, 230), width=2)
+        draw.line((center[0], center[1] - cross, center[0], center[1] + cross), fill=(255, 255, 255, 230), width=2)
+        draw.ellipse((center[0] - 3, center[1] - 3, center[0] + 3, center[1] + 3), fill=(255, 64, 64, 240))
+
+        if polygon:
+            draw.polygon(polygon, fill=(0, 180, 255, 45), outline=(255, 230, 0, 235))
+            draw.line(polygon + [polygon[0]], fill=(255, 230, 0, 235), width=2)
+
+        if view_label or yaw_deg is not None:
+            label = str(view_label) if view_label else "view"
+            if yaw_deg is not None:
+                label = f"{label} yaw={float(yaw_deg):g}"
+            draw.rectangle((4, 4, min(width - 4, 210), 25), fill=(0, 0, 0, 150))
+            draw.text((8, 8), label, fill=(255, 255, 255, 255))
+        return image
+
     def _compose_visualization(
         self,
         sat_image: torch.Tensor,
         generated_image: torch.Tensor,
         real_image: torch.Tensor,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        view_label: Optional[str] = None,
+        yaw_deg: Optional[float] = None,
     ) -> Image.Image:
         target_h, target_w = int(real_image.shape[-2]), int(real_image.shape[-1])
         sat_resized = F.interpolate(
@@ -1548,7 +1694,12 @@ class SDTrainer:
             align_corners=False,
         ).squeeze(0)
 
-        sat_pil = self._tensor_to_pil(sat_resized)
+        sat_pil = self._draw_satellite_view_coverage(
+            sat_resized,
+            front_bev_xy=front_bev_xy,
+            view_label=view_label,
+            yaw_deg=yaw_deg,
+        )
         gen_pil = self._tensor_to_pil(generated_image)
         real_pil = self._tensor_to_pil(real_image)
 
@@ -1559,17 +1710,99 @@ class SDTrainer:
             x_offset += img.width
         return canvas
 
-    @torch.no_grad()
-    def _save_visualizations(self, epoch: int):
-        data_loader = self.val_dataloader if self.val_dataloader is not None else self.train_dataloader
-        if data_loader is None:
-            return
+    @staticmethod
+    def _visualization_view_specs() -> List[Tuple[str, Optional[float]]]:
+        return [
+            ("front", None),
+            ("yaw_m120", -120.0),
+            ("yaw_m90", -90.0),
+            ("yaw_m60", -60.0),
+            ("yaw_p60", 60.0),
+            ("yaw_p90", 90.0),
+            ("yaw_p120", 120.0),
+        ]
 
+    @staticmethod
+    def _sample_with_visualization_view(base_sample: Any, view_label: str, yaw_deg: Optional[float]) -> Any:
+        base_meta = getattr(base_sample, "meta", None)
+        meta = dict(base_meta) if isinstance(base_meta, dict) else {}
+        meta["view_name"] = view_label
+        if yaw_deg is None:
+            meta["mode_override"] = "front"
+            meta.pop("vehicle_relative_yaw_deg_override", None)
+            meta.pop("fisheye_relative_yaw_deg_override", None)
+        else:
+            meta["mode_override"] = "fisheye_virtual"
+            meta["vehicle_relative_yaw_deg_override"] = float(yaw_deg)
+
+        return type(base_sample)(
+            drive_dir=getattr(base_sample, "drive_dir"),
+            frame_id=getattr(base_sample, "frame_id"),
+            meta=meta,
+        )
+
+    def _collect_fixed_yaw_visualization_items(self, data_loader: DataLoader) -> Optional[List[Dict[str, Any]]]:
+        dataset = getattr(data_loader, "dataset", None)
+        samples = getattr(dataset, "samples", None)
+        if dataset is None or not samples:
+            return None
+
+        base_index = 0
+        base_sample = samples[base_index]
+        items = []
+        for view_label, yaw_deg in self._visualization_view_specs():
+            override_sample = self._sample_with_visualization_view(base_sample, view_label, yaw_deg)
+            original_sample = samples[base_index]
+            try:
+                samples[base_index] = override_sample
+                item = dataset[base_index]
+            finally:
+                samples[base_index] = original_sample
+
+            if not isinstance(item, dict):
+                return None
+            item = dict(item)
+            item["_visualization_view_label"] = view_label
+            item["_visualization_yaw_deg"] = yaw_deg
+            items.append(item)
+
+        return items
+
+    @staticmethod
+    def _stack_visualization_items(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not items:
+            return None
+
+        required_keys = ("sat", "image", "front_bev_xy", "front_ground_valid_mask")
+        for key in required_keys:
+            if any(key not in item or not torch.is_tensor(item[key]) for item in items):
+                return None
+
+        frame_ids = []
+        for item in items:
+            frame_id = item.get("frame_id")
+            if torch.is_tensor(frame_id):
+                frame_id = int(frame_id.item())
+            frame_ids.append(frame_id)
+
+        return {
+            "sat": torch.stack([item["sat"] for item in items], dim=0),
+            "image": torch.stack([item["image"] for item in items], dim=0),
+            "front_bev_xy": torch.stack([item["front_bev_xy"] for item in items], dim=0),
+            "front_ground_valid_mask": torch.stack([item["front_ground_valid_mask"] for item in items], dim=0),
+            "frame_ids": frame_ids,
+            "view_labels": [str(item["_visualization_view_label"]) for item in items],
+            "yaw_degs": [item["_visualization_yaw_deg"] for item in items],
+        }
+
+    def _collect_fallback_visualization_batch(self, data_loader: DataLoader) -> Optional[Dict[str, Any]]:
         sat_chunks = []
         target_chunks = []
         front_bev_xy_chunks = []
         front_ground_valid_mask_chunks = []
         frame_ids = []
+        view_labels = []
+        yaw_degs = []
 
         for batch in data_loader:
             batch_count = batch['sat'].shape[0]
@@ -1593,20 +1826,57 @@ class SDTrainer:
                 frame_ids.extend([None] * take)
             else:
                 frame_ids.extend(list(batch_frame_ids[:take]))
+            view_labels.extend([None] * take)
+            yaw_degs.extend([None] * take)
 
             if len(frame_ids) >= self.num_visualizations:
                 break
 
         if not sat_chunks:
+            return None
+
+        return {
+            "sat": torch.cat(sat_chunks, dim=0),
+            "image": torch.cat(target_chunks, dim=0),
+            "front_bev_xy": torch.cat(front_bev_xy_chunks, dim=0) if front_bev_xy_chunks else None,
+            "front_ground_valid_mask": (
+                torch.cat(front_ground_valid_mask_chunks, dim=0)
+                if front_ground_valid_mask_chunks else None
+            ),
+            "frame_ids": frame_ids,
+            "view_labels": view_labels,
+            "yaw_degs": yaw_degs,
+        }
+
+    @torch.no_grad()
+    def _save_visualizations(self, epoch: int):
+        data_loader = self.val_dataloader if self.val_dataloader is not None else self.train_dataloader
+        if data_loader is None:
             return
 
-        sat_images = torch.cat(sat_chunks, dim=0).to(self.device)
-        target_images = torch.cat(target_chunks, dim=0).to(self.device)
-        front_bev_xy = torch.cat(front_bev_xy_chunks, dim=0).to(self.device) if front_bev_xy_chunks else None
-        front_ground_valid_mask = (
-            torch.cat(front_ground_valid_mask_chunks, dim=0).to(self.device)
-            if front_ground_valid_mask_chunks else None
+        fixed_items = self._collect_fixed_yaw_visualization_items(data_loader)
+        visualization_batch = (
+            self._stack_visualization_items(fixed_items)
+            if fixed_items is not None
+            else None
         )
+        if visualization_batch is None:
+            visualization_batch = self._collect_fallback_visualization_batch(data_loader)
+        if visualization_batch is None:
+            return
+
+        sat_images = visualization_batch["sat"].to(self.device)
+        target_images = visualization_batch["image"].to(self.device)
+        front_bev_xy = visualization_batch["front_bev_xy"]
+        if front_bev_xy is not None:
+            front_bev_xy = front_bev_xy.to(self.device)
+        front_ground_valid_mask = visualization_batch["front_ground_valid_mask"]
+        front_ground_valid_mask = (
+            front_ground_valid_mask.to(self.device) if front_ground_valid_mask is not None else None
+        )
+        frame_ids = visualization_batch["frame_ids"]
+        view_labels = visualization_batch["view_labels"]
+        yaw_degs = visualization_batch["yaw_degs"]
 
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
 
@@ -1616,15 +1886,34 @@ class SDTrainer:
         sat_state = eval_model.encode_satellite(sat_images)
         generator = torch.Generator(device=generator_device)
         generator.manual_seed(self.visualization_seed)
-        generated_images, _ = eval_model.generate_with_satellite_state(
-            sat_state,
-            front_bev_xy=front_bev_xy,
-            front_ground_valid_mask=front_ground_valid_mask,
-            target_size=tuple(target_images.shape[-2:]),
-            num_inference_steps=self.visualization_inference_steps,
-            guidance_scale=self.visualization_guidance_scale,
-            generator=generator,
-        )
+        generated_chunks = []
+        for idx in range(sat_images.shape[0]):
+            view_sat_state = SatelliteMemoryState(
+                tokens=sat_state.tokens[idx:idx + 1],
+                xy=sat_state.xy[idx:idx + 1],
+                bev_coords=(
+                    sat_state.bev_coords[idx:idx + 1]
+                    if sat_state.bev_coords is not None
+                    else None
+                ),
+            )
+            view_front_bev_xy = front_bev_xy[idx:idx + 1] if front_bev_xy is not None else None
+            view_front_ground_valid_mask = (
+                front_ground_valid_mask[idx:idx + 1]
+                if front_ground_valid_mask is not None
+                else None
+            )
+            generated_view, _ = eval_model.generate_with_satellite_state(
+                view_sat_state,
+                front_bev_xy=view_front_bev_xy,
+                front_ground_valid_mask=view_front_ground_valid_mask,
+                target_size=tuple(target_images.shape[-2:]),
+                num_inference_steps=self.visualization_inference_steps,
+                guidance_scale=self.visualization_guidance_scale,
+                generator=generator,
+            )
+            generated_chunks.append(generated_view)
+        generated_images = torch.cat(generated_chunks, dim=0)
         if was_training:
             eval_model.train()
 
@@ -1636,14 +1925,23 @@ class SDTrainer:
         for idx in range(sat_images.shape[0]):
             frame_id = frame_ids[idx]
             frame_suffix = f"_frame_{int(frame_id):010d}" if frame_id is not None else ""
+            view_label = view_labels[idx]
+            view_suffix = f"_{view_label}" if view_label else ""
             comparison = self._compose_visualization(
                 sat_images[idx],
                 generated_images[idx],
                 target_images[idx],
+                front_bev_xy=front_bev_xy[idx] if front_bev_xy is not None else None,
+                view_label=view_label,
+                yaw_deg=yaw_degs[idx],
             )
-            comparison.save(epoch_dir / f"sample_{idx:02d}{frame_suffix}.png")
+            comparison.save(epoch_dir / f"sample_{idx:02d}{view_suffix}{frame_suffix}.png")
             comparison_images.append(comparison)
             caption = f"epoch={epoch + 1} sample={idx:02d}"
+            if view_label:
+                caption += f" view={view_label}"
+            if yaw_degs[idx] is not None:
+                caption += f" yaw={float(yaw_degs[idx]):g}"
             if frame_id is not None:
                 caption += f" frame={int(frame_id):010d}"
             captions.append(caption)

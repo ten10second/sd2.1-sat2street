@@ -8,7 +8,7 @@ image_size: [256, 256]
 # 数据配置
 data:
   dataset: 'kitti360'
-  data_dir: '/media/zhimiao/Lenovo/KITTI-360'
+  data_dir: '/mnt/shizhm/KITTI-360'
   batch_size: 1
   num_workers: 4
   mode: 'front'

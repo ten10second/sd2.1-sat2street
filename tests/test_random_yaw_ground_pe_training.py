@@ -87,6 +87,7 @@ class _DummyUNet(nn.Module):
                 "logits_sem_std": signal_scalar + 1.0,
                 "logits_geom_std": signal_scalar + 2.0,
                 "logits_geom_to_sem_ratio": signal_scalar + 3.0,
+                "sat_update_norm": signal_scalar + 4.0,
             }
         }
         return SimpleNamespace(sample=noisy_latents)
@@ -234,6 +235,8 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertTrue(torch.is_tensor(outputs["loss"]))
         self.assertAlmostEqual(float(outputs["sat_state"].tokens.mean().item()), 1.0, places=5)
         self.assertIn("refinement_logits_geom_to_sem_ratio_mean", outputs)
+        self.assertIn("refinement_sat_update_norm_mean", outputs)
+        self.assertAlmostEqual(float(outputs["refinement_sat_update_norm_mean"].item()), 5.0, places=5)
 
     def test_rank5_view_group_forward_is_rejected(self) -> None:
         model = _TestSatelliteConditionedSDModel()
@@ -471,6 +474,50 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
 
             self.assertEqual(model.generate_sat_token_means, [0.0])
             self.assertTrue((trainer.visualization_dir / "epoch_0001" / "sample_00_frame_0000000007.png").is_file())
+
+    def test_visualization_view_specs_include_front_and_yaw_sweep(self) -> None:
+        specs = SDTrainer._visualization_view_specs()
+        self.assertEqual(
+            specs,
+            [
+                ("front", None),
+                ("yaw_m120", -120.0),
+                ("yaw_m90", -90.0),
+                ("yaw_m60", -60.0),
+                ("yaw_p60", 60.0),
+                ("yaw_p90", 90.0),
+                ("yaw_p120", 120.0),
+            ],
+        )
+
+        base_sample = SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=7, meta=None)
+        front_sample = SDTrainer._sample_with_visualization_view(base_sample, "front", None)
+        yaw_sample = SDTrainer._sample_with_visualization_view(base_sample, "yaw_m90", -90.0)
+
+        self.assertEqual(front_sample.meta["mode_override"], "front")
+        self.assertNotIn("vehicle_relative_yaw_deg_override", front_sample.meta)
+        self.assertEqual(yaw_sample.meta["mode_override"], "fisheye_virtual")
+        self.assertEqual(yaw_sample.meta["vehicle_relative_yaw_deg_override"], -90.0)
+
+    def test_satellite_visualization_draws_bev_coverage_overlay(self) -> None:
+        sat_image = torch.zeros((3, 8, 8), dtype=torch.float32)
+        front_bev_xy = torch.tensor(
+            [
+                [[-0.5, 0.5], [-0.5, 0.5]],
+                [[0.5, 0.5], [-0.5, -0.5]],
+            ],
+            dtype=torch.float32,
+        )
+
+        image = SDTrainer._draw_satellite_view_coverage(
+            sat_image,
+            front_bev_xy=front_bev_xy,
+            view_label="yaw_p90",
+            yaw_deg=90.0,
+        )
+
+        pixels = torch.from_numpy(np.array(image))
+        self.assertGreater(int(pixels.sum().item()), 0)
 
 
 if __name__ == "__main__":

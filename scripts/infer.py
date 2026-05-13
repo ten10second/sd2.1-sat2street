@@ -50,6 +50,18 @@ FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = (
     ("right_side", 90.0),
 )
 
+DEFAULT_YAW_SWEEP_SPECS: Sequence[Tuple[str, Optional[float]]] = (
+    ("front", None),
+    ("yaw_m120", -120.0),
+    ("yaw_m90", -90.0),
+    ("yaw_m60", -60.0),
+    ("yaw_m30", -30.0),
+    ("yaw_p30", 30.0),
+    ("yaw_p60", 60.0),
+    ("yaw_p90", 90.0),
+    ("yaw_p120", 120.0),
+)
+
 ABLATION_MODE_CONFIGS: Dict[str, str] = {
     "normal": "normal",
     "sat_zero": "zero",
@@ -154,10 +166,12 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         nargs="+",
         default=None,
-        help="Yaw values for single_yaw_sweep. Front is included by default; pass --no_include_front to omit it.",
+        help=(
+            "Yaw values for single_yaw_sweep. When omitted, uses the default "
+            "front/-120/-90/-60/-30/+30/+60/+90/+120 diagnostic sweep. "
+            "Front is included by default; pass --no_include_front to omit it."
+        ),
     )
-    parser.add_argument("--vehicle_yaw_min_deg", type=float, default=60.0)
-    parser.add_argument("--vehicle_yaw_max_deg", type=float, default=120.0)
     front_group = parser.add_mutually_exclusive_group()
     front_group.add_argument("--include_front", dest="include_front", action="store_true")
     front_group.add_argument("--no_include_front", dest="include_front", action="store_false")
@@ -267,25 +281,26 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.refinement_block_config = refinement_block_config or {"enable": not bool(args.disable_refinement)}
 
 
-def _training_range_yaws(min_abs: float, max_abs: float) -> List[float]:
-    min_abs = abs(float(min_abs))
-    max_abs = abs(float(max_abs))
-    if max_abs < min_abs:
-        min_abs, max_abs = max_abs, min_abs
-    mid = 0.5 * (min_abs + max_abs)
-    values = [-max_abs, -mid, -min_abs, min_abs, mid, max_abs]
-    deduped: List[float] = []
-    for value in values:
-        if not any(abs(value - seen) < 1e-6 for seen in deduped):
-            deduped.append(value)
-    return deduped
-
-
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
     if yaw is None:
         return view_name
-    token = f"yaw_{yaw:g}".replace("-", "m").replace(".", "p")
+    prefix = "p" if yaw > 0 else "m" if yaw < 0 else ""
+    token = f"yaw_{prefix}{abs(float(yaw)):g}".replace(".", "p")
     return token
+
+
+def _single_yaw_sweep_view_specs(args: argparse.Namespace) -> List[Tuple[str, Optional[float]]]:
+    if args.vehicle_yaws is None:
+        specs = list(DEFAULT_YAW_SWEEP_SPECS)
+        if not args.include_front:
+            specs = [(name, yaw) for name, yaw in specs if yaw is not None]
+        return specs
+
+    specs: List[Tuple[str, Optional[float]]] = []
+    if args.include_front:
+        specs.append(("front", None))
+    specs.extend((_view_token("yaw", yaw), float(yaw)) for yaw in args.vehicle_yaws)
+    return specs
 
 
 def _resolve_ablation_runs(args: argparse.Namespace) -> List[Tuple[Optional[str], str]]:
@@ -751,14 +766,7 @@ def _resolve_single_dataset(args: argparse.Namespace) -> Tuple[Kitti360dDataset,
 
 def run_single_yaw_sweep(args: argparse.Namespace) -> None:
     dataset, sample_index = _resolve_single_dataset(args)
-    yaws = args.vehicle_yaws if args.vehicle_yaws is not None else _training_range_yaws(
-        args.vehicle_yaw_min_deg,
-        args.vehicle_yaw_max_deg,
-    )
-    view_specs: List[Tuple[str, Optional[float]]] = []
-    if args.include_front:
-        view_specs.append(("front", None))
-    view_specs.extend((_view_token("yaw", yaw), float(yaw)) for yaw in yaws)
+    view_specs = _single_yaw_sweep_view_specs(args)
 
     materialize_sample = _get_view_sample(dataset, sample_index, *view_specs[0])
     model, checkpoint_meta = _load_model(args, materialize_sample)
