@@ -3,7 +3,6 @@ Cross-view-refined UNet for satellite-to-frontview generation.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -15,59 +14,6 @@ except ImportError:
 from diffusers.utils import USE_PEFT_BACKEND, deprecate, scale_lora_layers, unscale_lora_layers
 
 from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
-
-
-class PluckerCameraTokenProjector(nn.Module):
-    """Patchify per-pixel Plucker rays into spatial camera tokens for cross-attention."""
-
-    def __init__(
-        self,
-        token_dim: int,
-        patch_size: int = 16,
-        input_channels: int = 6,
-        zero_init: bool = True,
-    ) -> None:
-        super().__init__()
-        if patch_size <= 0:
-            raise ValueError(f"patch_size must be positive, got {patch_size}")
-        if input_channels <= 0:
-            raise ValueError(f"input_channels must be positive, got {input_channels}")
-
-        self.patch_size = int(patch_size)
-        self.input_channels = int(input_channels)
-        self.proj = nn.Conv2d(
-            input_channels,
-            token_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-        )
-        self.norm = nn.LayerNorm(token_dim)
-        if zero_init:
-            nn.init.zeros_(self.proj.weight)
-            nn.init.zeros_(self.proj.bias)
-
-    def _to_channel_first(self, plucker: torch.Tensor) -> torch.Tensor:
-        if plucker.ndim == 4 and plucker.shape[1] == self.input_channels:
-            return plucker
-        if plucker.ndim == 4 and plucker.shape[-1] == self.input_channels:
-            return plucker.permute(0, 3, 1, 2)
-        if plucker.ndim == 3 and plucker.shape[-1] == self.input_channels:
-            token_count = int(plucker.shape[1])
-            side = int(token_count ** 0.5)
-            if side * side == token_count:
-                return plucker.permute(0, 2, 1).reshape(plucker.shape[0], self.input_channels, side, side)
-            return plucker.permute(0, 2, 1).unsqueeze(-1)
-        raise ValueError(
-            "front_plucker must be [B,6,H,W], [B,H,W,6], or [B,N,6] "
-            f"for camera control, got {list(plucker.shape)}"
-        )
-
-    def forward(self, front_plucker: torch.Tensor) -> torch.Tensor:
-        param = next(self.parameters())
-        plucker = front_plucker.to(device=param.device, dtype=param.dtype)
-        plucker = self._to_channel_first(plucker)
-        tokens = self.proj(plucker).flatten(2).transpose(1, 2)
-        return self.norm(tokens)
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
@@ -86,7 +32,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         enable_cross_view_refinement: bool = True,
         refinement_injection_sites: Optional[List[str]] = None,
         refinement_block_config: Optional[Dict[str, Any]] = None,
-        camera_control_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -104,11 +49,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "lambda_geom": 1.0,
             "geom_hidden_dim": 128,
             "geom_head_dim": 16,
-            "gate_hidden_ratio": 0.25,
+            "sat_update_layers": 1,
             "use_geom_bias": True,
-            "street_to_sat_use_plucker_geom": False,
-            "use_gated_residual": True,
-            "enable_front_refinement": True,
         }
         if refinement_block_config is not None:
             self.refinement_block_config.update(refinement_block_config)
@@ -117,30 +59,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
         self.last_refinement_stats: Dict[str, Dict[str, torch.Tensor]] = {}
         self.last_satellite_state: Optional[SatelliteMemoryState] = None
-        self.camera_control_config = {
-            "enable": False,
-            "mode": "plucker_tokens",
-            "patch_size": 16,
-            "zero_init": True,
-            "token_scale": 0.1,
-        }
-        if camera_control_config is not None:
-            self.camera_control_config.update(camera_control_config)
-        self.enable_camera_control = bool(self.camera_control_config.get("enable", False))
-        self.camera_token_scale = float(self.camera_control_config.get("token_scale", 0.1))
-        self.camera_projector: Optional[PluckerCameraTokenProjector] = None
-        if self.enable_camera_control:
-            mode = str(self.camera_control_config.get("mode", "plucker_tokens"))
-            if mode != "plucker_tokens":
-                raise ValueError(f"Unsupported camera_control mode: {mode}")
-            if self.camera_token_scale < 0.0:
-                raise ValueError(f"camera_control.token_scale must be non-negative, got {self.camera_token_scale}")
-            token_dim = int(self.config.cross_attention_dim or 768)
-            self.camera_projector = PluckerCameraTokenProjector(
-                token_dim=token_dim,
-                patch_size=int(self.camera_control_config.get("patch_size", 16)),
-                zero_init=bool(self.camera_control_config.get("zero_init", True)),
-            )
 
     def _get_or_create_refinement_block(
         self,
@@ -167,11 +85,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             lambda_geom=self.refinement_block_config["lambda_geom"],
             geom_hidden_dim=self.refinement_block_config["geom_hidden_dim"],
             geom_head_dim=self.refinement_block_config["geom_head_dim"],
-            gate_hidden_ratio=self.refinement_block_config["gate_hidden_ratio"],
+            sat_update_layers=self.refinement_block_config["sat_update_layers"],
             use_geom_bias=self.refinement_block_config["use_geom_bias"],
-            street_to_sat_use_plucker_geom=self.refinement_block_config["street_to_sat_use_plucker_geom"],
-            use_gated_residual=self.refinement_block_config["use_gated_residual"],
-            enable_front_refinement=self.refinement_block_config["enable_front_refinement"],
         )
         block = block.to(device=front_feat.device)
         self.refinement_blocks[site] = block
@@ -213,45 +128,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             xy = front_bev_xy.permute(0, 3, 1, 2)
             resized = F.interpolate(xy, size=(height, width), mode="bilinear", align_corners=False)
             return resized.permute(0, 2, 3, 1).reshape(front_bev_xy.shape[0], height * width, 2)
-
-        return None
-
-    def _prepare_front_plucker(
-        self,
-        front_plucker: Any,
-        site: str,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        if front_plucker is None:
-            return None
-
-        if isinstance(front_plucker, dict):
-            site_plucker = front_plucker.get(site)
-            if site_plucker is None:
-                site_plucker = front_plucker.get("default")
-            return self._prepare_front_plucker(site_plucker, site, height, width, device, dtype)
-
-        if not torch.is_tensor(front_plucker):
-            return None
-
-        front_plucker = front_plucker.to(device=device, dtype=dtype)
-
-        if front_plucker.ndim == 3 and front_plucker.shape[-1] == 6:
-            if front_plucker.shape[1] == height * width:
-                return front_plucker
-            return None
-
-        if front_plucker.ndim == 4 and front_plucker.shape[1] == 6:
-            resized = F.interpolate(front_plucker, size=(height, width), mode="bilinear", align_corners=False)
-            return resized.permute(0, 2, 3, 1).reshape(front_plucker.shape[0], height * width, 6)
-
-        if front_plucker.ndim == 4 and front_plucker.shape[-1] == 6:
-            plucker = front_plucker.permute(0, 3, 1, 2)
-            resized = F.interpolate(plucker, size=(height, width), mode="bilinear", align_corners=False)
-            return resized.permute(0, 2, 3, 1).reshape(front_plucker.shape[0], height * width, 6)
 
         return None
 
@@ -298,14 +174,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             return resized.reshape(front_ground_valid_mask.shape[0], height * width)
 
         return None
-
-    @staticmethod
-    def _feature_condition_mask(condition_mask: torch.Tensor, front_feat: torch.Tensor) -> torch.Tensor:
-        if condition_mask.ndim != 1 or condition_mask.shape[0] != front_feat.shape[0]:
-            raise ValueError(
-                f"condition_mask must be [B], got {list(condition_mask.shape)} for batch {front_feat.shape[0]}"
-            )
-        return condition_mask.to(device=front_feat.device, dtype=front_feat.dtype).view(-1, 1, 1, 1)
 
     @staticmethod
     def _token_condition_mask(condition_mask: torch.Tensor, token_states: torch.Tensor) -> torch.Tensor:
@@ -358,7 +226,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         sat_xy: Optional[torch.Tensor],
         sat_bev_coords: Optional[torch.Tensor],
         front_bev_xy: Optional[torch.Tensor],
-        front_plucker: Optional[torch.Tensor],
         front_ground_valid_mask: Optional[torch.Tensor],
         condition_mask: Optional[torch.Tensor],
         return_attn_map: bool,
@@ -398,7 +265,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         return CrossViewConditioningState(
             satellite=satellite_state,
             front_bev_xy=front_bev_xy,
-            front_plucker=front_plucker,
             front_ground_valid_mask=front_ground_valid_mask,
             condition_mask=condition_mask,
             return_attn_map=return_attn_map,
@@ -420,14 +286,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 satellite_state,
                 conditioning_state.condition_mask,
             )
-            camera_tokens = self._camera_tokens(
-                conditioning_state.front_plucker,
-                satellite_state.tokens,
-                conditioning_state.condition_mask,
-            )
-            if camera_tokens is None:
-                return satellite_state.tokens
-            return torch.cat([satellite_state.tokens, camera_tokens], dim=1)
+            return satellite_state.tokens
 
         if torch.is_tensor(encoder_hidden_states):
             return encoder_hidden_states.to(device=hidden_states.device, dtype=hidden_states.dtype)
@@ -466,14 +325,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         if front_bev_xy is None:
             return front_feat
 
-        front_plucker = self._prepare_front_plucker(
-            conditioning_state.front_plucker,
-            site,
-            front_feat.shape[2],
-            front_feat.shape[3],
-            front_feat.device,
-            front_feat.dtype,
-        )
         front_ground_valid_mask = self._prepare_front_ground_valid_mask(
             conditioning_state.front_ground_valid_mask,
             site,
@@ -492,16 +343,12 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             front_feat=front_feat,
             satellite_state=satellite_state,
             front_bev_xy=front_bev_xy,
-            front_plucker=front_plucker,
             front_ground_valid_mask=front_ground_valid_mask,
             return_attn_map=conditioning_state.return_attn_map,
         )
 
-        updated = block_output["front_feat_out"]
         updated_satellite = block_output["satellite_state"]
         if conditioning_state.condition_mask is not None:
-            feature_mask = self._feature_condition_mask(conditioning_state.condition_mask, front_feat)
-            updated = feature_mask * updated + (1.0 - feature_mask) * front_feat
             updated_satellite = self._apply_satellite_condition_mask(
                 updated_satellite,
                 conditioning_state.condition_mask,
@@ -522,43 +369,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             if detached_stats:
                 conditioning_state.refinement_stats[site] = detached_stats
 
-        return updated
-
-    def _get_camera_plucker(self, front_plucker: Any) -> Optional[torch.Tensor]:
-        if front_plucker is None:
-            return None
-        if torch.is_tensor(front_plucker):
-            return front_plucker
-        if isinstance(front_plucker, dict):
-            for key in ("default", "mid", "up0", "down0"):
-                value = front_plucker.get(key)
-                if torch.is_tensor(value):
-                    return value
-            for value in front_plucker.values():
-                if torch.is_tensor(value):
-                    return value
-        return None
-
-    def _camera_tokens(
-        self,
-        front_plucker: Any,
-        reference: torch.Tensor,
-        condition_mask: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if not self.enable_camera_control:
-            return None
-        if self.camera_projector is None:
-            raise RuntimeError("camera control is enabled but camera_projector is not initialized")
-
-        camera_plucker = self._get_camera_plucker(front_plucker)
-        if camera_plucker is None:
-            raise ValueError("camera_control.enable=true requires front_plucker / plucker_map")
-
-        camera_tokens = self.camera_projector(camera_plucker).to(device=reference.device, dtype=reference.dtype)
-        camera_tokens = camera_tokens * self.camera_token_scale
-        if condition_mask is not None:
-            camera_tokens = camera_tokens * self._token_condition_mask(condition_mask, camera_tokens)
-        return camera_tokens
+        return front_feat
 
     def forward(
         self,
@@ -569,7 +380,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         sat_xy: Optional[torch.Tensor] = None,
         sat_bev_coords: Optional[torch.Tensor] = None,
         front_bev_xy: Optional[torch.Tensor] = None,
-        front_plucker: Optional[torch.Tensor] = None,
         front_ground_valid_mask: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
         return_attn_map: bool = False,
@@ -589,7 +399,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             sat_xy=sat_xy,
             sat_bev_coords=sat_bev_coords,
             front_bev_xy=front_bev_xy,
-            front_plucker=front_plucker,
             front_ground_valid_mask=front_ground_valid_mask,
             condition_mask=condition_mask,
             return_attn_map=return_attn_map,

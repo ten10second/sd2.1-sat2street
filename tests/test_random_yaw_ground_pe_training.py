@@ -7,8 +7,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from models.conditioning import SatelliteMemoryState
-from models.sd_model import PluckerCameraTokenProjector, SatelliteConditionedUNet
 from models.sd_trainer import SDTrainer, SatelliteConditionedSDModel
+from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
 from models.unet.street_to_satellite_attention import StreetToSatelliteAttention
 
 
@@ -64,12 +64,11 @@ class _DummyUNet(nn.Module):
         sat_xy: torch.Tensor = None,
         sat_bev_coords: torch.Tensor = None,
         front_bev_xy: torch.Tensor = None,
-        front_plucker: torch.Tensor = None,
         front_ground_valid_mask: torch.Tensor = None,
         condition_mask: torch.Tensor = None,
         return_attn_map: bool = False,
     ) -> SimpleNamespace:
-        del timesteps, encoder_hidden_states, front_plucker, front_ground_valid_mask, return_attn_map
+        del timesteps, encoder_hidden_states, front_ground_valid_mask, return_attn_map
         self.call_sat_token_means.append(float(sat_tokens.mean().item()))
         view_signal = front_bev_xy.mean(dim=(1, 2, 3), keepdim=True).to(sat_tokens.dtype)
         active = condition_mask.to(dtype=sat_tokens.dtype).view(-1, 1, 1)
@@ -101,7 +100,6 @@ class _SingleSampleDataset(Dataset):
             "image": torch.zeros((3, 8, 8), dtype=torch.float32),
             "front_bev_xy": torch.zeros((2, 8, 8), dtype=torch.float32),
             "front_ground_valid_mask": torch.ones((1, 8, 8), dtype=torch.float32),
-            "plucker_map": torch.zeros((6, 8, 8), dtype=torch.float32),
         }
 
 
@@ -130,11 +128,10 @@ class _ResumeTestModel(_TestSatelliteConditionedSDModel):
         sat_state: SatelliteMemoryState,
         target_images: torch.Tensor,
         front_bev_xy: torch.Tensor = None,
-        plucker_map: torch.Tensor = None,
         front_ground_valid_mask: torch.Tensor = None,
         condition_mask: torch.Tensor = None,
     ):
-        del sat_state, target_images, front_bev_xy, plucker_map, front_ground_valid_mask, condition_mask
+        del sat_state, target_images, front_bev_xy, front_ground_valid_mask, condition_mask
         loss = self.trainable_weight.square()
         return {
             "loss": loss,
@@ -150,11 +147,10 @@ class _NonFiniteLossModel(_ResumeTestModel):
         sat_state: SatelliteMemoryState,
         target_images: torch.Tensor,
         front_bev_xy: torch.Tensor = None,
-        plucker_map: torch.Tensor = None,
         front_ground_valid_mask: torch.Tensor = None,
         condition_mask: torch.Tensor = None,
     ):
-        del sat_state, target_images, front_bev_xy, plucker_map, front_ground_valid_mask, condition_mask
+        del sat_state, target_images, front_bev_xy, front_ground_valid_mask, condition_mask
         finite_anchor = self.trainable_weight * 0.0
         return {
             "loss": finite_anchor + torch.tensor(float("nan"), device=finite_anchor.device),
@@ -164,7 +160,7 @@ class _NonFiniteLossModel(_ResumeTestModel):
         }
 
 
-class _VisualizationSequentialModel(_TestSatelliteConditionedSDModel):
+class _VisualizationSingleViewModel(_TestSatelliteConditionedSDModel):
     def __init__(self) -> None:
         super().__init__()
         self.generate_sat_token_means = []
@@ -174,7 +170,6 @@ class _VisualizationSequentialModel(_TestSatelliteConditionedSDModel):
         self,
         sat_state: SatelliteMemoryState,
         front_bev_xy: torch.Tensor = None,
-        plucker_map: torch.Tensor = None,
         front_ground_valid_mask: torch.Tensor = None,
         target_size=None,
         num_inference_steps: int = 50,
@@ -182,7 +177,7 @@ class _VisualizationSequentialModel(_TestSatelliteConditionedSDModel):
         generator=None,
         sat_condition_mode: str = "normal",
     ):
-        del plucker_map, front_ground_valid_mask, num_inference_steps, guidance_scale, generator, sat_condition_mode
+        del front_ground_valid_mask, num_inference_steps, guidance_scale, generator, sat_condition_mode
         self.generate_sat_token_means.append(float(sat_state.tokens.mean().item()))
         batch_size = sat_state.tokens.shape[0]
         height, width = target_size
@@ -197,46 +192,44 @@ class _VisualizationSequentialModel(_TestSatelliteConditionedSDModel):
         return generated, updated_state
 
 
-class _CameraTokenHarness(nn.Module):
-    _get_camera_plucker = SatelliteConditionedUNet._get_camera_plucker
-    _camera_tokens = SatelliteConditionedUNet._camera_tokens
-
-    def __init__(self, projector: nn.Module, token_scale: float) -> None:
-        super().__init__()
-        self.enable_camera_control = True
-        self.camera_projector = projector
-        self.camera_token_scale = token_scale
-
-
-class GroupedMultiViewTrainingTest(unittest.TestCase):
-    def test_grouped_forward_reuses_updated_satellite_state(self) -> None:
+class RandomYawGroundPETrainingTest(unittest.TestCase):
+    def test_single_view_forward_initializes_satellite_state_per_batch(self) -> None:
         torch.manual_seed(0)
+        model = _TestSatelliteConditionedSDModel()
+        model.train()
+
+        sat_images = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
+        target_images = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
+        front_bev_xy = torch.ones((1, 2, 8, 8), dtype=torch.float32)
+        front_ground_valid_mask = torch.ones((1, 1, 8, 8), dtype=torch.float32)
+
+        outputs = model(
+            sat_images,
+            target_images,
+            front_bev_xy=front_bev_xy,
+            front_ground_valid_mask=front_ground_valid_mask,
+        )
+
+        self.assertEqual(len(model.unet.call_sat_token_means), 1)
+        self.assertAlmostEqual(model.unet.call_sat_token_means[0], 0.0, places=5)
+        self.assertTrue(torch.is_tensor(outputs["loss"]))
+        self.assertAlmostEqual(float(outputs["sat_state"].tokens.mean().item()), 1.0, places=5)
+        self.assertIn("refinement_logits_geom_to_sem_ratio_mean", outputs)
+
+    def test_rank5_view_group_forward_is_rejected(self) -> None:
         model = _TestSatelliteConditionedSDModel()
         model.train()
 
         sat_images = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
         target_images = torch.zeros((1, 2, 3, 8, 8), dtype=torch.float32)
         front_bev_xy = torch.zeros((1, 2, 2, 8, 8), dtype=torch.float32)
-        front_bev_xy[:, 0] = 1.0
-        front_bev_xy[:, 1] = 2.0
-        plucker_map = torch.zeros((1, 2, 6, 8, 8), dtype=torch.float32)
-        front_ground_valid_mask = torch.ones((1, 2, 1, 8, 8), dtype=torch.float32)
 
-        outputs = model(
-            sat_images,
-            target_images,
-            front_bev_xy=front_bev_xy,
-            plucker_map=plucker_map,
-            front_ground_valid_mask=front_ground_valid_mask,
-        )
-
-        self.assertEqual(len(model.unet.call_sat_token_means), 2)
-        self.assertAlmostEqual(model.unet.call_sat_token_means[0], 0.0, places=5)
-        self.assertAlmostEqual(model.unet.call_sat_token_means[1], 1.0, places=5)
-        self.assertTrue(torch.is_tensor(outputs["loss"]))
-        self.assertEqual(tuple(outputs["per_view_loss"].shape), (2,))
-        self.assertAlmostEqual(float(outputs["sat_state"].tokens.mean().item()), 3.0, places=5)
-        self.assertIn("refinement_logits_geom_to_sem_ratio_mean", outputs)
+        with self.assertRaisesRegex(ValueError, "one random-yaw street view per sample"):
+            model(
+                sat_images,
+                target_images,
+                front_bev_xy=front_bev_xy,
+            )
 
     def test_resume_checkpoint_restores_next_epoch_index(self) -> None:
         model = _ResumeTestModel()
@@ -284,7 +277,7 @@ class GroupedMultiViewTrainingTest(unittest.TestCase):
 
             self.assertEqual(observed_epochs, [3, 4])
 
-    def test_street_to_sat_plucker_geometry_can_be_disabled(self) -> None:
+    def test_street_to_sat_uses_ground_pe_only(self) -> None:
         torch.manual_seed(0)
         front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
         front_bev_xy = torch.tensor(
@@ -293,49 +286,70 @@ class GroupedMultiViewTrainingTest(unittest.TestCase):
         )
         sat_tokens = torch.randn((1, 3, 6), dtype=torch.float32)
         sat_xy = torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32)
-        zero_plucker = torch.zeros((1, 4, 6), dtype=torch.float32)
-        shifted_plucker = torch.randn((1, 4, 6), dtype=torch.float32) * 10.0
 
-        disabled = StreetToSatelliteAttention(
+        attention = StreetToSatelliteAttention(
             sat_in_dim=6,
             front_in_dim=4,
             num_heads=2,
             head_dim=8,
             geom_head_dim=2,
-            use_plucker_geom=False,
         )
-        disabled.eval()
+        attention.eval()
         with torch.no_grad():
-            disabled_zero, _, _ = disabled(front_feat, front_bev_xy, sat_tokens, sat_xy, zero_plucker)
-            disabled_shifted, _, _ = disabled(front_feat, front_bev_xy, sat_tokens, sat_xy, shifted_plucker)
-        self.assertTrue(torch.allclose(disabled_zero, disabled_shifted, atol=1e-6))
+            output, _, stats = attention(
+                front_feat,
+                front_bev_xy,
+                sat_tokens,
+                sat_xy,
+                front_ground_valid_mask=None,
+            )
+        self.assertEqual(output.shape, sat_tokens.shape)
+        self.assertIn("logits_geom_to_sem_ratio", stats)
 
-        enabled = StreetToSatelliteAttention(
-            sat_in_dim=6,
-            front_in_dim=4,
-            num_heads=2,
-            head_dim=8,
-            geom_head_dim=2,
-            use_plucker_geom=True,
-        )
-        enabled.load_state_dict(disabled.state_dict())
-        enabled.eval()
-        with torch.no_grad():
-            enabled_zero, _, _ = enabled(front_feat, front_bev_xy, sat_tokens, sat_xy, zero_plucker)
-            enabled_shifted, _, _ = enabled(front_feat, front_bev_xy, sat_tokens, sat_xy, shifted_plucker)
-        self.assertFalse(torch.allclose(enabled_zero, enabled_shifted, atol=1e-6))
-
-    def test_camera_token_scale_is_applied(self) -> None:
+    def test_cross_view_refinement_stacks_sat_update_layers(self) -> None:
         torch.manual_seed(0)
-        projector = PluckerCameraTokenProjector(token_dim=4, patch_size=2, zero_init=False)
-        unet = _CameraTokenHarness(projector=projector, token_scale=0.25)
+        block = CrossViewRefinementBlock(
+            front_dim=4,
+            sat_in_dim=6,
+            num_heads=2,
+            head_dim=8,
+            geom_head_dim=2,
+            sat_update_layers=2,
+        )
+        block.eval()
 
-        plucker_map = torch.randn((1, 6, 4, 4), dtype=torch.float32)
-        reference = torch.zeros((1, 2, 4), dtype=torch.float32)
+        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
+        front_bev_xy = torch.tensor(
+            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
+            dtype=torch.float32,
+        )
+        sat_state = SatelliteMemoryState(
+            tokens=torch.randn((1, 3, 6), dtype=torch.float32),
+            xy=torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32),
+            bev_coords=None,
+        )
 
-        expected = projector(plucker_map) * 0.25
-        actual = unet._camera_tokens(plucker_map, reference, condition_mask=None)
-        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+        with torch.no_grad():
+            output = block(front_feat, sat_state, front_bev_xy)
+
+        self.assertEqual(len(block.street_to_sat_layers), 2)
+        self.assertEqual(len(block.sat_self_refine_layers), 2)
+        stats = output["stats"]
+        self.assertIn("sat_update_l0_sat_update_norm", stats)
+        self.assertIn("sat_update_l1_sat_update_norm", stats)
+        self.assertIn("sat_update_norm", stats)
+        self.assertTrue(torch.allclose(stats["sat_update_norm"], stats["sat_update_l1_sat_update_norm"]))
+        self.assertEqual(output["satellite_state"].tokens.shape, sat_state.tokens.shape)
+
+    def test_cross_view_refinement_rejects_empty_sat_update_stack(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sat_update_layers must be positive"):
+            CrossViewRefinementBlock(
+                front_dim=4,
+                sat_in_dim=6,
+                num_heads=2,
+                head_dim=8,
+                sat_update_layers=0,
+            )
 
     def test_nonfinite_loss_skips_optimizer_update(self) -> None:
         model = _NonFiniteLossModel()
@@ -364,29 +378,24 @@ class GroupedMultiViewTrainingTest(unittest.TestCase):
             self.assertTrue(torch.allclose(model.trainable_weight.detach(), before))
             self.assertEqual(trainer.optimizer.state_dict()["state"], {})
 
-    def test_visualization_generation_reuses_updated_satellite_state(self) -> None:
-        model = _VisualizationSequentialModel()
+    def test_visualization_generation_uses_single_view_batch(self) -> None:
+        model = _VisualizationSingleViewModel()
 
-        class _GroupedVisualizationDataset(Dataset):
+        class _SingleVisualizationDataset(Dataset):
             def __len__(self) -> int:
                 return 1
 
             def __getitem__(self, idx: int):
                 del idx
-                front_bev_xy = torch.zeros((2, 2, 8, 8), dtype=torch.float32)
-                front_bev_xy[0] = 1.0
-                front_bev_xy[1] = 2.0
                 return {
                     "sat": torch.zeros((3, 8, 8), dtype=torch.float32),
-                    "image": torch.zeros((2, 3, 8, 8), dtype=torch.float32),
-                    "front_bev_xy": front_bev_xy,
-                    "front_ground_valid_mask": torch.ones((2, 1, 8, 8), dtype=torch.float32),
-                    "plucker_map": torch.zeros((2, 6, 8, 8), dtype=torch.float32),
+                    "image": torch.zeros((3, 8, 8), dtype=torch.float32),
+                    "front_bev_xy": torch.ones((2, 8, 8), dtype=torch.float32),
+                    "front_ground_valid_mask": torch.ones((1, 8, 8), dtype=torch.float32),
                     "frame_id": torch.tensor(7),
-                    "view_names": ["front", "left_side"],
                 }
 
-        dataloader = DataLoader(_GroupedVisualizationDataset(), batch_size=1, shuffle=False)
+        dataloader = DataLoader(_SingleVisualizationDataset(), batch_size=1, shuffle=False)
 
         with TemporaryDirectory() as tmpdir:
             trainer = SDTrainer(
@@ -408,7 +417,7 @@ class GroupedMultiViewTrainingTest(unittest.TestCase):
 
             trainer._save_visualizations(epoch=0)
 
-            self.assertEqual(model.generate_sat_token_means, [0.0, 1.0])
+            self.assertEqual(model.generate_sat_token_means, [0.0])
             self.assertTrue((trainer.visualization_dir / "epoch_0001" / "sample_00_frame_0000000007.png").is_file())
 
 

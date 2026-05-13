@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from models.sd_trainer import create_sd_model, load_model_checkpoint, SDTrainer
-from data import GroupedMultiViewDataset, Kitti360dDataset
+from data import Kitti360dDataset
 from torch.utils.data import DataLoader, default_collate
 from torch.utils.data.distributed import DistributedSampler
 
@@ -300,8 +300,11 @@ def main():
     )
     parser.add_argument(
         "--view_set", type=str, default="single",
-        choices=["single", "fixed5", "front_plus_random"],
-        help="Per-frame view expansion for fisheye_virtual. 'fixed5' yields front plus four fixed side views; 'front_plus_random' yields front plus one random side view.",
+        choices=["single"],
+        help=(
+            "This branch trains one independently sampled target yaw per frame; "
+            "grouped fixed-view feed is intentionally disabled."
+        ),
     )
     parser.add_argument(
         "--vehicle_yaw_min_deg", type=float, default=60.0,
@@ -492,7 +495,6 @@ def main():
     log_dir = Path(str(_config_get(config, ("logging", "log_dir"), args.output_dir)))
     refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
     refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
-    camera_control_config = dict(_config_get(config, ("model", "camera_control"), {}) or {})
 
     _configure_logging(log_dir)
 
@@ -551,7 +553,12 @@ def main():
     train_dataset_kwargs = dict(common_dataset_kwargs)
     val_dataset_kwargs = dict(common_dataset_kwargs)
 
-    if args.dataset_mode != "front" and args.view_set in {"single", "front_plus_random"} and args.yaw_mode == "vehicle_relative":
+    if args.view_set != "single":
+        raise ValueError(
+            f"view_set='{args.view_set}' is not supported on this branch; use data.view_set='single'."
+        )
+
+    if args.dataset_mode != "front" and args.yaw_mode == "vehicle_relative":
         train_dataset_kwargs.update({
             "random_vehicle_relative_yaw": True,
             "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
@@ -574,10 +581,6 @@ def main():
         frames=val_frames,
         **val_dataset_kwargs,
     )
-
-    if args.view_set != "single":
-        train_dataset = GroupedMultiViewDataset(train_dataset)
-        val_dataset = GroupedMultiViewDataset(val_dataset)
 
     train_sampler = DistributedSampler(
         train_dataset,
@@ -620,7 +623,6 @@ def main():
         freeze_base=freeze_base,
         refinement_block_config=refinement_block_config,
         refinement_injection_sites=tuple(refinement_injection_sites) if refinement_injection_sites is not None else None,
-        camera_control_config=camera_control_config,
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,

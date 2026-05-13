@@ -42,7 +42,6 @@ class CrossViewConditioningState:
 
     satellite: SatelliteMemoryState
     front_bev_xy: Any
-    front_plucker: Any = None
     front_ground_valid_mask: Any = None
     condition_mask: Optional[torch.Tensor] = None
     return_attn_map: bool = False

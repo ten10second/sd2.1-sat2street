@@ -25,7 +25,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Sequence, Tuple
 import logging
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from models.conditioning import SatelliteMemoryState
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
@@ -130,7 +130,6 @@ def _materialize_lazy_modules(
     model: "SatelliteConditionedSDModel",
     sat_images: torch.Tensor,
     front_bev_xy: Optional[torch.Tensor],
-    plucker_map: Optional[torch.Tensor],
     front_ground_valid_mask: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
@@ -154,7 +153,6 @@ def _materialize_lazy_modules(
         sat_xy=sat_state.xy,
         sat_bev_coords=sat_state.bev_coords,
         front_bev_xy=front_bev_xy,
-        front_plucker=plucker_map,
         front_ground_valid_mask=front_ground_valid_mask,
         return_attn_map=False,
     )
@@ -222,7 +220,6 @@ class SatelliteConditionedSDModel(nn.Module):
                 if (
                     ".attn2.to_k." in name
                     or ".attn2.to_v." in name
-                    or name.startswith("camera_projector.")
                 ):
                     param.requires_grad = True
                 else:
@@ -241,21 +238,6 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         logger.info("  Main attn2 route: satellite tokens")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
-        if getattr(self.unet, "enable_camera_control", False):
-            camera_params = sum(
-                p.numel()
-                for n, p in self.unet.named_parameters()
-                if n.startswith("camera_projector.")
-            )
-            trainable_camera_params = sum(
-                p.numel()
-                for n, p in self.unet.named_parameters()
-                if n.startswith("camera_projector.") and p.requires_grad
-            )
-            logger.info(
-                f"  Camera control: plucker_tokens "
-                f"({trainable_camera_params}/{camera_params} trainable params)"
-            )
 
     def encode_satellite(self, sat_images: torch.Tensor) -> SatelliteMemoryState:
         """Encode satellite images into a structured satellite memory state."""
@@ -278,7 +260,6 @@ class SatelliteConditionedSDModel(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor],
         sat_state: SatelliteMemoryState,
         front_bev_xy: Optional[torch.Tensor],
-        plucker_map: Optional[torch.Tensor],
         front_ground_valid_mask: Optional[torch.Tensor],
         condition_mask: Optional[torch.Tensor],
     ) -> Dict[str, Any]:
@@ -291,7 +272,6 @@ class SatelliteConditionedSDModel(nn.Module):
                 'sat_xy': sat_state.xy,
                 'sat_bev_coords': sat_state.bev_coords,
                 'front_bev_xy': front_bev_xy,
-                'front_plucker': plucker_map,
                 'front_ground_valid_mask': front_ground_valid_mask,
                 'condition_mask': condition_mask,
                 'return_attn_map': False,
@@ -350,7 +330,6 @@ class SatelliteConditionedSDModel(nn.Module):
         sat_state: SatelliteMemoryState,
         target_images: torch.Tensor,
         front_bev_xy: Optional[torch.Tensor] = None,
-        plucker_map: Optional[torch.Tensor] = None,
         front_ground_valid_mask: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -386,7 +365,6 @@ class SatelliteConditionedSDModel(nn.Module):
             encoder_hidden_states=encoder_hidden_states,
             sat_state=conditioned_sat_state,
             front_bev_xy=front_bev_xy,
-            plucker_map=plucker_map,
             front_ground_valid_mask=front_ground_valid_mask,
             condition_mask=condition_mask,
         )
@@ -427,71 +405,11 @@ class SatelliteConditionedSDModel(nn.Module):
             **refinement_stats,
         }
 
-    def forward_grouped_views(
-        self,
-        sat_images: torch.Tensor,
-        target_images: torch.Tensor,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        plucker_map: Optional[torch.Tensor] = None,
-        front_ground_valid_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Train on grouped multi-view batches with shared per-site satellite memory.
-
-        Args:
-            sat_images: [B, 3, Hs, Ws]
-            target_images: [B, V, 3, H, W]
-            front_bev_xy: [B, V, 2, H, W] or None
-            plucker_map: [B, V, 6, H, W] or None
-            front_ground_valid_mask: [B, V, 1, H, W] or None
-        """
-        if target_images.ndim != 5:
-            raise ValueError(f"grouped target_images must be [B, V, C, H, W], got {list(target_images.shape)}")
-
-        sat_state = self.encode_satellite(sat_images)
-        num_views = int(target_images.shape[1])
-        condition_mask = self._sample_condition_mask(batch_size=sat_images.shape[0], device=sat_images.device)
-        per_view_outputs = []
-
-        for view_index in range(num_views):
-            view_outputs = self.forward_view_with_satellite_state(
-                sat_state=sat_state,
-                target_images=target_images[:, view_index],
-                front_bev_xy=front_bev_xy[:, view_index] if front_bev_xy is not None else None,
-                plucker_map=plucker_map[:, view_index] if plucker_map is not None else None,
-                front_ground_valid_mask=(
-                    front_ground_valid_mask[:, view_index]
-                    if front_ground_valid_mask is not None
-                    else None
-                ),
-                condition_mask=condition_mask,
-            )
-            sat_state = view_outputs["sat_state"]
-            per_view_outputs.append(view_outputs)
-
-        losses = torch.stack([view_output["loss"] for view_output in per_view_outputs], dim=0)
-        loss = losses.mean()
-        final_outputs = per_view_outputs[-1]
-        refinement_stats_by_site = final_outputs.get("refinement_stats_by_site", {})
-        refinement_stats = final_outputs.get("refinement_stats", {})
-
-        output: Dict[str, Any] = {
-            "loss": loss,
-            "per_view_loss": losses.detach(),
-            "sat_state": sat_state,
-            "num_views": torch.tensor(num_views, device=loss.device),
-            "refinement_stats": refinement_stats,
-            "refinement_stats_by_site": refinement_stats_by_site,
-            **refinement_stats,
-        }
-        return output
-
     def forward(
         self,
         sat_images: torch.Tensor,
         target_images: torch.Tensor,
         front_bev_xy: Optional[torch.Tensor] = None,
-        plucker_map: Optional[torch.Tensor] = None,
         front_ground_valid_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -501,18 +419,14 @@ class SatelliteConditionedSDModel(nn.Module):
             sat_images: (B, 3, H_sat, W_sat) - Satellite images
             target_images: (B, 3, H, W) - Target frontview images
             front_bev_xy: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
-            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
 
         Returns:
             dict with 'loss' and other info
         """
-        if target_images.ndim == 5:
-            return self.forward_grouped_views(
-                sat_images=sat_images,
-                target_images=target_images,
-                front_bev_xy=front_bev_xy,
-                plucker_map=plucker_map,
-                front_ground_valid_mask=front_ground_valid_mask,
+        if target_images.ndim != 4:
+            raise ValueError(
+                "This experiment trains one random-yaw street view per sample; "
+                f"target_images must be [B,C,H,W], got {list(target_images.shape)}"
             )
 
         sat_state = self.encode_satellite(sat_images)
@@ -520,7 +434,6 @@ class SatelliteConditionedSDModel(nn.Module):
             sat_state=sat_state,
             target_images=target_images,
             front_bev_xy=front_bev_xy,
-            plucker_map=plucker_map,
             front_ground_valid_mask=front_ground_valid_mask,
         )
 
@@ -584,7 +497,6 @@ class SatelliteConditionedSDModel(nn.Module):
         self,
         sat_state: SatelliteMemoryState,
         front_bev_xy: Optional[torch.Tensor] = None,
-        plucker_map: Optional[torch.Tensor] = None,
         front_ground_valid_mask: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
         num_inference_steps: int = 50,
@@ -595,15 +507,12 @@ class SatelliteConditionedSDModel(nn.Module):
         """
         Generate images from a precomputed satellite memory state.
 
-        The memory is kept fixed during one denoising trajectory, matching the
-        existing single-view inference path. The final U-Net-updated memory is
-        returned so grouped inference can carry it to the next view, matching
-        the grouped training order.
+        The memory is initialized by the caller for one target yaw and updated
+        only inside that denoising trajectory.
 
         Args:
             sat_state: Satellite memory state shared by the current view.
             front_bev_xy: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
-            plucker_map: (B, 6, H_cam, W_cam) - Per-pixel Plucker ray map
             target_size: Optional target image size as (H, W)
             num_inference_steps: Number of denoising steps
             guidance_scale: Guidance scale for classifier-free guidance
@@ -662,7 +571,6 @@ class SatelliteConditionedSDModel(nn.Module):
                 ),
             )
             front_bev_xy_double = torch.cat([front_bev_xy, front_bev_xy], dim=0) if front_bev_xy is not None else None
-            plucker_map_double = torch.cat([plucker_map, plucker_map], dim=0) if plucker_map is not None else None
             front_ground_valid_mask_double = (
                 torch.cat([front_ground_valid_mask, front_ground_valid_mask], dim=0)
                 if front_ground_valid_mask is not None
@@ -686,7 +594,6 @@ class SatelliteConditionedSDModel(nn.Module):
                     encoder_hidden_states=encoder_hidden_states_double,
                     sat_state=sat_state_double,
                     front_bev_xy=front_bev_xy_double,
-                    plucker_map=plucker_map_double,
                     front_ground_valid_mask=front_ground_valid_mask_double,
                     condition_mask=condition_mask_double,
                 )
@@ -707,7 +614,6 @@ class SatelliteConditionedSDModel(nn.Module):
                     encoder_hidden_states=encoder_hidden_states,
                     sat_state=sat_state,
                     front_bev_xy=front_bev_xy,
-                    plucker_map=plucker_map,
                     front_ground_valid_mask=front_ground_valid_mask,
                     condition_mask=condition_mask,
                 )
@@ -759,7 +665,6 @@ class SatelliteConditionedSDModel(nn.Module):
         self,
         sat_images: torch.Tensor,
         front_bev_xy: Optional[torch.Tensor] = None,
-        plucker_map: Optional[torch.Tensor] = None,
         front_ground_valid_mask: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
         num_inference_steps: int = 50,
@@ -776,7 +681,6 @@ class SatelliteConditionedSDModel(nn.Module):
         generated_images, _ = self.generate_with_satellite_state(
             sat_state,
             front_bev_xy=front_bev_xy,
-            plucker_map=plucker_map,
             front_ground_valid_mask=front_ground_valid_mask,
             target_size=target_size,
             num_inference_steps=num_inference_steps,
@@ -792,7 +696,6 @@ def create_sd_model(
     freeze_base: bool = True,
     refinement_block_config: Optional[Dict] = None,
     refinement_injection_sites: Optional[Tuple[str, ...]] = None,
-    camera_control_config: Optional[Dict] = None,
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
@@ -845,13 +748,9 @@ def create_sd_model(
             'lambda_geom': refinement_cfg.get('lambda_geom', 1.0),
             'geom_hidden_dim': refinement_cfg.get('geom_hidden_dim', 128),
             'geom_head_dim': refinement_cfg.get('geom_head_dim', 16),
-            'gate_hidden_ratio': refinement_cfg.get('gate_hidden_ratio', 0.25),
+            'sat_update_layers': refinement_cfg.get('sat_update_layers', 1),
             'use_geom_bias': refinement_cfg.get('use_geom_bias', True),
-            'street_to_sat_use_plucker_geom': refinement_cfg.get('street_to_sat_use_plucker_geom', False),
-            'use_gated_residual': refinement_cfg.get('use_gated_residual', True),
-            'enable_front_refinement': refinement_cfg.get('enable_front_refinement', True),
         },
-        camera_control_config=camera_control_config,
         **base_unet.config,
     )
     unet.load_state_dict(base_unet.state_dict(), strict=False)
@@ -1101,16 +1000,11 @@ class SDTrainer:
             front_ground_valid_mask = front_ground_valid_mask[:1].to(self.device)
             if front_ground_valid_mask.ndim == 5:
                 front_ground_valid_mask = front_ground_valid_mask[:, 0]
-        plucker_map = batch.get("plucker_map")
-        if plucker_map is not None:
-            plucker_map = plucker_map[:1].to(self.device)
-            if plucker_map.ndim == 5:
-                plucker_map = plucker_map[:, 0]
         target_size = tuple(int(x) for x in target_images.shape[-2:])
 
         was_training = self.model.training
         self.model.eval()
-        _materialize_lazy_modules(self.model, sat_images, front_bev_xy, plucker_map, front_ground_valid_mask, target_size)
+        _materialize_lazy_modules(self.model, sat_images, front_bev_xy, front_ground_valid_mask, target_size)
         if was_training:
             self.model.train()
 
@@ -1419,9 +1313,6 @@ class SDTrainer:
             front_ground_valid_mask = batch.get('front_ground_valid_mask')
             if front_ground_valid_mask is not None:
                 front_ground_valid_mask = front_ground_valid_mask.to(self.device)
-            plucker_map = batch.get('plucker_map')
-            if plucker_map is not None:
-                plucker_map = plucker_map.to(self.device)
 
             # Forward pass
             with torch.autocast(
@@ -1433,7 +1324,6 @@ class SDTrainer:
                     sat_images,
                     target_images,
                     front_bev_xy=front_bev_xy,
-                    plucker_map=plucker_map,
                     front_ground_valid_mask=front_ground_valid_mask,
                 )
                 raw_loss = outputs['loss']
@@ -1443,7 +1333,6 @@ class SDTrainer:
                 "image": target_images,
                 "front_bev_xy": front_bev_xy,
                 "front_ground_valid_mask": front_ground_valid_mask,
-                "plucker_map": plucker_map,
             }
             loss_is_finite = bool(torch.isfinite(raw_loss.detach()).all().item())
             if self._any_rank_true(not loss_is_finite):
@@ -1600,9 +1489,6 @@ class SDTrainer:
             front_ground_valid_mask = batch.get('front_ground_valid_mask')
             if front_ground_valid_mask is not None:
                 front_ground_valid_mask = front_ground_valid_mask.to(self.device)
-            plucker_map = batch.get('plucker_map')
-            if plucker_map is not None:
-                plucker_map = plucker_map.to(self.device)
 
             with torch.autocast(
                 device_type="cuda",
@@ -1613,7 +1499,6 @@ class SDTrainer:
                     sat_images,
                     target_images,
                     front_bev_xy=front_bev_xy,
-                    plucker_map=plucker_map,
                     front_ground_valid_mask=front_ground_valid_mask,
                 )
                 loss = outputs['loss']
@@ -1622,42 +1507,6 @@ class SDTrainer:
         if was_training:
             eval_model.train()
         return total_loss / len(self.val_dataloader)
-
-    @staticmethod
-    def _select_visualization_view(
-        tensor: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if tensor is None:
-            return None
-        if tensor.ndim >= 5:
-            return tensor[:, 0]
-        return tensor
-
-    @staticmethod
-    def _visualization_view_count(target_images: torch.Tensor) -> int:
-        return int(target_images.shape[1]) if target_images.ndim == 5 else 1
-
-    @staticmethod
-    def _select_visualization_view_index(
-        tensor: Optional[torch.Tensor],
-        view_index: int,
-    ) -> Optional[torch.Tensor]:
-        if tensor is None:
-            return None
-        if tensor.ndim >= 5:
-            return tensor[:, view_index]
-        return tensor
-
-    @staticmethod
-    def _view_name_for_visualization(view_names: Any, sample_index: int, view_index: int) -> Optional[str]:
-        try:
-            per_sample_names = view_names[sample_index]
-            if isinstance(per_sample_names, (list, tuple)):
-                view_name = per_sample_names[view_index]
-                return None if view_name is None else str(view_name)
-        except Exception:
-            return None
-        return None
 
     def _save_checkpoint(self, epoch: int):
         """Save model checkpoint."""
@@ -1716,10 +1565,8 @@ class SDTrainer:
         sat_chunks = []
         target_chunks = []
         front_bev_xy_chunks = []
-        plucker_chunks = []
         front_ground_valid_mask_chunks = []
         frame_ids = []
-        view_name_rows = []
 
         for batch in data_loader:
             batch_count = batch['sat'].shape[0]
@@ -1737,20 +1584,12 @@ class SDTrainer:
             front_ground_valid_mask = batch.get('front_ground_valid_mask')
             if front_ground_valid_mask is not None:
                 front_ground_valid_mask_chunks.append(front_ground_valid_mask[:take])
-            plucker_map = batch.get('plucker_map')
-            if plucker_map is not None:
-                plucker_chunks.append(plucker_map[:take])
 
             batch_frame_ids = batch.get('frame_id')
             if batch_frame_ids is None:
                 frame_ids.extend([None] * take)
             else:
                 frame_ids.extend(list(batch_frame_ids[:take]))
-            batch_view_names = batch.get('view_names')
-            if batch_view_names is not None:
-                view_name_rows.extend(list(batch_view_names[:take]))
-            else:
-                view_name_rows.extend([None] * take)
 
             if len(frame_ids) >= self.num_visualizations:
                 break
@@ -1761,43 +1600,28 @@ class SDTrainer:
         sat_images = torch.cat(sat_chunks, dim=0).to(self.device)
         target_images = torch.cat(target_chunks, dim=0).to(self.device)
         front_bev_xy = torch.cat(front_bev_xy_chunks, dim=0).to(self.device) if front_bev_xy_chunks else None
-        plucker_map = torch.cat(plucker_chunks, dim=0).to(self.device) if plucker_chunks else None
         front_ground_valid_mask = (
             torch.cat(front_ground_valid_mask_chunks, dim=0).to(self.device)
             if front_ground_valid_mask_chunks else None
         )
-
-        num_views = self._visualization_view_count(target_images)
 
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
 
         eval_model = self.unwrapped_model
         was_training = eval_model.training
         eval_model.eval()
-        generated_by_view: List[torch.Tensor] = []
         sat_state = eval_model.encode_satellite(sat_images)
-        for view_index in range(num_views):
-            target_view = self._select_visualization_view_index(target_images, view_index)
-            front_bev_xy_view = self._select_visualization_view_index(front_bev_xy, view_index)
-            plucker_map_view = self._select_visualization_view_index(plucker_map, view_index)
-            front_ground_valid_mask_view = self._select_visualization_view_index(
-                front_ground_valid_mask,
-                view_index,
-            )
-
-            generator = torch.Generator(device=generator_device)
-            generator.manual_seed(self.visualization_seed + view_index)
-            generated_images, sat_state = eval_model.generate_with_satellite_state(
-                sat_state,
-                front_bev_xy=front_bev_xy_view,
-                plucker_map=plucker_map_view,
-                front_ground_valid_mask=front_ground_valid_mask_view,
-                target_size=tuple(target_view.shape[-2:]),
-                num_inference_steps=self.visualization_inference_steps,
-                guidance_scale=self.visualization_guidance_scale,
-                generator=generator,
-            )
-            generated_by_view.append(generated_images)
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(self.visualization_seed)
+        generated_images, _ = eval_model.generate_with_satellite_state(
+            sat_state,
+            front_bev_xy=front_bev_xy,
+            front_ground_valid_mask=front_ground_valid_mask,
+            target_size=tuple(target_images.shape[-2:]),
+            num_inference_steps=self.visualization_inference_steps,
+            guidance_scale=self.visualization_guidance_scale,
+            generator=generator,
+        )
         if was_training:
             eval_model.train()
 
@@ -1809,19 +1633,11 @@ class SDTrainer:
         for idx in range(sat_images.shape[0]):
             frame_id = frame_ids[idx]
             frame_suffix = f"_frame_{int(frame_id):010d}" if frame_id is not None else ""
-            per_view_rows = []
-            for view_index, generated_images in enumerate(generated_by_view):
-                target_view = self._select_visualization_view_index(target_images, view_index)
-                view_name = self._view_name_for_visualization(view_name_rows, idx, view_index)
-                row = self._compose_visualization(
-                    sat_images[idx],
-                    generated_images[idx],
-                    target_view[idx],
-                )
-                if view_name is not None:
-                    row = self._add_visualization_label(row, view_name)
-                per_view_rows.append(row)
-            comparison = self._stack_visualization_rows(per_view_rows)
+            comparison = self._compose_visualization(
+                sat_images[idx],
+                generated_images[idx],
+                target_images[idx],
+            )
             comparison.save(epoch_dir / f"sample_{idx:02d}{frame_suffix}.png")
             comparison_images.append(comparison)
             caption = f"epoch={epoch + 1} sample={idx:02d}"
@@ -1835,28 +1651,6 @@ class SDTrainer:
             captions,
             step=self._global_step(epoch, max(0, len(self.train_dataloader) - 1)),
         )
-
-    @staticmethod
-    def _add_visualization_label(image: Image.Image, label: str) -> Image.Image:
-        label_height = 22
-        canvas = Image.new("RGB", (image.width, image.height + label_height), color=(255, 255, 255))
-        canvas.paste(image, (0, label_height))
-        draw = ImageDraw.Draw(canvas)
-        draw.text((6, 4), label, fill=(0, 0, 0))
-        return canvas
-
-    @staticmethod
-    def _stack_visualization_rows(rows: Sequence[Image.Image], spacing: int = 6) -> Image.Image:
-        if len(rows) == 1:
-            return rows[0]
-        width = max(row.width for row in rows)
-        height = sum(row.height for row in rows) + spacing * (len(rows) - 1)
-        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
-        y_offset = 0
-        for row in rows:
-            canvas.paste(row, (0, y_offset))
-            y_offset += row.height + spacing
-        return canvas
 
     def _load_checkpoint(self, checkpoint_path: str) -> int:
         """Load from checkpoint and return the next zero-based epoch index."""

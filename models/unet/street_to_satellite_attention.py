@@ -32,7 +32,6 @@ class StreetToSatelliteAttention(nn.Module):
         geom_hidden_dim: int = 128,
         geom_head_dim: int = 16,
         use_geom_bias: bool = True,
-        use_plucker_geom: bool = False,
         use_front_layer_norm: bool = True,
         attn_dropout: float = 0.0,
     ):
@@ -47,7 +46,6 @@ class StreetToSatelliteAttention(nn.Module):
         self.lambda_geo = float(lambda_geo)
         self.lambda_geom = float(lambda_geom)
         self.use_geom_bias = bool(use_geom_bias)
-        self.use_plucker_geom = bool(use_plucker_geom)
         self.geom_head_dim = int(geom_head_dim)
         self.geom_model_dim = self.num_heads * self.geom_head_dim
         if geom_hidden_dim <= 0:
@@ -78,11 +76,6 @@ class StreetToSatelliteAttention(nn.Module):
 
         self.sat_xy_encoder = nn.Sequential(
             nn.Linear(2, geom_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(geom_hidden_dim, geom_hidden_dim),
-        )
-        self.front_plucker_encoder = nn.Sequential(
-            nn.Linear(6, geom_hidden_dim),
             nn.SiLU(),
             nn.Linear(geom_hidden_dim, geom_hidden_dim),
         )
@@ -143,7 +136,6 @@ class StreetToSatelliteAttention(nn.Module):
         front_bev_xy: torch.Tensor,
         sat_tokens: torch.Tensor,
         sat_xy: torch.Tensor,
-        front_plucker: Optional[torch.Tensor] = None,
         front_ground_valid_mask: Optional[torch.Tensor] = None,
         return_attn_map: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, torch.Tensor]]:
@@ -189,26 +181,11 @@ class StreetToSatelliteAttention(nn.Module):
 
         logits_sem = torch.matmul(q_tilde, k_tilde.transpose(-2, -1)) / math.sqrt(self.head_dim)
         logits = logits_sem
-        if self.use_plucker_geom and front_plucker is not None:
-            if front_plucker.ndim != 3 or front_plucker.shape[-1] != 6:
-                raise ValueError("front_plucker must be [B,Nf,6]")
-            if front_plucker.shape[:2] != front_bev_xy.shape[:2]:
-                raise ValueError(
-                    f"front_plucker token count mismatch: expected {list(front_bev_xy.shape[:2])}, "
-                    f"got {list(front_plucker.shape[:2])}"
-                )
-            sat_geom_feat = self.geom_q_norm(self.sat_xy_encoder(sat_xy))
-            front_geom_source = self.front_plucker_encoder(front_plucker)
-            q_geom = self._reshape_heads(self.q_geom_proj(sat_geom_feat), self.geom_head_dim)
-            k_geom = self._reshape_heads(self.k_geom_proj(self.geom_k_norm(front_geom_source)), self.geom_head_dim)
-            logits_geom = torch.matmul(q_geom, k_geom.transpose(-2, -1)) / math.sqrt(self.geom_head_dim)
-            logits = logits + self.lambda_geom * logits_geom
-        else:
-            front_geom_source = self.front_xy_encoder(front_bev_xy)
-            q_geom = self._reshape_heads(self.q_geom_proj(self.geom_q_norm(self.sat_xy_encoder(sat_xy))), self.geom_head_dim)
-            k_geom = self._reshape_heads(self.k_geom_proj(self.geom_k_norm(front_geom_source)), self.geom_head_dim)
-            logits_geom = torch.matmul(q_geom, k_geom.transpose(-2, -1)) / math.sqrt(self.geom_head_dim)
-            logits = logits + self.lambda_geom * logits_geom
+        front_geom_source = self.front_xy_encoder(front_bev_xy)
+        q_geom = self._reshape_heads(self.q_geom_proj(self.geom_q_norm(self.sat_xy_encoder(sat_xy))), self.geom_head_dim)
+        k_geom = self._reshape_heads(self.k_geom_proj(self.geom_k_norm(front_geom_source)), self.geom_head_dim)
+        logits_geom = torch.matmul(q_geom, k_geom.transpose(-2, -1)) / math.sqrt(self.geom_head_dim)
+        logits = logits + self.lambda_geom * logits_geom
 
         if self.use_geom_bias:
             logits = logits + self._geometry_bias(sat_xy, front_bev_xy).unsqueeze(1)
