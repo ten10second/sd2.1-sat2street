@@ -1,11 +1,14 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
 from models.conditioning import SatelliteMemoryState
 from models.sd_trainer import SDTrainer, SatelliteConditionedSDModel
 from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
@@ -193,6 +196,22 @@ class _VisualizationSingleViewModel(_TestSatelliteConditionedSDModel):
 
 
 class RandomYawGroundPETrainingTest(unittest.TestCase):
+    def test_front_sample_prob_mixes_real_front_without_overriding_explicit_views(self) -> None:
+        dataset = Kitti360dDataset.__new__(Kitti360dDataset)
+        dataset.mode = "fisheye_virtual"
+        dataset.front_sample_prob = 1.0
+
+        base_sample = SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=1, meta=None)
+        override_sample = SampleIndex(
+            drive_dir=Path("/tmp/drive"),
+            frame_id=1,
+            meta={"mode_override": "fisheye_virtual"},
+        )
+
+        rng = np.random.RandomState(0)
+        self.assertEqual(dataset._resolve_effective_sample_mode(base_sample, rng), "front")
+        self.assertEqual(dataset._resolve_effective_sample_mode(override_sample, rng), "fisheye_virtual")
+
     def test_single_view_forward_initializes_satellite_state_per_batch(self) -> None:
         torch.manual_seed(0)
         model = _TestSatelliteConditionedSDModel()
@@ -305,6 +324,39 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             )
         self.assertEqual(output.shape, sat_tokens.shape)
         self.assertIn("logits_geom_to_sem_ratio", stats)
+
+    def test_street_to_sat_out_proj_is_zero_initialized(self) -> None:
+        torch.manual_seed(0)
+        attention = StreetToSatelliteAttention(
+            sat_in_dim=6,
+            front_in_dim=4,
+            num_heads=2,
+            head_dim=8,
+            geom_head_dim=2,
+        )
+
+        self.assertTrue(torch.allclose(attention.out_proj.weight, torch.zeros_like(attention.out_proj.weight)))
+        self.assertTrue(torch.allclose(attention.out_proj.bias, torch.zeros_like(attention.out_proj.bias)))
+
+        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
+        front_bev_xy = torch.tensor(
+            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
+            dtype=torch.float32,
+        )
+        sat_tokens = torch.randn((1, 3, 6), dtype=torch.float32)
+        sat_xy = torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32)
+
+        attention.eval()
+        with torch.no_grad():
+            _, _, stats = attention(
+                front_feat,
+                front_bev_xy,
+                sat_tokens,
+                sat_xy,
+                front_ground_valid_mask=None,
+            )
+
+        self.assertTrue(torch.allclose(stats["sat_update_norm"], torch.tensor(0.0)))
 
     def test_cross_view_refinement_stacks_sat_update_layers(self) -> None:
         torch.manual_seed(0)

@@ -72,6 +72,8 @@ class StreetToSatelliteAttention(nn.Module):
         self.k_proj = nn.Linear(model_dim, model_dim)
         self.v_proj = nn.Linear(model_dim, model_dim)
         self.out_proj = nn.Linear(model_dim, sat_in_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
         self.out_norm = nn.LayerNorm(sat_in_dim)
 
         self.sat_xy_encoder = nn.Sequential(
@@ -198,11 +200,12 @@ class StreetToSatelliteAttention(nn.Module):
 
         sat_update = torch.matmul(attn_map, v)
         sat_update = sat_update.transpose(1, 2).reshape(batch_size, sat_xy.shape[1], self.model_dim)
-        sat_tokens_out = self.out_norm(sat_tokens + self.out_proj(sat_update))
+        sat_delta = self.out_proj(sat_update)
+        sat_tokens_out = self.out_norm(sat_tokens + sat_delta)
 
         logits_sem_std = logits_sem.float().std(unbiased=False)
         logits_geom_std = (self.lambda_geom * logits_geom).float().std(unbiased=False)
-        update_norm = (sat_tokens_out - sat_tokens).float().norm(dim=-1).mean()
+        update_norm = sat_delta.float().norm(dim=-1).mean()
         stats = {
             "logits_sem_std": logits_sem_std.detach(),
             "logits_geom_std": logits_geom_std.detach(),

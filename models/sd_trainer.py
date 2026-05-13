@@ -1285,6 +1285,9 @@ class SDTrainer:
         sampler = getattr(self.train_dataloader, "sampler", None)
         if hasattr(sampler, "set_epoch"):
             sampler.set_epoch(epoch)
+        dataset = getattr(self.train_dataloader, "dataset", None)
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
 
         progress_bar = tqdm(
             self.train_dataloader,

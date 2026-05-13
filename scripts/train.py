@@ -315,6 +315,10 @@ def main():
         help="Maximum absolute vehicle-relative yaw sampled for virtual-view training; random training samples from [-max,-min] U [min,max].",
     )
     parser.add_argument(
+        "--front_sample_prob", type=float, default=0.0,
+        help="Probability that a training item uses the real image_00 front view instead of a random virtual fisheye yaw.",
+    )
+    parser.add_argument(
         "--guidance_scale", type=float, default=3.0,
         help="Guidance scale used for training visualizations. 1.0 disables CFG.",
     )
@@ -460,6 +464,13 @@ def main():
             _config_get(config, ("data", "vehicle_yaw_max_deg")),
         )
     )
+    args.front_sample_prob = float(
+        _prefer_config(
+            args.front_sample_prob,
+            0.0,
+            _config_get(config, ("data", "front_sample_prob")),
+        )
+    )
     args.guidance_scale = float(
         _prefer_config(args.guidance_scale, 3.0, _config_get(config, ("validation", "guidance_scale")))
     )
@@ -547,6 +558,7 @@ def main():
         front_center_crop=None,
         random_fisheye_relative_yaw=False,
         random_vehicle_relative_yaw=False,
+        front_sample_prob=0.0,
         seed=args.seed,
         return_bgr=False,
     )
@@ -563,6 +575,7 @@ def main():
             "random_vehicle_relative_yaw": True,
             "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
             "vehicle_yaw_max_deg": args.vehicle_yaw_max_deg,
+            "front_sample_prob": args.front_sample_prob,
         })
         val_dataset_kwargs.update({
             "vehicle_relative_yaw_deg": 0.5 * (args.vehicle_yaw_min_deg + args.vehicle_yaw_max_deg),

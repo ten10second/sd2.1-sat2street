@@ -442,6 +442,7 @@ class Kitti360dDataset(Dataset):
         random_vehicle_relative_yaw: bool = False,
         vehicle_yaw_min_deg: float = 60.0,
         vehicle_yaw_max_deg: float = 120.0,
+        front_sample_prob: float = 0.0,
         # IPM correction angles (degrees)
         roll_deg: float = 0.0,  # Roll correction for IPM
         pitch_deg: float = 0.0,  # Pitch correction for IPM
@@ -476,6 +477,7 @@ class Kitti360dDataset(Dataset):
         self.random_vehicle_relative_yaw = bool(random_vehicle_relative_yaw)
         self.vehicle_yaw_min_deg = float(vehicle_yaw_min_deg)
         self.vehicle_yaw_max_deg = float(vehicle_yaw_max_deg)
+        self.front_sample_prob = float(front_sample_prob)
         self.roll_deg = float(roll_deg)
         self.pitch_deg = float(pitch_deg)
 
@@ -513,6 +515,8 @@ class Kitti360dDataset(Dataset):
             raise ValueError(
                 f"view_set='{self.view_set}' is not supported on this branch; use view_set='single'."
             )
+        if not 0.0 <= self.front_sample_prob <= 1.0:
+            raise ValueError(f"front_sample_prob must be in [0, 1], got {self.front_sample_prob}")
         # fisheye_camera can be auto-selected based on yaw; only validate when explicitly set
         if self.fisheye_camera is not None and self.fisheye_camera not in {"image_02", "image_03"}:
             raise ValueError(f"fisheye_camera must be image_02 or image_03, got {self.fisheye_camera}")
@@ -548,6 +552,18 @@ class Kitti360dDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _make_item_rng(self, idx: int) -> np.random.RandomState:
+        base_seed = 0 if self.seed is None else int(self.seed)
+        seed = (
+            base_seed
+            + 1000003 * int(self.epoch)
+            + 37 * int(idx)
+        ) % (2 ** 32)
+        return np.random.RandomState(seed)
+
     def _resolve_sample_mode(self, sample: SampleIndex) -> str:
         mode = self.mode
         if isinstance(sample.meta, dict):
@@ -555,6 +571,18 @@ class Kitti360dDataset(Dataset):
         if mode not in {"front", "fisheye_virtual"}:
             raise ValueError(f"Unknown sample mode: {mode}")
         return mode
+
+    def _resolve_effective_sample_mode(
+        self,
+        sample: SampleIndex,
+        rng: np.random.RandomState,
+    ) -> str:
+        sample_mode = self._resolve_sample_mode(sample)
+        has_mode_override = isinstance(sample.meta, dict) and "mode_override" in sample.meta
+        if sample_mode == "fisheye_virtual" and self.front_sample_prob > 0.0 and not has_mode_override:
+            if rng.rand() < self.front_sample_prob:
+                sample_mode = "front"
+        return sample_mode
 
     @staticmethod
     def _resolve_sample_view_name(sample: SampleIndex) -> Optional[str]:
@@ -799,8 +827,9 @@ class Kitti360dDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         s = self.samples[idx]
         drive_dir, frame_id = s.drive_dir, s.frame_id
-        sample_mode = self._resolve_sample_mode(s)
         view_name = self._resolve_sample_view_name(s)
+        item_rng = self._make_item_rng(idx)
+        sample_mode = self._resolve_effective_sample_mode(s, item_rng)
 
         # Optional deterministic overrides (provided by an outer wrapper dataset).
         # This avoids relying on internal RNG, and is DDP/worker safe.
@@ -827,11 +856,10 @@ class Kitti360dDataset(Dataset):
                 if vehicle_relative_yaw_override_deg is not None:
                     vehicle_yaw_deg_item = float(vehicle_relative_yaw_override_deg)
                 elif self.random_vehicle_relative_yaw:
-                    rng = self.rng if self.rng is not None else None
                     vehicle_yaw_deg_item = _sample_random_signed_yaw(
                         self.vehicle_yaw_min_deg,
                         self.vehicle_yaw_max_deg,
-                        rng=rng,
+                        rng=item_rng,
                     )
                 elif self.vehicle_relative_yaw_deg is not None:
                     vehicle_yaw_deg_item = float(self.vehicle_relative_yaw_deg)
@@ -844,20 +872,16 @@ class Kitti360dDataset(Dataset):
             else:
                 fisheye_camera_item = explicit_fisheye_camera
                 if fisheye_camera_item is None:
-                    if self.rng is not None:
-                        fisheye_camera_item = str(self.rng.choice(FISHEYE_CAMERAS))
-                    else:
-                        fisheye_camera_item = str(np.random.choice(FISHEYE_CAMERAS))
+                    fisheye_camera_item = str(item_rng.choice(FISHEYE_CAMERAS))
 
                 sampled_fisheye_relative_yaw_deg = self.fisheye_relative_yaw_deg
                 if fisheye_relative_yaw_override_deg is not None:
                     sampled_fisheye_relative_yaw_deg = float(fisheye_relative_yaw_override_deg)
                 elif self.random_fisheye_relative_yaw:
-                    rng = self.rng if self.rng is not None else None
                     sampled_fisheye_relative_yaw_deg = _sample_random_signed_yaw(
                         self.yaw_min_abs,
                         self.yaw_max_abs,
-                        rng=rng,
+                        rng=item_rng,
                     )
 
                 fisheye_relative_yaw_deg_item = float(sampled_fisheye_relative_yaw_deg)
