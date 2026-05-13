@@ -9,7 +9,7 @@ gradient_checkpointing: true
 # 数据配置
 data:
   dataset: 'kitti360'
-  data_dir: '/media/shizhm/Lenovo/KITTI-360'
+  data_dir: '/mnt/shizhm/KITTI-360'
   batch_size: 2
   num_workers: 8
   image_size: [256, 256]
@@ -17,9 +17,6 @@ data:
   resolution: 0.2
   mode: 'fisheye_virtual'
   yaw_mode: 'vehicle_relative'
-  # This branch trains each sample as one independently sampled target yaw.
-  # Do not use grouped fixed-view feed here; cross-view memory carry made yaw
-  # control depend on training order instead of the current view geometry.
   view_set: 'single'
   vehicle_yaw_min_deg: 60.0
   vehicle_yaw_max_deg: 120.0
@@ -63,7 +60,6 @@ model:
     geom_head_dim: 16
     sat_update_layers: 2
     use_geom_bias: true
-    # Keep front_bev_xy/valid_mask as the PE-driven satellite-update router.
 
 # 训练配置
 training:
