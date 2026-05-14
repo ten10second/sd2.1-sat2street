@@ -315,6 +315,20 @@ def main():
         help="Maximum absolute vehicle-relative yaw sampled for virtual-view training; random training samples from [-max,-min] U [min,max].",
     )
     parser.add_argument(
+        "--vehicle_yaw_sampling",
+        type=str,
+        default="random_range",
+        choices=["random_range", "fixed_list"],
+        help="Vehicle-relative yaw sampler for fisheye_virtual training.",
+    )
+    parser.add_argument(
+        "--vehicle_yaw_fixed_list",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Fixed yaw list for vehicle_yaw_sampling=fixed_list. Use 'front' for image_00.",
+    )
+    parser.add_argument(
         "--front_sample_prob", type=float, default=0.0,
         help="Probability that a training item uses the real image_00 front view instead of a random virtual fisheye yaw.",
     )
@@ -464,6 +478,18 @@ def main():
             _config_get(config, ("data", "vehicle_yaw_max_deg")),
         )
     )
+    args.vehicle_yaw_sampling = str(
+        _prefer_config(
+            args.vehicle_yaw_sampling,
+            "random_range",
+            _config_get(config, ("data", "vehicle_yaw_sampling")),
+        )
+    )
+    args.vehicle_yaw_fixed_list = _prefer_config(
+        args.vehicle_yaw_fixed_list,
+        None,
+        _config_get(config, ("data", "vehicle_yaw_fixed_list")),
+    )
     args.front_sample_prob = float(
         _prefer_config(
             args.front_sample_prob,
@@ -571,16 +597,21 @@ def main():
         )
 
     if args.dataset_mode != "front" and args.yaw_mode == "vehicle_relative":
+        random_vehicle_relative_yaw = args.vehicle_yaw_sampling == "random_range"
         train_dataset_kwargs.update({
-            "random_vehicle_relative_yaw": True,
+            "random_vehicle_relative_yaw": random_vehicle_relative_yaw,
             "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
             "vehicle_yaw_max_deg": args.vehicle_yaw_max_deg,
+            "vehicle_yaw_sampling": args.vehicle_yaw_sampling,
+            "vehicle_yaw_fixed_list": args.vehicle_yaw_fixed_list,
             "front_sample_prob": args.front_sample_prob,
         })
         val_dataset_kwargs.update({
             "vehicle_relative_yaw_deg": 0.5 * (args.vehicle_yaw_min_deg + args.vehicle_yaw_max_deg),
             "vehicle_yaw_min_deg": args.vehicle_yaw_min_deg,
             "vehicle_yaw_max_deg": args.vehicle_yaw_max_deg,
+            "vehicle_yaw_sampling": "fixed_list" if args.vehicle_yaw_sampling == "fixed_list" else "random_range",
+            "vehicle_yaw_fixed_list": args.vehicle_yaw_fixed_list,
         })
 
     train_dataset = Kitti360dDataset(

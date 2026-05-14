@@ -62,6 +62,21 @@ DEFAULT_YAW_SWEEP_SPECS: Sequence[Tuple[str, Optional[float]]] = (
     ("yaw_p120", 120.0),
 )
 
+TRAIN_FIXED_YAW_SWEEP_SPECS: Sequence[Tuple[str, Optional[float]]] = (
+    ("front", None),
+    ("yaw_m120", -120.0),
+    ("yaw_m90", -90.0),
+    ("yaw_m60", -60.0),
+    ("yaw_p60", 60.0),
+    ("yaw_p90", 90.0),
+    ("yaw_p120", 120.0),
+)
+
+YAW_SWEEP_PRESETS: Dict[str, Sequence[Tuple[str, Optional[float]]]] = {
+    "diagnostic": DEFAULT_YAW_SWEEP_SPECS,
+    "train_fixed": TRAIN_FIXED_YAW_SWEEP_SPECS,
+}
+
 ABLATION_MODE_CONFIGS: Dict[str, str] = {
     "normal": "normal",
     "sat_zero": "zero",
@@ -170,6 +185,16 @@ def _parse_args() -> argparse.Namespace:
             "Yaw values for single_yaw_sweep. When omitted, uses the default "
             "front/-120/-90/-60/-30/+30/+60/+90/+120 diagnostic sweep. "
             "Front is included by default; pass --no_include_front to omit it."
+        ),
+    )
+    parser.add_argument(
+        "--yaw_sweep_preset",
+        type=str,
+        default="diagnostic",
+        choices=sorted(YAW_SWEEP_PRESETS.keys()),
+        help=(
+            "Preset yaw list for single_yaw_sweep when --vehicle_yaws is omitted. "
+            "diagnostic includes +/-30; train_fixed uses front/-120/-90/-60/+60/+90/+120."
         ),
     )
     front_group = parser.add_mutually_exclusive_group()
@@ -291,7 +316,7 @@ def _view_token(view_name: str, yaw: Optional[float]) -> str:
 
 def _single_yaw_sweep_view_specs(args: argparse.Namespace) -> List[Tuple[str, Optional[float]]]:
     if args.vehicle_yaws is None:
-        specs = list(DEFAULT_YAW_SWEEP_SPECS)
+        specs = list(YAW_SWEEP_PRESETS[args.yaw_sweep_preset])
         if not args.include_front:
             specs = [(name, yaw) for name, yaw in specs if yaw is not None]
         return specs

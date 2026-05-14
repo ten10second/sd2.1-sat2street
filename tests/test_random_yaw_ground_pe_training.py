@@ -201,6 +201,8 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
     def test_front_sample_prob_mixes_real_front_without_overriding_explicit_views(self) -> None:
         dataset = Kitti360dDataset.__new__(Kitti360dDataset)
         dataset.mode = "fisheye_virtual"
+        dataset.yaw_mode = "vehicle_relative"
+        dataset.vehicle_yaw_sampling = "random_range"
         dataset.front_sample_prob = 1.0
 
         base_sample = SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=1, meta=None)
@@ -211,8 +213,27 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         )
 
         rng = np.random.RandomState(0)
-        self.assertEqual(dataset._resolve_effective_sample_mode(base_sample, rng), "front")
-        self.assertEqual(dataset._resolve_effective_sample_mode(override_sample, rng), "fisheye_virtual")
+        self.assertEqual(dataset._resolve_effective_sample_mode(base_sample, rng, idx=0), "front")
+        self.assertEqual(dataset._resolve_effective_sample_mode(override_sample, rng, idx=0), "fisheye_virtual")
+
+    def test_fixed_vehicle_yaw_sampler_uses_front_and_discrete_yaws(self) -> None:
+        dataset = Kitti360dDataset.__new__(Kitti360dDataset)
+        dataset.mode = "fisheye_virtual"
+        dataset.yaw_mode = "vehicle_relative"
+        dataset.vehicle_yaw_sampling = "fixed_list"
+        dataset.vehicle_yaw_fixed_list = Kitti360dDataset._normalize_vehicle_yaw_fixed_list(
+            ["front", -120.0, -90.0, -60.0, 60.0, 90.0, 120.0]
+        )
+        dataset.front_sample_prob = 0.0
+        dataset.samples = [SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=i, meta=None) for i in range(7)]
+        dataset.epoch = 0
+
+        rng = np.random.RandomState(0)
+        self.assertEqual(dataset._resolve_effective_sample_mode(dataset.samples[0], rng, idx=0), "front")
+        self.assertEqual(dataset._resolve_effective_sample_mode(dataset.samples[1], rng, idx=1), "fisheye_virtual")
+        self.assertIsNone(dataset._choose_fixed_vehicle_yaw(0))
+        self.assertEqual(dataset._choose_fixed_vehicle_yaw(1), -120.0)
+        self.assertEqual(dataset._choose_fixed_vehicle_yaw(6), 120.0)
 
     def test_single_view_forward_initializes_satellite_state_per_batch(self) -> None:
         torch.manual_seed(0)

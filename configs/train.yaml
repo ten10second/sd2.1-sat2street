@@ -20,7 +20,9 @@ data:
   view_set: 'single'
   vehicle_yaw_min_deg: 60.0
   vehicle_yaw_max_deg: 120.0
-  front_sample_prob: 0.2
+  vehicle_yaw_sampling: 'fixed_list'
+  vehicle_yaw_fixed_list: ['front', -120.0, -90.0, -60.0, 60.0, 90.0, 120.0]
+  front_sample_prob: 0.0
   front_resize: [640, 256]
 
 # 模型配置
