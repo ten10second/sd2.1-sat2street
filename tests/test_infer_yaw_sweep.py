@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from scripts import infer
@@ -77,6 +78,19 @@ class InferYawSweepTest(unittest.TestCase):
                 ("yaw_p30", 30.0),
             ],
         )
+
+    def test_parse_args_accepts_independent_view_memory_mode(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "infer.py",
+                "--view_memory_mode",
+                "independent",
+            ],
+        ):
+            args = infer._parse_args()
+
+        self.assertEqual(args.view_memory_mode, "independent")
 
 
 if __name__ == "__main__":

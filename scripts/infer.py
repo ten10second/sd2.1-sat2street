@@ -205,6 +205,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--view_memory_mode",
+        type=str,
+        default="independent",
+        choices=["independent"],
+        help=(
+            "How views share satellite memory during inference. Only independent is "
+            "supported in the current single-view conditioning setup."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--base_model", type=str, default=DEFAULT_SD21_BASE_REPO)
@@ -838,7 +848,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                     "checkpoint": str(Path(args.checkpoint).resolve()),
                     "checkpoint_epoch": checkpoint_meta.get("epoch"),
                     "mode": args.mode,
-                    "memory_mode": "independent",
+                    "memory_mode": args.view_memory_mode,
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
                     "views": [{"view_name": name, "vehicle_yaw_deg": yaw} for name, yaw in view_specs],
@@ -910,7 +920,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     "checkpoint": str(Path(args.checkpoint).resolve()),
                     "checkpoint_epoch": checkpoint_meta.get("epoch"),
                     "mode": args.mode,
-                    "memory_mode": "independent",
+                    "memory_mode": args.view_memory_mode,
                     "dataset_split": args.dataset_split,
                     "split_yaml": str(Path(args.split_yaml)),
                     "start_frame": args.start_frame,
