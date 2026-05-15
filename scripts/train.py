@@ -532,6 +532,7 @@ def main():
     log_dir = Path(str(_config_get(config, ("logging", "log_dir"), args.output_dir)))
     refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
     refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
+    native_cross_attention_config = dict(_config_get(config, ("model", "native_cross_attention"), {}) or {})
 
     _configure_logging(log_dir)
 
@@ -667,6 +668,7 @@ def main():
         freeze_base=freeze_base,
         refinement_block_config=refinement_block_config,
         refinement_injection_sites=tuple(refinement_injection_sites) if refinement_injection_sites is not None else None,
+        native_cross_attention_config=native_cross_attention_config,
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,

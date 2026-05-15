@@ -235,6 +235,30 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertEqual(dataset._choose_fixed_vehicle_yaw(1), -120.0)
         self.assertEqual(dataset._choose_fixed_vehicle_yaw(6), 120.0)
 
+    def test_fixed_vehicle_yaw_sampler_expands_each_frame_to_all_fixed_views(self) -> None:
+        dataset = Kitti360dDataset.__new__(Kitti360dDataset)
+        dataset.vehicle_yaw_fixed_list = Kitti360dDataset._normalize_vehicle_yaw_fixed_list(
+            ["front", -120.0, -90.0, -60.0, 60.0, 90.0, 120.0]
+        )
+        base_samples = [
+            SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=10, meta=None),
+            SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=11, meta=None),
+        ]
+
+        expanded = dataset._expand_samples_for_fixed_vehicle_yaws(base_samples)
+
+        self.assertEqual(len(expanded), 14)
+        self.assertEqual([sample.frame_id for sample in expanded[:7]], [10] * 7)
+        self.assertEqual([sample.frame_id for sample in expanded[7:]], [11] * 7)
+        self.assertEqual(expanded[0].meta["mode_override"], "front")
+        self.assertEqual(expanded[0].meta["view_name"], "front")
+        self.assertNotIn("vehicle_relative_yaw_deg_override", expanded[0].meta)
+        self.assertEqual(expanded[1].meta["mode_override"], "fisheye_virtual")
+        self.assertEqual(expanded[1].meta["vehicle_relative_yaw_deg_override"], -120.0)
+        self.assertEqual(expanded[1].meta["view_name"], "yaw_m120")
+        self.assertEqual(expanded[6].meta["vehicle_relative_yaw_deg_override"], 120.0)
+        self.assertEqual(expanded[6].meta["view_name"], "yaw_p120")
+
     def test_single_view_forward_initializes_satellite_state_per_batch(self) -> None:
         torch.manual_seed(0)
         model = _TestSatelliteConditionedSDModel()

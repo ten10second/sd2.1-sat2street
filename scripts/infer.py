@@ -281,6 +281,7 @@ def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
 def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     if not config:
         args.refinement_block_config = {"enable": not bool(args.disable_refinement)}
+        args.native_cross_attention_config = {}
         return
 
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
@@ -314,6 +315,7 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     if args.disable_refinement:
         refinement_block_config["enable"] = False
     args.refinement_block_config = refinement_block_config or {"enable": not bool(args.disable_refinement)}
+    args.native_cross_attention_config = dict(_config_get(config, ("model", "native_cross_attention"), {}) or {})
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -668,6 +670,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
 
     refinement_block_config = dict(getattr(args, "refinement_block_config", {}) or {})
     refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
+    native_cross_attention_config = dict(getattr(args, "native_cross_attention_config", {}) or {})
 
     logger.info("Loading model")
     model = create_sd_model(
@@ -679,6 +682,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
             if refinement_injection_sites is not None
             else None
         ),
+        native_cross_attention_config=native_cross_attention_config,
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,

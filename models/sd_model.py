@@ -14,6 +14,7 @@ except ImportError:
 from diffusers.utils import USE_PEFT_BACKEND, deprecate, scale_lora_layers, unscale_lora_layers
 
 from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
+from models.unet.geometry_masked_attention_processor import apply_geometry_masked_attn_processors
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
@@ -32,6 +33,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         enable_cross_view_refinement: bool = True,
         refinement_injection_sites: Optional[List[str]] = None,
         refinement_block_config: Optional[Dict[str, Any]] = None,
+        native_cross_attention_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -61,6 +63,66 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
         self.last_refinement_stats: Dict[str, Dict[str, torch.Tensor]] = {}
         self.last_satellite_state: Optional[SatelliteMemoryState] = None
+        self._geometry_attention_context: Optional[Dict[str, Any]] = None
+        self._attention_debug_config: Optional[Dict[str, Any]] = None
+
+        self.native_cross_attention_config = {
+            "enable_geometry_mask": False,
+            "mask_sites": ["down1", "down2", "mid"],
+            "mask_mode": "topk",
+            "topk": 32,
+            "mask_invalid_queries": True,
+            "fallback_to_unmasked": True,
+            "use_metric_coords": False,
+        }
+        if native_cross_attention_config is not None:
+            self.native_cross_attention_config.update(native_cross_attention_config)
+        self.geometry_masked_attn_sites: List[str] = []
+        if self.native_cross_attention_config.get("enable_geometry_mask", False):
+            self._apply_native_geometry_mask_processors()
+
+    def _get_geometry_attention_context(self) -> Optional[Dict[str, Any]]:
+        return self._geometry_attention_context
+
+    def enable_attention_debug(
+        self,
+        *,
+        layers: Optional[List[str]] = None,
+        storage: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if storage is None:
+            storage = {}
+        self._attention_debug_config = {
+            "enabled": True,
+            "layers": set(layers or []),
+            "storage": storage,
+        }
+        return storage
+
+    def disable_attention_debug(self) -> None:
+        self._attention_debug_config = None
+
+    def _apply_native_geometry_mask_processors(self) -> List[str]:
+        self.geometry_masked_attn_sites = []
+        if not self.native_cross_attention_config.get("enable_geometry_mask", False):
+            return self.geometry_masked_attn_sites
+        mask_mode = str(self.native_cross_attention_config.get("mask_mode", "topk")).lower()
+        if mask_mode != "topk":
+            raise ValueError(f"Only native_cross_attention.mask_mode='topk' is supported, got {mask_mode!r}")
+        self.geometry_masked_attn_sites = apply_geometry_masked_attn_processors(
+            self,
+            sites=self.native_cross_attention_config.get("mask_sites", ["down1", "down2", "mid"]),
+            context_provider=self._get_geometry_attention_context,
+            topk=int(self.native_cross_attention_config.get("topk", 32)),
+            mask_invalid_queries=bool(self.native_cross_attention_config.get("mask_invalid_queries", True)),
+            fallback_to_unmasked=bool(self.native_cross_attention_config.get("fallback_to_unmasked", True)),
+            use_metric_coords=bool(self.native_cross_attention_config.get("use_metric_coords", False)),
+        )
+        return self.geometry_masked_attn_sites
+
+    def set_attention_slice(self, slice_size: Union[str, int, List[int], None]) -> None:
+        super().set_attention_slice(slice_size)
+        self._apply_native_geometry_mask_processors()
 
     def _get_or_create_refinement_block(
         self,
@@ -424,6 +486,17 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.last_attn_maps = {}
         self.last_refinement_stats = {}
         self.last_satellite_state = None
+        self._geometry_attention_context = None
+        if conditioning_state is not None:
+            self._geometry_attention_context = {
+                "sat_xy": conditioning_state.satellite.xy,
+                "sat_bev_coords": conditioning_state.satellite.bev_coords,
+                "front_bev_xy": conditioning_state.front_bev_xy,
+                "front_ground_valid_mask": conditioning_state.front_ground_valid_mask,
+                "condition_mask": conditioning_state.condition_mask,
+                "attention_debug": self._attention_debug_config,
+                "timestep": timestep,
+            }
         default_overall_up_factor = 2 ** self.num_upsamplers
         forward_upsample_size = False
         upsample_size = None

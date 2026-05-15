@@ -264,6 +264,11 @@ def _choose_nearest_fisheye_camera(vehicle_relative_yaw_deg: float) -> str:
     )
 
 
+def _vehicle_yaw_view_name(yaw_deg: float) -> str:
+    prefix = "p" if yaw_deg > 0 else "m" if yaw_deg < 0 else ""
+    return f"yaw_{prefix}{abs(float(yaw_deg)):g}".replace(".", "p")
+
+
 def compute_camera_bev_xy(
     K: np.ndarray,
     T_cam_to_world: np.ndarray,
@@ -557,6 +562,13 @@ class Kitti360dDataset(Dataset):
             for fid in ids:
                 self.samples.append(SampleIndex(drive_dir=d, frame_id=int(fid)))
 
+        if (
+            self.mode == "fisheye_virtual"
+            and self.yaw_mode == "vehicle_relative"
+            and self.vehicle_yaw_sampling == "fixed_list"
+        ):
+            self.samples = self._expand_samples_for_fixed_vehicle_yaws(self.samples)
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -589,10 +601,43 @@ class Kitti360dDataset(Dataset):
             normalized.append(float(value))
         return normalized
 
+    def _expand_samples_for_fixed_vehicle_yaws(
+        self,
+        samples: List[SampleIndex],
+    ) -> List[SampleIndex]:
+        expanded: List[SampleIndex] = []
+        for sample in samples:
+            base_meta = dict(sample.meta or {})
+            for fixed_yaw in self.vehicle_yaw_fixed_list:
+                meta = dict(base_meta)
+                if fixed_yaw is None:
+                    meta["mode_override"] = "front"
+                    meta["view_name"] = "front"
+                    meta.pop("vehicle_relative_yaw_deg_override", None)
+                else:
+                    yaw = float(fixed_yaw)
+                    meta["mode_override"] = "fisheye_virtual"
+                    meta["view_name"] = _vehicle_yaw_view_name(yaw)
+                    meta["vehicle_relative_yaw_deg_override"] = yaw
+                expanded.append(
+                    SampleIndex(
+                        drive_dir=sample.drive_dir,
+                        frame_id=sample.frame_id,
+                        meta=meta,
+                    )
+                )
+        return expanded
+
     def _choose_fixed_vehicle_yaw(self, idx: int) -> Optional[float]:
+        sample = self.samples[int(idx)]
+        if isinstance(sample.meta, dict) and "mode_override" in sample.meta:
+            if sample.meta.get("mode_override") == "front":
+                return None
+            if "vehicle_relative_yaw_deg_override" in sample.meta:
+                return float(sample.meta["vehicle_relative_yaw_deg_override"])
         if not self.vehicle_yaw_fixed_list:
             raise ValueError("vehicle_yaw_fixed_list is empty")
-        fixed_index = (int(idx) + int(self.epoch) * len(self.samples)) % len(self.vehicle_yaw_fixed_list)
+        fixed_index = int(idx) % len(self.vehicle_yaw_fixed_list)
         return self.vehicle_yaw_fixed_list[fixed_index]
 
     def _resolve_sample_mode(self, sample: SampleIndex) -> str:

@@ -50,7 +50,7 @@ model:
 
   # Ground-PE satellite update block
   refinement_block:
-    enable: true
+    enable: false
     injection_sites: ['mid', 'up0', 'up1']
     num_heads: 8
     head_dim: 64
@@ -62,8 +62,18 @@ model:
     geom_head_dim: 16
     sat_update_layers: 2
     use_geom_bias: true
-    adapter_residual: true
+    adapter_residual: false
     adapter_residual_scale: 1.0
+
+  # Native SD attn2 geometry mask (scheme B)
+  native_cross_attention:
+    enable_geometry_mask: true
+    mask_sites: ['down1', 'down2', 'mid']
+    mask_mode: 'topk'
+    topk: 32
+    mask_invalid_queries: true
+    fallback_to_unmasked: true
+    use_metric_coords: false
 
 # 训练配置
 training:

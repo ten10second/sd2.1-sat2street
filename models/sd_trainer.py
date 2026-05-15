@@ -25,7 +25,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Sequence, Tuple
 import logging
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 from models.conditioning import SatelliteMemoryState
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
@@ -33,6 +33,13 @@ from models.sd_model import SatelliteConditionedUNet
 
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_ATTENTION_VIS_LAYERS = [
+    "down_blocks.1.attentions.1.transformer_blocks.0.attn2",
+    "down_blocks.2.attentions.1.transformer_blocks.0.attn2",
+    "mid_block.attentions.0.transformer_blocks.0.attn2",
+]
 
 
 def _aggregate_refinement_stats(
@@ -81,11 +88,17 @@ def _aggregate_refinement_stats(
     return aggregated
 
 
+def _is_missing_processor_key(key: str) -> bool:
+    return ".processor." in key
+
+
 def load_model_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
 ) -> Tuple[Sequence[str], Sequence[str]]:
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    missing_keys = [key for key in missing_keys if not _is_missing_processor_key(key)]
+    unexpected_keys = [key for key in unexpected_keys if not _is_missing_processor_key(key)]
     if missing_keys:
         raise RuntimeError(f"Missing keys when loading checkpoint: {missing_keys}")
     if unexpected_keys:
@@ -152,10 +165,12 @@ def _materialize_lazy_modules(
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
     latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
+    unet_param = next(model.unet.parameters(), None)
+    latent_dtype = unet_param.dtype if unet_param is not None else sat_state.tokens.dtype
     latents = torch.randn(
         (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
         device=sat_images.device,
-        dtype=sat_state.tokens.dtype,
+        dtype=latent_dtype,
     )
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
 
@@ -255,6 +270,9 @@ class SatelliteConditionedSDModel(nn.Module):
 
     def encode_satellite(self, sat_images: torch.Tensor) -> SatelliteMemoryState:
         """Encode satellite images into a structured satellite memory state."""
+        encoder_param = next(self.satellite_encoder.parameters(), None)
+        if encoder_param is not None:
+            sat_images = sat_images.to(dtype=encoder_param.dtype)
         return self.satellite_encoder(sat_images)
 
     @staticmethod
@@ -557,12 +575,14 @@ class SatelliteConditionedSDModel(nn.Module):
         vae_scale_factor = self._get_vae_scale_factor()
         latent_h = max(1, (image_h + vae_scale_factor - 1) // vae_scale_factor)
         latent_w = max(1, (image_w + vae_scale_factor - 1) // vae_scale_factor)
+        unet_param = next(self.unet.parameters(), None)
+        latent_dtype = unet_param.dtype if unet_param is not None else sat_state.tokens.dtype
 
         # Initialize latents
         latents = torch.randn(
             (B, self.unet.config.in_channels, latent_h, latent_w),
             device=device,
-            dtype=sat_state.tokens.dtype,
+            dtype=latent_dtype,
             generator=generator,
         )
 
@@ -710,6 +730,7 @@ def create_sd_model(
     freeze_base: bool = True,
     refinement_block_config: Optional[Dict] = None,
     refinement_injection_sites: Optional[Tuple[str, ...]] = None,
+    native_cross_attention_config: Optional[Dict] = None,
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
@@ -767,9 +788,12 @@ def create_sd_model(
             'adapter_residual': refinement_cfg.get('adapter_residual', True),
             'adapter_residual_scale': refinement_cfg.get('adapter_residual_scale', 1.0),
         },
+        native_cross_attention_config=native_cross_attention_config,
         **base_unet.config,
     )
     unet.load_state_dict(base_unet.state_dict(), strict=False)
+    if torch_dtype is not None:
+        unet = unet.to(dtype=torch_dtype)
     scheduler_load_kwargs: Dict[str, Any] = {}
     if revision is not None and resolved_base_model is None:
         scheduler_load_kwargs["revision"] = revision
@@ -830,6 +854,7 @@ class SDTrainer:
         visualization_inference_steps: int = 20,
         visualization_guidance_scale: float = 1.0,
         visualization_seed: int = 42,
+        attention_visualization_layers: Optional[Sequence[str]] = None,
         distributed: bool = False,
         local_rank: int = 0,
     ):
@@ -863,6 +888,11 @@ class SDTrainer:
         self.visualization_inference_steps = int(visualization_inference_steps)
         self.visualization_guidance_scale = float(visualization_guidance_scale)
         self.visualization_seed = int(visualization_seed)
+        self.attention_visualization_layers = list(
+            attention_visualization_layers
+            if attention_visualization_layers is not None
+            else DEFAULT_ATTENTION_VIS_LAYERS
+        )
         self.visualization_dir = self.output_dir / "visualizations"
         if self.is_main_process:
             self.visualization_dir.mkdir(parents=True, exist_ok=True)
@@ -1622,12 +1652,57 @@ class SDTrainer:
 
         return cls._coords_to_satellite_pixels(coords, sat_width, sat_height)
 
+    @staticmethod
+    def _convex_hull_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        if len(points) <= 3:
+            return points
+
+        unique_points = sorted(set((float(x), float(y)) for x, y in points))
+        if len(unique_points) <= 3:
+            return unique_points
+
+        def cross(
+            origin: Tuple[float, float],
+            a: Tuple[float, float],
+            b: Tuple[float, float],
+        ) -> float:
+            return (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
+
+        lower: List[Tuple[float, float]] = []
+        for point in unique_points:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+                lower.pop()
+            lower.append(point)
+
+        upper: List[Tuple[float, float]] = []
+        for point in reversed(unique_points):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+                upper.pop()
+            upper.append(point)
+
+        return lower[:-1] + upper[:-1]
+
+    @staticmethod
+    def _front_mask_to_hw(front_ground_valid_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if front_ground_valid_mask is None or not torch.is_tensor(front_ground_valid_mask):
+            return None
+
+        mask = front_ground_valid_mask.detach().cpu().to(torch.float32)
+        if mask.ndim == 3 and mask.shape[0] == 1:
+            return mask[0] > 0.5
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            return mask[..., 0] > 0.5
+        if mask.ndim == 2:
+            return mask > 0.5
+        return None
+
     @classmethod
     def _front_bev_xy_to_fov_polygon(
         cls,
         front_bev_xy: Optional[torch.Tensor],
         sat_width: int,
         sat_height: int,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
     ) -> List[Tuple[float, float]]:
         if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
             return []
@@ -1643,6 +1718,27 @@ class SDTrainer:
         height, width = int(coords_hw.shape[0]), int(coords_hw.shape[1])
         if height < 2 or width < 2:
             return []
+
+        valid_mask = cls._front_mask_to_hw(front_ground_valid_mask)
+        if valid_mask is not None and tuple(valid_mask.shape) == (height, width):
+            valid_coords = coords_hw[valid_mask]
+            points, bbox = cls._coords_to_satellite_pixels(valid_coords, sat_width, sat_height)
+            if len(points) >= 3:
+                max_hull_points = 6000
+                if len(points) > max_hull_points:
+                    step = max(1, len(points) // max_hull_points)
+                    points = points[::step]
+                hull = cls._convex_hull_points(points)
+                if len(hull) >= 3:
+                    return hull
+            if bbox is not None:
+                left_px, top_px, right_px, bottom_px = bbox
+                return [
+                    (left_px, top_px),
+                    (right_px, top_px),
+                    (right_px, bottom_px),
+                    (left_px, bottom_px),
+                ]
 
         top = coords_hw[0, :, :]
         right = coords_hw[:, width - 1, :]
@@ -1669,13 +1765,19 @@ class SDTrainer:
         cls,
         sat_image: torch.Tensor,
         front_bev_xy: Optional[torch.Tensor],
+        front_ground_valid_mask: Optional[torch.Tensor],
         view_label: Optional[str],
         yaw_deg: Optional[float],
     ) -> Image.Image:
         image = cls._tensor_to_pil(sat_image).convert("RGB")
         draw = ImageDraw.Draw(image, "RGBA")
         width, height = image.size
-        polygon = cls._front_bev_xy_to_fov_polygon(front_bev_xy, width, height)
+        polygon = cls._front_bev_xy_to_fov_polygon(
+            front_bev_xy,
+            width,
+            height,
+            front_ground_valid_mask=front_ground_valid_mask,
+        )
 
         center = (width / 2.0, height / 2.0)
         cross = max(4, int(round(min(width, height) * 0.027)))
@@ -1701,6 +1803,7 @@ class SDTrainer:
         generated_image: torch.Tensor,
         real_image: torch.Tensor,
         front_bev_xy: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
         view_label: Optional[str] = None,
         yaw_deg: Optional[float] = None,
     ) -> Image.Image:
@@ -1715,6 +1818,7 @@ class SDTrainer:
         sat_pil = self._draw_satellite_view_coverage(
             sat_resized,
             front_bev_xy=front_bev_xy,
+            front_ground_valid_mask=front_ground_valid_mask,
             view_label=view_label,
             yaw_deg=yaw_deg,
         )
@@ -1727,6 +1831,180 @@ class SDTrainer:
             canvas.paste(img, (x_offset, 0))
             x_offset += img.width
         return canvas
+
+    @staticmethod
+    def _safe_filename_token(value: str) -> str:
+        return (
+            str(value)
+            .replace("/", "_")
+            .replace(".", "_")
+            .replace(":", "_")
+            .replace(" ", "_")
+        )
+
+    @staticmethod
+    def _normalize_heatmap(values: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        values = values.detach().float()
+        finite = torch.isfinite(values)
+        if not bool(finite.any().item()):
+            return torch.zeros_like(values, dtype=torch.float32)
+        min_value = values[finite].min()
+        max_value = values[finite].max()
+        normalized = (values - min_value) / (max_value - min_value + eps)
+        return normalized.clamp(0, 1).masked_fill(~finite, 0)
+
+    @classmethod
+    def _heatmap_to_pil(cls, values: torch.Tensor, size: Optional[Tuple[int, int]] = None) -> Image.Image:
+        normalized = cls._normalize_heatmap(values)
+        image = (normalized * 255).to(torch.uint8).cpu().numpy()
+        pil = Image.fromarray(image, mode="L")
+        pil = ImageOps.colorize(pil, black=(0, 0, 60), white=(255, 48, 0), mid=(255, 220, 0))
+        if size is not None and pil.size != size:
+            pil = pil.resize(size, Image.Resampling.BILINEAR)
+        return pil.convert("RGB")
+
+    @staticmethod
+    def _xy_to_pixel(xy: torch.Tensor, width: int, height: int) -> Tuple[float, float]:
+        x = (float(xy[0]) + 1.0) * 0.5 * float(max(1, width - 1))
+        y = (1.0 - (float(xy[1]) + 1.0) * 0.5) * float(max(1, height - 1))
+        return x, y
+
+    @classmethod
+    def _draw_target_marker(
+        cls,
+        image: Image.Image,
+        xy: torch.Tensor,
+        *,
+        color: Tuple[int, int, int] = (0, 255, 255),
+    ) -> None:
+        draw = ImageDraw.Draw(image, "RGBA")
+        width, height = image.size
+        x, y = cls._xy_to_pixel(xy, width, height)
+        radius = max(3, int(round(min(width, height) * 0.018)))
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color + (255,), width=2)
+        draw.line((x - radius * 1.6, y, x + radius * 1.6, y), fill=color + (255,), width=2)
+        draw.line((x, y - radius * 1.6, x, y + radius * 1.6), fill=color + (255,), width=2)
+
+    @staticmethod
+    def _select_attention_query_indices(
+        query_mask: Optional[torch.Tensor],
+        query_hw: Tuple[int, int],
+    ) -> List[int]:
+        height, width = int(query_hw[0]), int(query_hw[1])
+        candidates = [
+            (int(round(height * 0.78)), int(round(width * 0.50))),
+            (int(round(height * 0.66)), int(round(width * 0.30))),
+            (int(round(height * 0.66)), int(round(width * 0.70))),
+            (int(round(height * 0.50)), int(round(width * 0.50))),
+        ]
+        indices = []
+        flat_mask = query_mask.reshape(-1).bool() if torch.is_tensor(query_mask) else None
+        for row, col in candidates:
+            row = min(max(row, 0), height - 1)
+            col = min(max(col, 0), width - 1)
+            index = row * width + col
+            if flat_mask is not None and not bool(flat_mask[index].item()):
+                valid = torch.nonzero(flat_mask, as_tuple=False).flatten()
+                if valid.numel() == 0:
+                    continue
+                grid = torch.stack(
+                    [valid // width, valid % width],
+                    dim=-1,
+                ).float()
+                target = torch.tensor([row, col], dtype=torch.float32)
+                index = int(valid[((grid - target).pow(2).sum(dim=-1)).argmin()].item())
+            if index not in indices:
+                indices.append(index)
+        return indices
+
+    def _save_attention_debug_visualizations(
+        self,
+        *,
+        attention_debug: Dict[str, Any],
+        sat_image: torch.Tensor,
+        front_bev_xy: Optional[torch.Tensor],
+        front_ground_valid_mask: Optional[torch.Tensor],
+        output_dir: Path,
+        prefix: str,
+    ) -> None:
+        if not attention_debug:
+            return
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sat_base = self._tensor_to_pil(sat_image).convert("RGB")
+        sat_width, sat_height = sat_base.size
+
+        for layer_name, payload in attention_debug.items():
+            attention = payload.get("attention")
+            front_xy = payload.get("front_xy")
+            sat_xy = payload.get("sat_xy")
+            query_hw = payload.get("query_hw")
+            sat_hw = payload.get("sat_hw")
+            if (
+                not torch.is_tensor(attention)
+                or not torch.is_tensor(front_xy)
+                or not torch.is_tensor(sat_xy)
+                or query_hw is None
+            ):
+                continue
+            if attention.ndim != 3 or front_xy.ndim != 3 or sat_xy.ndim != 3:
+                continue
+
+            attention = attention[0]
+            front_xy = front_xy[0]
+            sat_xy = sat_xy[0]
+            query_mask = payload.get("query_mask")
+            if torch.is_tensor(query_mask):
+                query_mask = query_mask[0]
+
+            if sat_hw is None:
+                side = int(math.isqrt(attention.shape[-1]))
+                sat_hw = (side, side) if side * side == attention.shape[-1] else None
+            if sat_hw is None:
+                continue
+
+            layer_token = self._safe_filename_token(layer_name)
+            query_indices = self._select_attention_query_indices(query_mask, query_hw)
+            heatmaps = []
+            for query_index in query_indices:
+                heat = attention[query_index].reshape(int(sat_hw[0]), int(sat_hw[1]))
+                heat_pil = self._heatmap_to_pil(heat, size=(sat_width, sat_height))
+                overlay = Image.blend(sat_base, heat_pil, alpha=0.55)
+                self._draw_target_marker(overlay, front_xy[query_index], color=(0, 255, 255))
+                draw = ImageDraw.Draw(overlay, "RGBA")
+                row = int(query_index) // int(query_hw[1])
+                col = int(query_index) % int(query_hw[1])
+                draw.rectangle((4, 4, 150, 25), fill=(0, 0, 0, 150))
+                draw.text((8, 8), f"q=({row},{col})", fill=(255, 255, 255, 255))
+                heatmaps.append(overlay)
+                overlay.save(output_dir / f"{prefix}_{layer_token}_q{query_index:04d}_sat_heatmap.png")
+
+            if heatmaps:
+                canvas = Image.new("RGB", (sat_width * len(heatmaps), sat_height))
+                for idx, image in enumerate(heatmaps):
+                    canvas.paste(image, (idx * sat_width, 0))
+                canvas.save(output_dir / f"{prefix}_{layer_token}_sat_heatmaps.png")
+
+            predicted_xy = torch.matmul(attention, sat_xy.float())
+            error = (predicted_xy - front_xy.float()).pow(2).sum(dim=-1).sqrt()
+            if torch.is_tensor(query_mask):
+                error = error.masked_fill(~query_mask.reshape(-1).bool(), float("nan"))
+            error_map = error.reshape(int(query_hw[0]), int(query_hw[1]))
+            error_pil = self._heatmap_to_pil(error_map, size=(sat_width, sat_height))
+            if front_bev_xy is not None:
+                base = sat_base.copy()
+                draw = ImageDraw.Draw(base, "RGBA")
+                polygon = self._front_bev_xy_to_fov_polygon(
+                    front_bev_xy,
+                    sat_width,
+                    sat_height,
+                    front_ground_valid_mask=front_ground_valid_mask,
+                )
+                if polygon:
+                    draw.polygon(polygon, fill=(0, 180, 255, 35), outline=(255, 230, 0, 220))
+                    draw.line(polygon + [polygon[0]], fill=(255, 230, 0, 220), width=2)
+                error_pil = Image.blend(base, error_pil, alpha=0.55)
+            error_pil.save(output_dir / f"{prefix}_{layer_token}_alignment_error.png")
 
     @staticmethod
     def _visualization_view_specs() -> List[Tuple[str, Optional[float]]]:
@@ -1905,6 +2183,8 @@ class SDTrainer:
         generator = torch.Generator(device=generator_device)
         generator.manual_seed(self.visualization_seed)
         generated_chunks = []
+        attention_debug_by_sample: List[Dict[str, Any]] = []
+        unet = getattr(eval_model, "unet", None)
         for idx in range(sat_images.shape[0]):
             view_sat_state = SatelliteMemoryState(
                 tokens=sat_state.tokens[idx:idx + 1],
@@ -1921,22 +2201,34 @@ class SDTrainer:
                 if front_ground_valid_mask is not None
                 else None
             )
-            generated_view, _ = eval_model.generate_with_satellite_state(
-                view_sat_state,
-                front_bev_xy=view_front_bev_xy,
-                front_ground_valid_mask=view_front_ground_valid_mask,
-                target_size=tuple(target_images.shape[-2:]),
-                num_inference_steps=self.visualization_inference_steps,
-                guidance_scale=self.visualization_guidance_scale,
-                generator=generator,
-            )
+            attention_debug: Dict[str, Any] = {}
+            if unet is not None and hasattr(unet, "enable_attention_debug"):
+                unet.enable_attention_debug(
+                    layers=self.attention_visualization_layers,
+                    storage=attention_debug,
+                )
+            try:
+                generated_view, _ = eval_model.generate_with_satellite_state(
+                    view_sat_state,
+                    front_bev_xy=view_front_bev_xy,
+                    front_ground_valid_mask=view_front_ground_valid_mask,
+                    target_size=tuple(target_images.shape[-2:]),
+                    num_inference_steps=self.visualization_inference_steps,
+                    guidance_scale=self.visualization_guidance_scale,
+                    generator=generator,
+                )
+            finally:
+                if unet is not None and hasattr(unet, "disable_attention_debug"):
+                    unet.disable_attention_debug()
             generated_chunks.append(generated_view)
+            attention_debug_by_sample.append(attention_debug)
         generated_images = torch.cat(generated_chunks, dim=0)
         if was_training:
             eval_model.train()
 
         epoch_dir = self.visualization_dir / f"epoch_{epoch + 1:04d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
+        attention_dir = epoch_dir / "attention"
         comparison_images = []
         captions = []
 
@@ -1950,10 +2242,24 @@ class SDTrainer:
                 generated_images[idx],
                 target_images[idx],
                 front_bev_xy=front_bev_xy[idx] if front_bev_xy is not None else None,
+                front_ground_valid_mask=(
+                    front_ground_valid_mask[idx] if front_ground_valid_mask is not None else None
+                ),
                 view_label=view_label,
                 yaw_deg=yaw_degs[idx],
             )
             comparison.save(epoch_dir / f"sample_{idx:02d}{view_suffix}{frame_suffix}.png")
+            attention_prefix = f"sample_{idx:02d}{view_suffix}{frame_suffix}"
+            self._save_attention_debug_visualizations(
+                attention_debug=attention_debug_by_sample[idx],
+                sat_image=sat_images[idx],
+                front_bev_xy=front_bev_xy[idx] if front_bev_xy is not None else None,
+                front_ground_valid_mask=(
+                    front_ground_valid_mask[idx] if front_ground_valid_mask is not None else None
+                ),
+                output_dir=attention_dir,
+                prefix=attention_prefix,
+            )
             comparison_images.append(comparison)
             caption = f"epoch={epoch + 1} sample={idx:02d}"
             if view_label:
