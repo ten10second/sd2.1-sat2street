@@ -23,6 +23,8 @@ data:
   vehicle_yaw_sampling: 'fixed_list'
   vehicle_yaw_fixed_list: ['front', -120.0, -90.0, -60.0, 60.0, 90.0, 120.0]
   front_sample_prob: 0.0
+  pitch_deg: 0.0
+  roll_deg: 0.0
   front_resize: [640, 256]
 
 # 模型配置
@@ -74,6 +76,11 @@ model:
     mask_invalid_queries: true
     fallback_to_unmasked: true
     use_metric_coords: false
+    enable_geometry_bias: true
+    geometry_bias_type: 'dist_dir'
+    lambda_dist: 2.0
+    lambda_dir: 0.5
+    learnable_geometry_bias: false
 
 # 训练配置
 training:

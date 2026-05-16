@@ -249,6 +249,7 @@ class SatelliteConditionedSDModel(nn.Module):
                 if (
                     ".attn2.to_k." in name
                     or ".attn2.to_v." in name
+                    or ".attn2.processor." in name
                 ):
                     param.requires_grad = True
                 else:
@@ -264,6 +265,10 @@ class SatelliteConditionedSDModel(nn.Module):
         logger.info(
             f"  Trainable attn2 k/v params: "
             f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and ('.attn2.to_k.' in n or '.attn2.to_v.' in n))}"
+        )
+        logger.info(
+            f"  Trainable attn2 processor params: "
+            f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and '.attn2.processor.' in n)}"
         )
         logger.info("  Main attn2 route: satellite tokens")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
@@ -1988,11 +1993,22 @@ class SDTrainer:
             predicted_xy = torch.matmul(attention, sat_xy.float())
             error = (predicted_xy - front_xy.float()).pow(2).sum(dim=-1).sqrt()
             if torch.is_tensor(query_mask):
-                error = error.masked_fill(~query_mask.reshape(-1).bool(), float("nan"))
-            error_map = error.reshape(int(query_hw[0]), int(query_hw[1]))
-            error_pil = self._heatmap_to_pil(error_map, size=(sat_width, sat_height))
+                valid_query = query_mask.reshape(-1).bool()
+                attention_for_error = attention.masked_fill(~valid_query[:, None], 0.0)
+                error_for_error = error.masked_fill(~valid_query, 0.0)
+            else:
+                attention_for_error = attention
+                error_for_error = error
+
+            sat_error_weight = attention_for_error.sum(dim=0)
+            sat_error = (attention_for_error * error_for_error[:, None]).sum(dim=0)
+            sat_error = sat_error / sat_error_weight.clamp_min(1e-8)
+            sat_error = sat_error.masked_fill(sat_error_weight <= 1e-8, float("nan"))
+            bev_error_map = sat_error.reshape(int(sat_hw[0]), int(sat_hw[1]))
+            bev_error_pil = self._heatmap_to_pil(bev_error_map, size=(sat_width, sat_height))
+
+            base = sat_base.copy()
             if front_bev_xy is not None:
-                base = sat_base.copy()
                 draw = ImageDraw.Draw(base, "RGBA")
                 polygon = self._front_bev_xy_to_fov_polygon(
                     front_bev_xy,
@@ -2003,8 +2019,8 @@ class SDTrainer:
                 if polygon:
                     draw.polygon(polygon, fill=(0, 180, 255, 35), outline=(255, 230, 0, 220))
                     draw.line(polygon + [polygon[0]], fill=(255, 230, 0, 220), width=2)
-                error_pil = Image.blend(base, error_pil, alpha=0.55)
-            error_pil.save(output_dir / f"{prefix}_{layer_token}_alignment_error.png")
+            bev_error_pil = Image.blend(base, bev_error_pil, alpha=0.55)
+            bev_error_pil.save(output_dir / f"{prefix}_{layer_token}_bev_alignment_error.png")
 
     @staticmethod
     def _visualization_view_specs() -> List[Tuple[str, Optional[float]]]:

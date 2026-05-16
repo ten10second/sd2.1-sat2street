@@ -74,6 +74,10 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             "mask_invalid_queries": True,
             "fallback_to_unmasked": True,
             "use_metric_coords": False,
+            "enable_geometry_bias": False,
+            "lambda_dist": 2.0,
+            "lambda_dir": 0.5,
+            "learnable_geometry_bias": False,
         }
         if native_cross_attention_config is not None:
             self.native_cross_attention_config.update(native_cross_attention_config)
@@ -117,6 +121,11 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             mask_invalid_queries=bool(self.native_cross_attention_config.get("mask_invalid_queries", True)),
             fallback_to_unmasked=bool(self.native_cross_attention_config.get("fallback_to_unmasked", True)),
             use_metric_coords=bool(self.native_cross_attention_config.get("use_metric_coords", False)),
+            enable_geometry_bias=bool(self.native_cross_attention_config.get("enable_geometry_bias", False)),
+            geometry_bias_type=str(self.native_cross_attention_config.get("geometry_bias_type", "dist_dir")),
+            lambda_dist=float(self.native_cross_attention_config.get("lambda_dist", 2.0)),
+            lambda_dir=float(self.native_cross_attention_config.get("lambda_dir", 0.5)),
+            learnable_geometry_bias=bool(self.native_cross_attention_config.get("learnable_geometry_bias", False)),
         )
         return self.geometry_masked_attn_sites
 

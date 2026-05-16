@@ -37,6 +37,16 @@ DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
 
 
+def _worker_init_fn(_worker_id: int) -> None:
+    try:
+        import cv2  # type: ignore
+
+        cv2.setNumThreads(0)
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+
+
 def _init_distributed(args) -> Tuple[bool, int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -333,6 +343,18 @@ def main():
         help="Probability that a training item uses the real image_00 front view instead of a random virtual fisheye yaw.",
     )
     parser.add_argument(
+        "--pitch_deg",
+        type=float,
+        default=0.0,
+        help="Virtual camera pitch in degrees for fisheye remap and BEV projection.",
+    )
+    parser.add_argument(
+        "--roll_deg",
+        type=float,
+        default=0.0,
+        help="Virtual camera roll in degrees for fisheye remap and BEV projection.",
+    )
+    parser.add_argument(
         "--guidance_scale", type=float, default=3.0,
         help="Guidance scale used for training visualizations. 1.0 disables CFG.",
     )
@@ -497,6 +519,8 @@ def main():
             _config_get(config, ("data", "front_sample_prob")),
         )
     )
+    args.pitch_deg = float(_prefer_config(args.pitch_deg, 0.0, _config_get(config, ("data", "pitch_deg"))))
+    args.roll_deg = float(_prefer_config(args.roll_deg, 0.0, _config_get(config, ("data", "roll_deg"))))
     args.guidance_scale = float(
         _prefer_config(args.guidance_scale, 3.0, _config_get(config, ("validation", "guidance_scale")))
     )
@@ -586,6 +610,8 @@ def main():
         random_fisheye_relative_yaw=False,
         random_vehicle_relative_yaw=False,
         front_sample_prob=0.0,
+        pitch_deg=args.pitch_deg,
+        roll_deg=args.roll_deg,
         seed=args.seed,
         return_bgr=False,
     )
@@ -646,6 +672,7 @@ def main():
         pin_memory=True,
         drop_last=True,
         collate_fn=_safe_collate,
+        worker_init_fn=_worker_init_fn if args.num_workers > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -655,6 +682,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=_safe_collate,
+        worker_init_fn=_worker_init_fn if args.num_workers > 0 else None,
     )
 
     if is_main_process:

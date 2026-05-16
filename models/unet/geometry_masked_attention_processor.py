@@ -8,6 +8,7 @@ import math
 from typing import Any, Callable, Optional, Sequence
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 try:
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover - compatibility with older diffusers lay
 GeometryContextProvider = Callable[[], Optional[dict[str, Any]]]
 
 
-class GeometryMaskedAttnProcessor2_0:
+class GeometryMaskedAttnProcessor2_0(nn.Module):
     """
     PyTorch-2 SDPA attention processor with BEV top-k masking for satellite cross-attn.
 
@@ -37,7 +38,13 @@ class GeometryMaskedAttnProcessor2_0:
         mask_invalid_queries: bool = True,
         fallback_to_unmasked: bool = True,
         use_metric_coords: bool = False,
+        enable_geometry_bias: bool = False,
+        geometry_bias_type: str = "dist_dir",
+        lambda_dist: float = 2.0,
+        lambda_dir: float = 0.5,
+        learnable_geometry_bias: bool = False,
     ):
+        super().__init__()
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("GeometryMaskedAttnProcessor2_0 requires PyTorch 2.0 SDPA support")
         if topk <= 0:
@@ -49,6 +56,17 @@ class GeometryMaskedAttnProcessor2_0:
         self.mask_invalid_queries = bool(mask_invalid_queries)
         self.fallback_to_unmasked = bool(fallback_to_unmasked)
         self.use_metric_coords = bool(use_metric_coords)
+        self.enable_geometry_bias = bool(enable_geometry_bias)
+        self.geometry_bias_type = str(geometry_bias_type).lower()
+        if self.geometry_bias_type != "dist_dir":
+            raise ValueError(f"Only geometry_bias_type='dist_dir' is supported, got {geometry_bias_type!r}")
+        self.learnable_geometry_bias = bool(learnable_geometry_bias)
+        if self.learnable_geometry_bias:
+            self.lambda_dist = nn.Parameter(torch.tensor(float(lambda_dist)))
+            self.lambda_dir = nn.Parameter(torch.tensor(float(lambda_dir)))
+        else:
+            self.register_buffer("lambda_dist", torch.tensor(float(lambda_dist)), persistent=True)
+            self.register_buffer("lambda_dir", torch.tensor(float(lambda_dir)), persistent=True)
 
     @staticmethod
     def _front_xy_to_bchw(front_bev_xy: torch.Tensor) -> Optional[torch.Tensor]:
@@ -147,7 +165,31 @@ class GeometryMaskedAttnProcessor2_0:
             return None
         return sat_xy.to(device=device, dtype=dtype)
 
-    def _build_geometry_mask(
+    def _build_geometry_attention_bias(
+        self,
+        *,
+        front_xy: torch.Tensor,
+        sat_xy: torch.Tensor,
+        dist2: torch.Tensor,
+        keep: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        min_value = -10000.0
+        if not self.enable_geometry_bias:
+            mask = torch.zeros(keep.shape, device=keep.device, dtype=dtype)
+            return mask.masked_fill(~keep, min_value)
+
+        front_dir = F.normalize(front_xy.float(), dim=-1, eps=1e-6).to(dtype=front_xy.dtype)
+        sat_dir = F.normalize(sat_xy.float(), dim=-1, eps=1e-6).to(dtype=sat_xy.dtype)
+        dir_cos = (front_dir.unsqueeze(2) * sat_dir.unsqueeze(1)).sum(dim=-1)
+
+        lambda_dist = self.lambda_dist.to(device=front_xy.device, dtype=front_xy.dtype).clamp_min(0.0)
+        lambda_dir = self.lambda_dir.to(device=front_xy.device, dtype=front_xy.dtype)
+        geo_bias = -lambda_dist * dist2 + lambda_dir * dir_cos
+        masked_bias = torch.full_like(geo_bias, min_value)
+        return torch.where(keep, geo_bias, masked_bias).to(dtype=dtype)
+
+    def _build_geometry_attention_mask(
         self,
         *,
         context: dict[str, Any],
@@ -171,11 +213,7 @@ class GeometryMaskedAttnProcessor2_0:
         topk = min(self.topk, int(key_length))
         dist2 = (front_xy.unsqueeze(2) - sat_xy.unsqueeze(1)).pow(2).sum(dim=-1)
         nearest = torch.topk(dist2, k=topk, dim=-1, largest=False).indices
-        keep = torch.zeros(
-            dist2.shape,
-            device=device,
-            dtype=torch.bool,
-        )
+        keep = torch.zeros(dist2.shape, device=device, dtype=torch.bool)
         keep.scatter_(dim=-1, index=nearest, value=True)
 
         if self.mask_invalid_queries and query_mask is not None:
@@ -187,10 +225,14 @@ class GeometryMaskedAttnProcessor2_0:
             if condition_mask.shape[0] == keep.shape[0]:
                 keep = keep | (~condition_mask).view(-1, 1, 1)
 
-        min_value = -10000.0
-        mask = torch.zeros(keep.shape, device=device, dtype=dtype)
-        mask = mask.masked_fill(~keep, min_value)
-        return mask[:, None, :, :]
+        bias = self._build_geometry_attention_bias(
+            front_xy=front_xy,
+            sat_xy=sat_xy,
+            dist2=dist2,
+            keep=keep,
+            dtype=dtype,
+        )
+        return bias[:, None, :, :]
 
     @staticmethod
     def _infer_grid_hw_from_xy(xy: torch.Tensor) -> Optional[tuple[int, int]]:
@@ -334,7 +376,7 @@ class GeometryMaskedAttnProcessor2_0:
         if is_cross_attention:
             context = self.context_provider()
             if context is not None:
-                geometry_mask = self._build_geometry_mask(
+                geometry_mask = self._build_geometry_attention_mask(
                     context=context,
                     query_length=query.shape[2],
                     key_length=key.shape[2],
@@ -388,6 +430,11 @@ def apply_geometry_masked_attn_processors(
     mask_invalid_queries: bool = True,
     fallback_to_unmasked: bool = True,
     use_metric_coords: bool = False,
+    enable_geometry_bias: bool = False,
+    geometry_bias_type: str = "dist_dir",
+    lambda_dist: float = 2.0,
+    lambda_dir: float = 0.5,
+    learnable_geometry_bias: bool = False,
 ) -> list[str]:
     """
     Replace selected native attn2 processors and return the module names changed.
@@ -420,6 +467,11 @@ def apply_geometry_masked_attn_processors(
                 mask_invalid_queries=mask_invalid_queries,
                 fallback_to_unmasked=fallback_to_unmasked,
                 use_metric_coords=use_metric_coords,
+                enable_geometry_bias=enable_geometry_bias,
+                geometry_bias_type=geometry_bias_type,
+                lambda_dist=lambda_dist,
+                lambda_dir=lambda_dir,
+                learnable_geometry_bias=learnable_geometry_bias,
             )
         )
         changed.append(name)

@@ -206,6 +206,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--pitch_deg",
+        type=float,
+        default=0.0,
+        help="Virtual camera pitch in degrees for fisheye remap and BEV projection.",
+    )
+    parser.add_argument(
+        "--roll_deg",
+        type=float,
+        default=0.0,
+        help="Virtual camera roll in degrees for fisheye remap and BEV projection.",
+    )
+    parser.add_argument(
         "--view_memory_mode",
         type=str,
         default="independent",
@@ -309,6 +321,8 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.guidance_scale = float(
         _prefer_config(args.guidance_scale, 1.0, _config_get(config, ("inference", "guidance_scale")))
     )
+    args.pitch_deg = float(_prefer_config(args.pitch_deg, 0.0, _config_get(config, ("data", "pitch_deg"))))
+    args.roll_deg = float(_prefer_config(args.roll_deg, 0.0, _config_get(config, ("data", "roll_deg"))))
     args.output_dir = str(_prefer_config(args.output_dir, "./inference_results", _config_get(config, ("output", "output_dir"))))
 
     refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
@@ -525,7 +539,14 @@ def _draw_satellite_coverage(
     return image
 
 
-def _build_base_dataset(drives, frames, seed: int) -> Kitti360dDataset:
+def _build_base_dataset(
+    drives,
+    frames,
+    seed: int,
+    *,
+    pitch_deg: float = 0.0,
+    roll_deg: float = 0.0,
+) -> Kitti360dDataset:
     return Kitti360dDataset(
         drives=drives,
         frames=frames,
@@ -537,6 +558,8 @@ def _build_base_dataset(drives, frames, seed: int) -> Kitti360dDataset:
         front_resize=(640, 256),
         front_center_crop=None,
         random_fisheye_relative_yaw=False,
+        pitch_deg=pitch_deg,
+        roll_deg=roll_deg,
         seed=seed,
         return_bgr=False,
     )
@@ -784,7 +807,13 @@ def _resolve_single_dataset(args: argparse.Namespace) -> Tuple[Kitti360dDataset,
         raise ValueError("--frame_id is required for single_yaw_sweep")
 
     if args.drive_dir is not None:
-        dataset = _build_base_dataset(Path(args.drive_dir), [int(args.frame_id)], args.seed)
+        dataset = _build_base_dataset(
+            Path(args.drive_dir),
+            [int(args.frame_id)],
+            args.seed,
+            pitch_deg=args.pitch_deg,
+            roll_deg=args.roll_deg,
+        )
         return dataset, 0
 
     if args.split_yaml is not None:
@@ -794,12 +823,24 @@ def _resolve_single_dataset(args: argparse.Namespace) -> Tuple[Kitti360dDataset,
         )
         drives = train_dirs if args.dataset_split == "train" else val_dirs
         frames = train_frames if args.dataset_split == "train" else val_frames
-        dataset = _build_base_dataset(drives, frames, args.seed)
+        dataset = _build_base_dataset(
+            drives,
+            frames,
+            args.seed,
+            pitch_deg=args.pitch_deg,
+            roll_deg=args.roll_deg,
+        )
         return dataset, _resolve_sample_index(dataset, int(args.frame_id), args.drive)
 
     if args.drive is None:
         raise ValueError("Pass --drive_dir, or pass --split_yaml with optional --drive")
-    dataset = _build_base_dataset(Path(args.data_dir) / args.drive, [int(args.frame_id)], args.seed)
+    dataset = _build_base_dataset(
+        Path(args.data_dir) / args.drive,
+        [int(args.frame_id)],
+        args.seed,
+        pitch_deg=args.pitch_deg,
+        roll_deg=args.roll_deg,
+    )
     return dataset, 0
 
 
@@ -855,6 +896,8 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                     "memory_mode": args.view_memory_mode,
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
+                    "virtual_pitch_deg": float(args.pitch_deg),
+                    "virtual_roll_deg": float(args.roll_deg),
                     "views": [{"view_name": name, "vehicle_yaw_deg": yaw} for name, yaw in view_specs],
                 },
                 f,
@@ -875,7 +918,13 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
     )
     drives = train_dirs if args.dataset_split == "train" else val_dirs
     frames = train_frames if args.dataset_split == "train" else val_frames
-    dataset = _build_base_dataset(drives, frames, args.seed)
+    dataset = _build_base_dataset(
+        drives,
+        frames,
+        args.seed,
+        pitch_deg=args.pitch_deg,
+        roll_deg=args.roll_deg,
+    )
     sample_indices = _filter_sample_indices(dataset, args.start_frame, args.end_frame, args.max_frames)
 
     materialize_sample = _get_view_sample(dataset, sample_indices[0], *FIXED_VIEW_SPECS[0])
@@ -933,6 +982,8 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     "num_frames": len(sample_indices),
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
+                    "virtual_pitch_deg": float(args.pitch_deg),
+                    "virtual_roll_deg": float(args.roll_deg),
                     "fixed_views": [
                         {"view_name": view_name, "vehicle_yaw_deg": yaw}
                         for view_name, yaw in FIXED_VIEW_SPECS

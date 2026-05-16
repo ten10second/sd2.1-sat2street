@@ -37,6 +37,12 @@ import torch
 from torch.utils.data import Dataset
 import yaml
 
+try:
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
 
 # Mounting yaw (deg) of fisheye cameras relative to vehicle front (CW+ convention)
 MOUNT_ANGLES = {
@@ -100,6 +106,22 @@ def _rot_z(deg: float) -> np.ndarray:
         [s, c, 0.0],
         [0.0, 0.0, 1.0]
     ], dtype=np.float64)
+
+
+def _make_virtual_rectify_rotation(
+    fisheye_relative_yaw_deg: float,
+    pitch_deg: float = 0.0,
+    roll_deg: float = 0.0,
+) -> np.ndarray:
+    """Return physical-fisheye -> virtual-camera rotation.
+
+    The yaw-only path is identical to the old implementation. Pitch/roll are
+    virtual-camera local pose deltas, so their inverse is folded into the
+    phys->virt rectify matrix used by both OpenCV remap and BEV projection.
+    """
+    R_yaw = _rot_y(-float(fisheye_relative_yaw_deg))
+    R_virtual_pose_delta = _rot_x(float(pitch_deg)) @ _rot_z(float(roll_deg))
+    return R_virtual_pose_delta.T @ R_yaw
 
 
 def _make_newK(out_w: int, out_h: int, hfov_deg: float) -> np.ndarray:
@@ -362,6 +384,8 @@ def fisheye_to_virtual_perspective(
     img_bgr: np.ndarray,
     calib_yaml: Path,
     fisheye_relative_yaw_deg: float = 0.0,
+    pitch_deg: float = 0.0,
+    roll_deg: float = 0.0,
     hfov_deg: float = 100.0,
     out_w: int = 640,
     out_h: int = 256,
@@ -372,8 +396,8 @@ def fisheye_to_virtual_perspective(
     Yaw is defined relative to the *physical fisheye optical axis*, and rotation is applied
     around the physical fisheye camera Y axis (same convention as debug_ipm_alignment.py).
 
-    If R_rectify is provided, it is used directly (phys->virt). Otherwise we compute it as
-    rot_y(-fisheye_relative_yaw_deg).
+    If R_rectify is provided, it is used directly (phys->virt). Otherwise it is
+    built from fisheye-relative yaw plus virtual-camera pitch/roll.
 
     Returns:
         perspective BGR image (out_h, out_w, 3)
@@ -382,7 +406,11 @@ def fisheye_to_virtual_perspective(
     newK = _make_newK(out_w, out_h, hfov_deg)
 
     if R_rectify is None:
-        R_rectify = _rot_y(-float(fisheye_relative_yaw_deg))
+        R_rectify = _make_virtual_rectify_rotation(
+            fisheye_relative_yaw_deg,
+            pitch_deg=pitch_deg,
+            roll_deg=roll_deg,
+        )
 
     map1, map2 = cv2.omnidir.initUndistortRectifyMap(
         K,
@@ -796,6 +824,8 @@ class Kitti360dDataset(Dataset):
             img_bgr=img,
             calib_yaml=calib_yaml,
             fisheye_relative_yaw_deg=float(fisheye_relative_yaw_deg),
+            pitch_deg=self.pitch_deg,
+            roll_deg=self.roll_deg,
             hfov_deg=self.virtual_hfov_deg,
             out_w=self.virtual_w,
             out_h=self.virtual_h,
@@ -1047,6 +1077,8 @@ class Kitti360dDataset(Dataset):
                 "final_size": (self.virtual_w, self.virtual_h),
                 "fisheye_relative_yaw_deg": float(fisheye_yaw_used),
                 "vehicle_yaw_deg": float(vehicle_yaw_deg_item) if vehicle_yaw_deg_item is not None else None,
+                "virtual_pitch_deg": float(self.pitch_deg),
+                "virtual_roll_deg": float(self.roll_deg),
             }
 
             # remember which camera was used for this sample
@@ -1097,9 +1129,13 @@ class Kitti360dDataset(Dataset):
                     cam_used = aug_meta.get("fisheye_camera_used")
                     fisheye_yaw_used = float(aug_meta.get("fisheye_relative_yaw_deg", 0.0))
 
-                    # This logic now matches debug_ipm_alignment.py (without gravity alignment)
-                    # R_rectify is the rotation from physical fisheye to virtual camera.
-                    R_rectify = _rot_y(-fisheye_yaw_used)
+                    # R_rectify is the same physical fisheye -> virtual camera
+                    # rotation used by fisheye_to_virtual_perspective.
+                    R_rectify = _make_virtual_rectify_rotation(
+                        fisheye_yaw_used,
+                        pitch_deg=self.pitch_deg,
+                        roll_deg=self.roll_deg,
+                    )
 
                     # The virtual camera's pose in the world is the physical camera's pose
                     # followed by the local rotation.
@@ -1107,13 +1143,6 @@ class Kitti360dDataset(Dataset):
                     R_phys_to_world = T_phys_to_world[:3, :3]
                     R_virt_to_phys = R_rectify.T # virt -> phys
                     R_virt_to_world = R_phys_to_world @ R_virt_to_phys
-
-                    # Apply roll and pitch corrections if specified
-                    if self.roll_deg != 0.0 or self.pitch_deg != 0.0:
-                        R_roll = _rot_z(self.roll_deg)
-                        R_pitch = _rot_x(self.pitch_deg)
-                        R_correction = R_pitch @ R_roll  # Applied in the virtual camera's local frame
-                        R_virt_to_world = R_virt_to_world @ R_correction
 
                     T_cam_to_world = np.eye(4, dtype=np.float64)
                     T_cam_to_world[:3, :3] = R_virt_to_world
@@ -1177,6 +1206,8 @@ class Kitti360dDataset(Dataset):
                 "vehicle_relative_yaw_deg": aug_meta.get("vehicle_yaw_deg"),
                 "vehicle_yaw_deg_used": aug_meta.get("vehicle_yaw_deg"),
                 "virtual_hfov_deg": self.virtual_hfov_deg,
+                "virtual_pitch_deg": float(self.pitch_deg),
+                "virtual_roll_deg": float(self.roll_deg),
                 "camera_height_m": camera_height_m,
                 "oxts_yaw": yaw,
                 "drive_dir": str(drive_dir),

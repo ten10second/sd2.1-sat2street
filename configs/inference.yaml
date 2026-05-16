@@ -13,6 +13,8 @@ data:
   num_workers: 4
   mode: 'front'
   front_resize: [640, 256]
+  pitch_deg: 0.0
+  roll_deg: 0.0
   sat_size: 512
   resolution: 0.2
 
@@ -57,6 +59,11 @@ model:
     mask_invalid_queries: true
     fallback_to_unmasked: true
     use_metric_coords: false
+    enable_geometry_bias: true
+    geometry_bias_type: 'dist_dir'
+    lambda_dist: 2.0
+    lambda_dir: 0.5
+    learnable_geometry_bias: false
 
 # 推理配置
 inference:
