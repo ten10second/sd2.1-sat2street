@@ -416,6 +416,38 @@ def _resize_satellite_for_front(sat_image: torch.Tensor, target_h: int) -> torch
     ).squeeze(0)
 
 
+def _project_satellite_to_perspective(
+    sat_image: torch.Tensor,
+    front_bev_xy: Optional[torch.Tensor],
+    front_ground_valid_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
+        return torch.zeros_like(sat_image)
+
+    coords = front_bev_xy.detach().cpu().to(torch.float32)
+    if coords.ndim == 3 and coords.shape[0] == 2:
+        coords_hw = coords.permute(1, 2, 0)
+    elif coords.ndim == 3 and coords.shape[-1] == 2:
+        coords_hw = coords
+    else:
+        return torch.zeros_like(sat_image)
+
+    grid = coords_hw.clone()
+    grid[..., 1] = -grid[..., 1]
+    projected = F.grid_sample(
+        sat_image.detach().cpu().to(torch.float32).unsqueeze(0),
+        grid.unsqueeze(0),
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).squeeze(0)
+
+    valid_mask = _front_mask_to_hw(front_ground_valid_mask)
+    if valid_mask is not None and tuple(valid_mask.shape) == tuple(projected.shape[-2:]):
+        projected = projected * valid_mask.to(torch.float32).unsqueeze(0)
+    return projected.clamp(0, 1)
+
+
 def _coords_to_satellite_pixels(
     coords: torch.Tensor,
     sat_width: int,
@@ -852,6 +884,11 @@ def _save_view_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     gt_image = sample["image"]
     sat_resized = _resize_satellite_for_front(sample["sat"], int(gt_image.shape[-2]))
+    sat_projected = _project_satellite_to_perspective(
+        sample["sat"],
+        sample.get("front_bev_xy"),
+        sample.get("front_ground_valid_mask"),
+    )
     sat_overlay = _draw_satellite_coverage(
         sample["sat"],
         sample.get("front_bev_xy"),
@@ -863,8 +900,10 @@ def _save_view_outputs(
     _tensor_to_pil(generated).save(output_dir / "generated.png")
     _tensor_to_pil(gt_image).save(output_dir / "gt.png")
     sat_overlay.save(output_dir / "satellite.png")
+    _tensor_to_pil(sat_projected).save(output_dir / "satellite_projected.png")
     comparison = _compose_panels([
         ("sat coverage", torch.from_numpy(np.array(sat_overlay)).permute(2, 0, 1).to(torch.float32) / 255.0),
+        ("sat projected", sat_projected),
         (f"gen {view_name}", generated),
         ("gt", gt_image),
     ])
