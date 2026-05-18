@@ -326,16 +326,20 @@ def compute_camera_bev_xy(
 
     pixels_flat = pixels.reshape(3, -1)
     dirs_cam = K_inv @ pixels_flat
-    s = float(cam_height) / (dirs_cam[1, :] + 1e-8)
+    dirs_world = R @ dirs_cam
 
-    hit_cam = s[np.newaxis, :] * dirs_cam
-    hit_world = cam_center[:, np.newaxis] + (R @ hit_cam)
+    # Intersect the rotated camera rays with the local ground plane. Using the
+    # camera-frame y component here would ignore virtual pitch/roll when deciding
+    # where each image ray lands on the BEV ground plane.
+    down_world = -dirs_world[2, :]
+    s = float(cam_height) / (down_world + 1e-8)
+    hit_world = cam_center[:, np.newaxis] + s[np.newaxis, :] * dirs_world
 
     bev_x_norm = (hit_world[0, :] - sat_center_xy[0]) / (bev_range_x + 1e-8)
     bev_y_norm = (hit_world[1, :] - sat_center_xy[1]) / (bev_range_y + 1e-8)
 
     invalid = (
-        (dirs_cam[1, :] < 0.01) |
+        (down_world < 0.01) |
         (s < 0.0) |
         (np.abs(bev_x_norm) > 1.0) |
         (np.abs(bev_y_norm) > 1.0)

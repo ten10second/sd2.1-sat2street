@@ -469,10 +469,55 @@ def _front_bev_xy_to_satellite_pixels(
     return _coords_to_satellite_pixels(coords, sat_width, sat_height)
 
 
+def _convex_hull_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if len(points) <= 3:
+        return points
+
+    unique_points = sorted(set((float(x), float(y)) for x, y in points))
+    if len(unique_points) <= 3:
+        return unique_points
+
+    def cross(
+        origin: Tuple[float, float],
+        a: Tuple[float, float],
+        b: Tuple[float, float],
+    ) -> float:
+        return (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
+
+    lower: List[Tuple[float, float]] = []
+    for point in unique_points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+
+    upper: List[Tuple[float, float]] = []
+    for point in reversed(unique_points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+
+    return lower[:-1] + upper[:-1]
+
+
+def _front_mask_to_hw(front_ground_valid_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if front_ground_valid_mask is None or not torch.is_tensor(front_ground_valid_mask):
+        return None
+
+    mask = front_ground_valid_mask.detach().cpu().to(torch.float32)
+    if mask.ndim == 3 and mask.shape[0] == 1:
+        return mask[0] > 0.5
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        return mask[..., 0] > 0.5
+    if mask.ndim == 2:
+        return mask > 0.5
+    return None
+
+
 def _front_bev_xy_to_fov_polygon(
     front_bev_xy: Optional[torch.Tensor],
     sat_width: int,
     sat_height: int,
+    front_ground_valid_mask: Optional[torch.Tensor] = None,
 ) -> List[Tuple[float, float]]:
     if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
         return []
@@ -488,6 +533,27 @@ def _front_bev_xy_to_fov_polygon(
     height, width = int(coords_hw.shape[0]), int(coords_hw.shape[1])
     if height < 2 or width < 2:
         return []
+
+    valid_mask = _front_mask_to_hw(front_ground_valid_mask)
+    if valid_mask is not None and tuple(valid_mask.shape) == (height, width):
+        valid_coords = coords_hw[valid_mask]
+        points, bbox = _front_bev_xy_to_satellite_pixels(valid_coords, sat_width, sat_height)
+        if len(points) >= 3:
+            max_hull_points = 6000
+            if len(points) > max_hull_points:
+                step = max(1, len(points) // max_hull_points)
+                points = points[::step]
+            hull = _convex_hull_points(points)
+            if len(hull) >= 3:
+                return hull
+        if bbox is not None:
+            left_px, top_px, right_px, bottom_px = bbox
+            return [
+                (left_px, top_px),
+                (right_px, top_px),
+                (right_px, bottom_px),
+                (left_px, bottom_px),
+            ]
 
     top = coords_hw[0, :, :]
     right = coords_hw[:, width - 1, :]
@@ -513,13 +579,14 @@ def _front_bev_xy_to_fov_polygon(
 def _draw_satellite_coverage(
     sat_image: torch.Tensor,
     front_bev_xy: Optional[torch.Tensor],
+    front_ground_valid_mask: Optional[torch.Tensor],
     view_name: str,
     yaw: Optional[float],
 ) -> Image.Image:
     image = _tensor_to_pil(sat_image).convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
     width, height = image.size
-    polygon = _front_bev_xy_to_fov_polygon(front_bev_xy, width, height)
+    polygon = _front_bev_xy_to_fov_polygon(front_bev_xy, width, height, front_ground_valid_mask)
 
     # Ego vehicle is at the satellite crop center by construction.
     center = (width / 2.0, height / 2.0)
@@ -664,24 +731,32 @@ def _materialize_lazy_modules(
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
     latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
+    unet_param = next(model.unet.parameters(), None)
+    latent_dtype = unet_param.dtype if unet_param is not None else sat_state.tokens.dtype
     latents = torch.randn(
         (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
         device=sat_images.device,
-        dtype=sat_state.tokens.dtype,
+        dtype=latent_dtype,
     )
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
 
-    model.unet(
-        latents,
-        timestep,
-        encoder_hidden_states=None,
-        sat_tokens=sat_state.tokens,
-        sat_xy=sat_state.xy,
-        sat_bev_coords=sat_state.bev_coords,
-        front_bev_xy=front_bev_xy,
-        front_ground_valid_mask=front_ground_valid_mask,
-        return_attn_map=False,
-    )
+    amp_dtype = latent_dtype if latent_dtype in {torch.float16, torch.bfloat16} else torch.float32
+    with torch.autocast(
+        device_type="cuda",
+        dtype=amp_dtype,
+        enabled=str(device).startswith("cuda") and amp_dtype in {torch.float16, torch.bfloat16},
+    ):
+        model.unet(
+            latents,
+            timestep,
+            encoder_hidden_states=None,
+            sat_tokens=sat_state.tokens,
+            sat_xy=sat_state.xy,
+            sat_bev_coords=sat_state.bev_coords,
+            front_bev_xy=front_bev_xy,
+            front_ground_valid_mask=front_ground_valid_mask,
+            return_attn_map=False,
+        )
 
 
 def _load_model(args: argparse.Namespace, materialize_sample: Dict):
@@ -747,16 +822,22 @@ def _generate_one(
     generator = torch.Generator(device=generator_device)
     generator.manual_seed(int(args.seed))
 
-    return model.generate(
-        sat_image,
-        front_bev_xy=front_bev_xy,
-        front_ground_valid_mask=front_ground_valid_mask,
-        target_size=target_size,
-        num_inference_steps=args.num_inference_steps,
-        guidance_scale=args.guidance_scale,
-        generator=generator,
-        sat_condition_mode=sat_condition_mode,
-    )[0].cpu()
+    amp_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
+    with torch.autocast(
+        device_type="cuda",
+        dtype=amp_dtype,
+        enabled=args.device.startswith("cuda") and amp_dtype in {torch.float16, torch.bfloat16},
+    ):
+        return model.generate(
+            sat_image,
+            front_bev_xy=front_bev_xy,
+            front_ground_valid_mask=front_ground_valid_mask,
+            target_size=target_size,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            generator=generator,
+            sat_condition_mode=sat_condition_mode,
+        )[0].cpu()
 
 
 def _save_view_outputs(
@@ -774,6 +855,7 @@ def _save_view_outputs(
     sat_overlay = _draw_satellite_coverage(
         sample["sat"],
         sample.get("front_bev_xy"),
+        sample.get("front_ground_valid_mask"),
         view_name,
         yaw,
     ).resize((sat_resized.shape[-1], sat_resized.shape[-2]), resample=Image.BILINEAR)
