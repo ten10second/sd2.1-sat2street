@@ -557,6 +557,8 @@ def main():
     refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
     refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
     native_cross_attention_config = dict(_config_get(config, ("model", "native_cross_attention"), {}) or {})
+    perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
+    perspective_pe_enabled = bool(perspective_pe_config.get("enable", False))
 
     _configure_logging(log_dir)
 
@@ -700,6 +702,7 @@ def main():
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
+        perspective_pe_enabled=perspective_pe_enabled,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":
         if is_main_process:

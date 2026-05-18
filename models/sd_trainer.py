@@ -2097,7 +2097,7 @@ class SDTrainer:
                 frame_id = int(frame_id.item())
             frame_ids.append(frame_id)
 
-        return {
+        result = {
             "sat": torch.stack([item["sat"] for item in items], dim=0),
             "image": torch.stack([item["image"] for item in items], dim=0),
             "front_bev_xy": torch.stack([item["front_bev_xy"] for item in items], dim=0),
@@ -2106,12 +2106,19 @@ class SDTrainer:
             "view_labels": [str(item["_visualization_view_label"]) for item in items],
             "yaw_degs": [item["_visualization_yaw_deg"] for item in items],
         }
+        for cam_key in ("K", "T_cam_to_world", "T_imu_to_world"):
+            if all(cam_key in item and torch.is_tensor(item[cam_key]) for item in items):
+                result[cam_key] = torch.stack([item[cam_key] for item in items], dim=0)
+        return result
 
     def _collect_fallback_visualization_batch(self, data_loader: DataLoader) -> Optional[Dict[str, Any]]:
         sat_chunks = []
         target_chunks = []
         front_bev_xy_chunks = []
         front_ground_valid_mask_chunks = []
+        K_chunks = []
+        T_cam_to_world_chunks = []
+        T_imu_to_world_chunks = []
         frame_ids = []
         view_labels = []
         yaw_degs = []
@@ -2133,6 +2140,15 @@ class SDTrainer:
             if front_ground_valid_mask is not None:
                 front_ground_valid_mask_chunks.append(front_ground_valid_mask[:take])
 
+            for cam_key, chunks in [
+                ('K', K_chunks),
+                ('T_cam_to_world', T_cam_to_world_chunks),
+                ('T_imu_to_world', T_imu_to_world_chunks),
+            ]:
+                cam_val = batch.get(cam_key)
+                if cam_val is not None:
+                    chunks.append(cam_val[:take])
+
             batch_frame_ids = batch.get('frame_id')
             if batch_frame_ids is None:
                 frame_ids.extend([None] * take)
@@ -2147,7 +2163,7 @@ class SDTrainer:
         if not sat_chunks:
             return None
 
-        return {
+        result = {
             "sat": torch.cat(sat_chunks, dim=0),
             "image": torch.cat(target_chunks, dim=0),
             "front_bev_xy": torch.cat(front_bev_xy_chunks, dim=0) if front_bev_xy_chunks else None,
@@ -2159,6 +2175,14 @@ class SDTrainer:
             "view_labels": view_labels,
             "yaw_degs": yaw_degs,
         }
+        for cam_key, chunks in [
+            ('K', K_chunks),
+            ('T_cam_to_world', T_cam_to_world_chunks),
+            ('T_imu_to_world', T_imu_to_world_chunks),
+        ]:
+            if chunks:
+                result[cam_key] = torch.cat(chunks, dim=0)
+        return result
 
     @torch.no_grad()
     def _save_visualizations(self, epoch: int):
@@ -2190,12 +2214,29 @@ class SDTrainer:
         view_labels = visualization_batch["view_labels"]
         yaw_degs = visualization_batch["yaw_degs"]
 
+        K = visualization_batch.get("K")
+        if K is not None:
+            K = K.to(self.device)
+        T_cam_to_world = visualization_batch.get("T_cam_to_world")
+        if T_cam_to_world is not None:
+            T_cam_to_world = T_cam_to_world.to(self.device)
+        T_imu_to_world = visualization_batch.get("T_imu_to_world")
+        if T_imu_to_world is not None:
+            T_imu_to_world = T_imu_to_world.to(self.device)
+        target_size = (int(target_images.shape[2]), int(target_images.shape[3]))
+
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
 
         eval_model = self.unwrapped_model
         was_training = eval_model.training
         eval_model.eval()
-        sat_state = eval_model.encode_satellite(sat_images)
+        sat_state = eval_model.encode_satellite(
+            sat_images,
+            K=K,
+            T_cam_to_world=T_cam_to_world,
+            T_imu_to_world=T_imu_to_world,
+            image_size=target_size,
+        )
         generator = torch.Generator(device=generator_device)
         generator.manual_seed(self.visualization_seed)
         generated_chunks = []
@@ -2208,6 +2249,16 @@ class SDTrainer:
                 bev_coords=(
                     sat_state.bev_coords[idx:idx + 1]
                     if sat_state.bev_coords is not None
+                    else None
+                ),
+                perspective_uv=(
+                    sat_state.perspective_uv[idx:idx + 1]
+                    if sat_state.perspective_uv is not None
+                    else None
+                ),
+                perspective_valid=(
+                    sat_state.perspective_valid[idx:idx + 1]
+                    if sat_state.perspective_valid is not None
                     else None
                 ),
             )

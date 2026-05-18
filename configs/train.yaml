@@ -82,6 +82,10 @@ model:
     lambda_dir: 0.5
     learnable_geometry_bias: false
 
+  # Perspective position encoding for satellite tokens
+  perspective_position_encoding:
+    enable: true
+
 # 训练配置
 training:
   epochs: 100

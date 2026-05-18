@@ -337,6 +337,8 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
         refinement_block_config["enable"] = False
     args.refinement_block_config = refinement_block_config or {"enable": not bool(args.disable_refinement)}
     args.native_cross_attention_config = dict(_config_get(config, ("model", "native_cross_attention"), {}) or {})
+    perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
+    args.perspective_pe_enabled = bool(perspective_pe_config.get("enable", False))
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -765,7 +767,20 @@ def _materialize_lazy_modules(
     )
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
 
-    sat_state = model.encode_satellite(sat_images)
+    K = sample.get("K")
+    K = K.unsqueeze(0).to(device) if K is not None else None
+    T_cam_to_world = sample.get("T_cam_to_world")
+    T_cam_to_world = T_cam_to_world.unsqueeze(0).to(device) if T_cam_to_world is not None else None
+    T_imu_to_world = sample.get("T_imu_to_world")
+    T_imu_to_world = T_imu_to_world.unsqueeze(0).to(device) if T_imu_to_world is not None else None
+
+    sat_state = model.encode_satellite(
+        sat_images,
+        K=K,
+        T_cam_to_world=T_cam_to_world,
+        T_imu_to_world=T_imu_to_world,
+        image_size=target_size,
+    )
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -823,6 +838,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
+        perspective_pe_enabled=getattr(args, "perspective_pe_enabled", False),
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")
@@ -857,6 +873,13 @@ def _generate_one(
     )
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
 
+    K = sample.get("K")
+    K = K.unsqueeze(0).to(args.device) if K is not None else None
+    T_cam_to_world = sample.get("T_cam_to_world")
+    T_cam_to_world = T_cam_to_world.unsqueeze(0).to(args.device) if T_cam_to_world is not None else None
+    T_imu_to_world = sample.get("T_imu_to_world")
+    T_imu_to_world = T_imu_to_world.unsqueeze(0).to(args.device) if T_imu_to_world is not None else None
+
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
     generator = torch.Generator(device=generator_device)
     generator.manual_seed(int(args.seed))
@@ -876,6 +899,9 @@ def _generate_one(
             guidance_scale=args.guidance_scale,
             generator=generator,
             sat_condition_mode=sat_condition_mode,
+            K=K,
+            T_cam_to_world=T_cam_to_world,
+            T_imu_to_world=T_imu_to_world,
         )[0].cpu()
 
 
