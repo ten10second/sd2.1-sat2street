@@ -124,6 +124,19 @@ def _make_virtual_rectify_rotation(
     return R_virtual_pose_delta.T @ R_yaw
 
 
+def _apply_virtual_pose_delta(
+    T_cam_to_world: np.ndarray,
+    pitch_deg: float = 0.0,
+    roll_deg: float = 0.0,
+) -> np.ndarray:
+    """Apply a camera-local virtual pitch/roll delta to a camera->world pose."""
+    T_virtual_to_world = np.array(T_cam_to_world, dtype=np.float64, copy=True)
+    R_virtual_pose_delta = _rot_x(float(pitch_deg)) @ _rot_z(float(roll_deg))
+    R_virt_to_phys = R_virtual_pose_delta.T
+    T_virtual_to_world[:3, :3] = T_virtual_to_world[:3, :3] @ R_virt_to_phys
+    return T_virtual_to_world
+
+
 def _make_newK(out_w: int, out_h: int, hfov_deg: float) -> np.ndarray:
     hfov = math.radians(hfov_deg)
     fx = (out_w * 0.5) / math.tan(hfov * 0.5)
@@ -1055,6 +1068,8 @@ class Kitti360dDataset(Dataset):
                 resize_wh=self.front_resize,
                 crop_wh=self.front_center_crop,
             )
+            aug_meta["virtual_pitch_deg"] = float(self.pitch_deg)
+            aug_meta["virtual_roll_deg"] = float(self.roll_deg)
             T_pose_cam = all_extrinsics.get("image_00")
 
             # Prefer user-provided per-frame cam0->world if available
@@ -1158,6 +1173,12 @@ class Kitti360dDataset(Dataset):
         elif T_cam0_to_world is not None and sample_mode == "front":
             # Fallback: front camera can still use cam0_to_world if provided
             T_cam_to_world = T_cam0_to_world
+        if T_cam_to_world is not None and sample_mode == "front":
+            T_cam_to_world = _apply_virtual_pose_delta(
+                T_cam_to_world,
+                pitch_deg=self.pitch_deg,
+                roll_deg=self.roll_deg,
+            )
         T_pose_cam_t = None if T_pose_cam is None else torch.from_numpy(T_pose_cam).to(torch.float32)
         T_cam_to_world_t = None if T_cam_to_world is None else torch.from_numpy(T_cam_to_world).to(torch.float32)
 

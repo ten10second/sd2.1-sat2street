@@ -347,6 +347,11 @@ def _view_token(view_name: str, yaw: Optional[float]) -> str:
     return token
 
 
+def _pitch_token(pitch: float) -> str:
+    prefix = "p" if pitch > 0 else "m" if pitch < 0 else ""
+    return f"pitch_{prefix}{abs(float(pitch)):g}".replace(".", "p")
+
+
 def _single_yaw_sweep_view_specs(args: argparse.Namespace) -> List[Tuple[str, Optional[float]]]:
     if args.vehicle_yaws is None:
         specs = list(YAW_SWEEP_PRESETS[args.yaw_sweep_preset])
@@ -1135,7 +1140,7 @@ def run_front_pitch_sweep(args: argparse.Namespace) -> None:
     original_roll = float(dataset.roll_deg)
     dataset.pitch_deg = pitch_values[0]
     dataset.roll_deg = float(args.roll_deg)
-    materialize_sample = _get_view_sample(dataset, sample_index, _view_token("pitch", pitch_values[0]), 0.0)
+    materialize_sample = _get_view_sample(dataset, sample_index, _pitch_token(pitch_values[0]), None)
     model, checkpoint_meta = _load_model(args, materialize_sample)
 
     output_root = Path(args.output_dir)
@@ -1151,15 +1156,15 @@ def run_front_pitch_sweep(args: argparse.Namespace) -> None:
             for pitch in pitch_values:
                 dataset.pitch_deg = float(pitch)
                 dataset.roll_deg = float(args.roll_deg)
-                view_name = _view_token("pitch", pitch)
-                sample = _get_view_sample(dataset, sample_index, view_name, 0.0)
+                view_name = _pitch_token(pitch)
+                sample = _get_view_sample(dataset, sample_index, view_name, None)
                 generated = _generate_one(model, sample, args, sat_mode)
                 comparison = _save_view_outputs(
                     sample,
                     generated,
                     sample_dir / view_name,
                     view_name,
-                    0.0,
+                    None,
                     ablation_name,
                     sat_mode,
                     gt_override=front_sample["image"],

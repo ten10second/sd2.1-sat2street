@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
+from data.kitti360d_dataset import Kitti360dDataset, SampleIndex, _apply_virtual_pose_delta
 from models.conditioning import SatelliteMemoryState
 from models.sd_trainer import SDTrainer, SatelliteConditionedSDModel
 from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
@@ -198,6 +198,20 @@ class _VisualizationSingleViewModel(_TestSatelliteConditionedSDModel):
 
 
 class RandomYawGroundPETrainingTest(unittest.TestCase):
+    def test_apply_virtual_pose_delta_changes_rotation_for_pitch(self) -> None:
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, 3] = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        original_pose = pose.copy()
+
+        zero_delta = _apply_virtual_pose_delta(pose, pitch_deg=0.0, roll_deg=0.0)
+        pitched = _apply_virtual_pose_delta(pose, pitch_deg=10.0, roll_deg=0.0)
+
+        self.assertTrue(np.allclose(zero_delta, pose))
+        self.assertTrue(np.allclose(pose, original_pose))
+        self.assertTrue(np.allclose(pitched[:3, 3], pose[:3, 3]))
+        self.assertFalse(np.allclose(pitched[:3, :3], pose[:3, :3]))
+        self.assertTrue(np.allclose(pitched[:3, :3] @ pitched[:3, :3].T, np.eye(3), atol=1e-6))
+
     def test_front_sample_prob_mixes_real_front_without_overriding_explicit_views(self) -> None:
         dataset = Kitti360dDataset.__new__(Kitti360dDataset)
         dataset.mode = "fisheye_virtual"
@@ -598,6 +612,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         image = SDTrainer._draw_satellite_view_coverage(
             sat_image,
             front_bev_xy=front_bev_xy,
+            front_ground_valid_mask=None,
             view_label="yaw_p90",
             yaw_deg=90.0,
         )
