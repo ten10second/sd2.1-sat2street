@@ -158,7 +158,7 @@ def _parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default="single_yaw_sweep",
-        choices=["single_yaw_sweep", "split_fixed_views"],
+        choices=["single_yaw_sweep", "split_fixed_views", "front_pitch_sweep"],
         help="Inference mode.",
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained checkpoint.")
@@ -210,6 +210,13 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Virtual camera pitch in degrees for fisheye remap and BEV projection.",
+    )
+    parser.add_argument(
+        "--pitch_values",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Pitch values for front_pitch_sweep. Defaults to 0 5 10 15 20 25 30.",
     )
     parser.add_argument(
         "--roll_deg",
@@ -880,9 +887,10 @@ def _save_view_outputs(
     yaw: Optional[float],
     ablation_mode: Optional[str],
     sat_condition_mode: str,
+    gt_override: Optional[torch.Tensor] = None,
 ) -> Image.Image:
     output_dir.mkdir(parents=True, exist_ok=True)
-    gt_image = sample["image"]
+    gt_image = gt_override if gt_override is not None else sample["image"]
     sat_resized = _resize_satellite_for_front(sample["sat"], int(gt_image.shape[-2]))
     sat_projected = _project_satellite_to_perspective(
         sample["sat"],
@@ -916,6 +924,7 @@ def _save_view_outputs(
         "vehicle_yaw_deg": None if yaw is None else float(yaw),
         "ablation_mode": ablation_mode,
         "sat_condition_mode": sat_condition_mode,
+        "gt_override": gt_override is not None,
         "meta": sample.get("meta", {}),
     }
     with open(output_dir / "metadata.yaml", "w") as f:
@@ -1116,6 +1125,72 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
         logger.info(f"Saved split fixed-view inference to: {active_output_root}")
 
 
+def run_front_pitch_sweep(args: argparse.Namespace) -> None:
+    dataset, sample_index = _resolve_single_dataset(args)
+    pitch_values = args.pitch_values if args.pitch_values is not None else [0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+    pitch_values = [float(value) for value in pitch_values]
+
+    front_sample = _get_view_sample(dataset, sample_index, "front", None)
+    original_pitch = float(dataset.pitch_deg)
+    original_roll = float(dataset.roll_deg)
+    dataset.pitch_deg = pitch_values[0]
+    dataset.roll_deg = float(args.roll_deg)
+    materialize_sample = _get_view_sample(dataset, sample_index, _view_token("pitch", pitch_values[0]), 0.0)
+    model, checkpoint_meta = _load_model(args, materialize_sample)
+
+    output_root = Path(args.output_dir)
+    base_sample = dataset.samples[sample_index]
+    ablation_runs = _resolve_ablation_runs(args)
+
+    try:
+        for ablation_name, sat_mode in ablation_runs:
+            active_output_root = output_root / ablation_name if ablation_name is not None else output_root
+            sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_front_pitch_sweep"
+            summary_rows: List[Image.Image] = []
+
+            for pitch in pitch_values:
+                dataset.pitch_deg = float(pitch)
+                dataset.roll_deg = float(args.roll_deg)
+                view_name = _view_token("pitch", pitch)
+                sample = _get_view_sample(dataset, sample_index, view_name, 0.0)
+                generated = _generate_one(model, sample, args, sat_mode)
+                comparison = _save_view_outputs(
+                    sample,
+                    generated,
+                    sample_dir / view_name,
+                    view_name,
+                    0.0,
+                    ablation_name,
+                    sat_mode,
+                    gt_override=front_sample["image"],
+                )
+                summary_rows.append(comparison)
+
+            with open(sample_dir / "run_metadata.yaml", "w") as f:
+                yaml.safe_dump(
+                    {
+                        "checkpoint": str(Path(args.checkpoint).resolve()),
+                        "checkpoint_epoch": checkpoint_meta.get("epoch"),
+                        "mode": args.mode,
+                        "memory_mode": args.view_memory_mode,
+                        "ablation_mode": ablation_name,
+                        "sat_condition_mode": sat_mode,
+                        "vehicle_yaw_deg": 0.0,
+                        "fixed_gt": "front",
+                        "virtual_roll_deg": float(args.roll_deg),
+                        "pitch_values": pitch_values,
+                    },
+                    f,
+                    sort_keys=False,
+                )
+            if summary_rows:
+                _stack_panel_rows(summary_rows).save(sample_dir / "summary.png")
+            logger.info(f"Saved front pitch sweep to: {sample_dir}")
+    finally:
+        dataset.pitch_deg = original_pitch
+        dataset.roll_deg = original_roll
+
+
 def main() -> None:
     args = _parse_args()
     if args.checkpoint is None:
@@ -1134,6 +1209,8 @@ def main() -> None:
         run_single_yaw_sweep(args)
     elif args.mode == "split_fixed_views":
         run_split_fixed_views(args)
+    elif args.mode == "front_pitch_sweep":
+        run_front_pitch_sweep(args)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
