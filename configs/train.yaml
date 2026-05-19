@@ -3,7 +3,7 @@
 # 基本配置
 seed: 42
 device: 'cuda'
-mixed_precision: 'fp16'
+mixed_precision: 'bf16'
 gradient_checkpointing: true
 
 # 数据配置
@@ -37,50 +37,11 @@ model:
   # 卫星图编码器配置
   satellite_encoder:
     name: 'satellite_condition_encoder'
-    embed_dim: 768
+    embed_dim: 1024
     patch_size: 16
-    num_layers: 12
-    num_heads: 12
-
-  # Self-Attention 配置
-  self_attention:
-    name: 'relative_position_attention'
-    embed_dim: 768
-    num_heads: 12
-    dropout: 0.1
-    use_relative_pos: true
-
-  # Ground-PE satellite update block
-  refinement_block:
-    enable: false
-    injection_sites: ['mid', 'up0', 'up1']
+    sat_resolution: 0.2
+    sat_size: 512
     num_heads: 8
-    head_dim: 64
-    geo_ratio: 0.5
-    rope_base: 10000.0
-    lambda_geo: 1.0
-    lambda_geom: 1.0
-    geom_hidden_dim: 128
-    geom_head_dim: 16
-    sat_update_layers: 2
-    use_geom_bias: true
-    adapter_residual: false
-    adapter_residual_scale: 1.0
-
-  # Native SD attn2 geometry mask (scheme B)
-  native_cross_attention:
-    enable_geometry_mask: true
-    mask_sites: ['down1', 'down2', 'mid']
-    mask_mode: 'topk'
-    topk: 32
-    mask_invalid_queries: true
-    fallback_to_unmasked: true
-    use_metric_coords: false
-    enable_geometry_bias: true
-    geometry_bias_type: 'dist_dir'
-    lambda_dist: 2.0
-    lambda_dir: 0.5
-    learnable_geometry_bias: false
 
   # Perspective position encoding for satellite tokens
   perspective_position_encoding:
@@ -90,7 +51,7 @@ model:
 training:
   epochs: 100
   warmup_epochs: 5
-  learning_rate: 2e-5
+  learning_rate: 1e-5
   weight_decay: 1e-4
   scheduler: 'cosine'
   gradient_accumulation_steps: 4

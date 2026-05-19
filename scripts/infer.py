@@ -28,7 +28,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
-from models.sd_trainer import create_sd_model, load_model_checkpoint
+from models.sd_model import create_sd_model, load_model_checkpoint
 
 
 logging.basicConfig(
@@ -152,7 +152,7 @@ def _parse_args() -> argparse.Namespace:
         "--config",
         type=str,
         default=None,
-        help="Optional inference YAML. model.refinement_block is used for model construction.",
+        help="Optional inference YAML.",
     )
     parser.add_argument(
         "--mode",
@@ -238,11 +238,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--base_model", type=str, default=DEFAULT_SD21_BASE_REPO)
     parser.add_argument("--base_model_revision", type=str, default=None)
-    parser.add_argument(
-        "--disable_refinement",
-        action="store_true",
-        help="Instantiate the model without cross-view refinement blocks.",
-    )
     parser.add_argument("--hf_endpoint", type=str, default=DEFAULT_HF_ENDPOINT)
     parser.add_argument("--hf_home", type=str, default=str(DEFAULT_HF_HOME))
     parser.add_argument(
@@ -299,8 +294,8 @@ def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
 
 def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     if not config:
-        args.refinement_block_config = {"enable": not bool(args.disable_refinement)}
-        args.native_cross_attention_config = {}
+        args.satellite_encoder_config = {}
+        args.perspective_pe_enabled = True
         return
 
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
@@ -332,13 +327,9 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.roll_deg = float(_prefer_config(args.roll_deg, 0.0, _config_get(config, ("data", "roll_deg"))))
     args.output_dir = str(_prefer_config(args.output_dir, "./inference_results", _config_get(config, ("output", "output_dir"))))
 
-    refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
-    if args.disable_refinement:
-        refinement_block_config["enable"] = False
-    args.refinement_block_config = refinement_block_config or {"enable": not bool(args.disable_refinement)}
-    args.native_cross_attention_config = dict(_config_get(config, ("model", "native_cross_attention"), {}) or {})
+    args.satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
-    args.perspective_pe_enabled = bool(perspective_pe_config.get("enable", False))
+    args.perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -758,13 +749,6 @@ def _materialize_lazy_modules(
     device: str,
 ) -> None:
     sat_images = sample["sat"].unsqueeze(0).to(device)
-    front_bev_xy = sample.get("front_bev_xy")
-    front_bev_xy = front_bev_xy.unsqueeze(0).to(device) if front_bev_xy is not None else None
-    front_ground_valid_mask = sample.get("front_ground_valid_mask")
-    front_ground_valid_mask = (
-        front_ground_valid_mask.unsqueeze(0).to(device)
-        if front_ground_valid_mask is not None else None
-    )
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
 
     K = sample.get("K")
@@ -803,13 +787,7 @@ def _materialize_lazy_modules(
         model.unet(
             latents,
             timestep,
-            encoder_hidden_states=None,
             sat_tokens=sat_state.tokens,
-            sat_xy=sat_state.xy,
-            sat_bev_coords=sat_state.bev_coords,
-            front_bev_xy=front_bev_xy,
-            front_ground_valid_mask=front_ground_valid_mask,
-            return_attn_map=False,
         )
 
 
@@ -820,25 +798,15 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     elif args.device.startswith("cuda") and args.mixed_precision == "bf16":
         model_torch_dtype = torch.bfloat16
 
-    refinement_block_config = dict(getattr(args, "refinement_block_config", {}) or {})
-    refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
-    native_cross_attention_config = dict(getattr(args, "native_cross_attention_config", {}) or {})
-
     logger.info("Loading model")
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        refinement_block_config=refinement_block_config,
-        refinement_injection_sites=(
-            tuple(refinement_injection_sites)
-            if refinement_injection_sites is not None
-            else None
-        ),
-        native_cross_attention_config=native_cross_attention_config,
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
-        perspective_pe_enabled=getattr(args, "perspective_pe_enabled", False),
+        perspective_pe_enabled=getattr(args, "perspective_pe_enabled", True),
+        satellite_encoder_config=getattr(args, "satellite_encoder_config", None),
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")
@@ -864,13 +832,6 @@ def _generate_one(
     sat_condition_mode: str,
 ) -> torch.Tensor:
     sat_image = sample["sat"].unsqueeze(0).to(args.device)
-    front_bev_xy = sample.get("front_bev_xy")
-    front_bev_xy = front_bev_xy.unsqueeze(0).to(args.device) if front_bev_xy is not None else None
-    front_ground_valid_mask = sample.get("front_ground_valid_mask")
-    front_ground_valid_mask = (
-        front_ground_valid_mask.unsqueeze(0).to(args.device)
-        if front_ground_valid_mask is not None else None
-    )
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
 
     K = sample.get("K")
@@ -892,8 +853,6 @@ def _generate_one(
     ):
         return model.generate(
             sat_image,
-            front_bev_xy=front_bev_xy,
-            front_ground_valid_mask=front_ground_valid_mask,
             target_size=target_size,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,

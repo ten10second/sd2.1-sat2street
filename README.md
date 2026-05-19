@@ -1,13 +1,12 @@
 # KITTI-360 Satellite-to-Frontview Generation with Stable Diffusion
 
-基于 Stable Diffusion 的卫星图到前视图生成框架，完全移除 IPM（逆透视映射）中间步骤，直接使用卫星图和相机位姿，通过 ground-plane-aware 几何契约和双向迭代 cross-view refinement 保持空间一致性。
+基于 Stable Diffusion 的卫星图到前视图生成框架，当前分支只保留基于大地平面假设的 perspective pixel-coordinate position encoding：卫星 patch 投影到前视像素坐标后，再把这个坐标编码加到卫星 token 上。
 
 ## 核心创新
 
-1. **直接端到端生成**：移除传统 IPM 中间步骤，卫星图 + 位姿 → 前视图
-2. **地面平面几何编码**：以前视 token 的 `front_bev_xy` 和有效地面 mask 作为第二种位置编码
-3. **卫星 memory 自校准**：street 特征会反向更新 satellite memory，而不只是单向读取
-4. **空间一致性保持**：更新后的卫星 memory 再经过 self-attention 持续混合
+1. **直接端到端生成**：卫星图 + 位姿 → 前视图
+2. **地平面投影位置编码**：卫星 patch 先投到前视像素坐标，再做 learnable PE
+3. **单一路径条件注入**：UNet 只接收标准 satellite-token cross-attn，没有 scheme1 BEV 注入或 refinement 分支
 
 ## 项目架构
 
@@ -17,14 +16,12 @@
 │   ├── Kitti360dDataset   # 完整的 KITTI-360 数据加载器
 │   └── Kitti360Dataset    # 简化的数据加载器（预留）
 ├── models/               # 模型定义
-│   ├── encoders/         # 卫星图编码器
-│   │   └── SatelliteConditionEncoder  # 输出初始 satellite memory
-│   ├── unet/             # U-Net 模块
-│   │   ├── CrossViewRefinementBlock   # 双向 cross-view refinement
-│   │   ├── StreetToSatelliteAttention # street -> satellite 更新
-│   │   └── SatelliteReadingAttention  # satellite -> street 读取
+│   ├── encoders/         # 卫星 patch + perspective PE 编码器
+│   │   ├── satellite_condition_encoder.py
+│   │   └── perspective_position_encoder.py
 │   ├── sd_model.py       # 显式 conditioning state 的 SD 模型包装
-│   └── sd_trainer.py     # 完整的训练器
+│   ├── sd_trainer.py     # 完整的训练器
+│   └── ...
 ├── utils/                # 工具函数
 │   ├── geometry/         # 几何计算（来自原始项目）
 │   │   ├── differentiable_projection.py  # 可微分投影

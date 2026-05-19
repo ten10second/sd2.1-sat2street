@@ -21,7 +21,7 @@ import yaml
 from PIL import Image, ImageDraw
 
 from data.kitti360d_dataset import Kitti360dDataset
-from models.sd_trainer import create_sd_model, load_model_checkpoint
+from models.sd_model import create_sd_model, load_model_checkpoint
 
 
 logging.basicConfig(
@@ -138,11 +138,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base_model_revision", type=str, default=None,
         help="Optional model revision/branch, e.g. fp16",
-    )
-    parser.add_argument(
-        "--disable_refinement",
-        action="store_true",
-        help="Instantiate the model without cross-view refinement blocks.",
     )
     parser.add_argument(
         "--output_dir", type=str, default="output/multiseed_visualizations",
@@ -310,11 +305,18 @@ def _stack_panel_rows(rows: Sequence[Image.Image], spacing: int = 8) -> Image.Im
 def _materialize_lazy_modules(
     model,
     sat_images: torch.Tensor,
-    front_bev_xy: Optional[torch.Tensor],
-    front_ground_valid_mask: Optional[torch.Tensor],
+    K: Optional[torch.Tensor],
+    T_cam_to_world: Optional[torch.Tensor],
+    T_imu_to_world: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
-    sat_state = model.encode_satellite(sat_images)
+    sat_state = model.encode_satellite(
+        sat_images,
+        K=K,
+        T_cam_to_world=T_cam_to_world,
+        T_imu_to_world=T_imu_to_world,
+        image_size=target_size,
+    )
 
     vae_scale_factor = model._get_vae_scale_factor()
     latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
@@ -329,13 +331,7 @@ def _materialize_lazy_modules(
     model.unet(
         latents,
         timestep,
-        encoder_hidden_states=None,
         sat_tokens=sat_state.tokens,
-        sat_xy=sat_state.xy,
-        sat_bev_coords=sat_state.bev_coords,
-        front_bev_xy=front_bev_xy,
-        front_ground_valid_mask=front_ground_valid_mask,
-        return_attn_map=False,
     )
 
 
@@ -358,12 +354,12 @@ def main() -> None:
 
     sat_image = sample["sat"].unsqueeze(0).to(args.device)
     real_image = sample["image"]
-    front_bev_xy = sample.get("front_bev_xy")
-    if front_bev_xy is not None:
-        front_bev_xy = front_bev_xy.unsqueeze(0).to(args.device)
-    front_ground_valid_mask = sample.get("front_ground_valid_mask")
-    if front_ground_valid_mask is not None:
-        front_ground_valid_mask = front_ground_valid_mask.unsqueeze(0).to(args.device)
+    K = sample.get("K")
+    K = K.unsqueeze(0).to(args.device) if K is not None else None
+    T_cam_to_world = sample.get("T_cam_to_world")
+    T_cam_to_world = T_cam_to_world.unsqueeze(0).to(args.device) if T_cam_to_world is not None else None
+    T_imu_to_world = sample.get("T_imu_to_world")
+    T_imu_to_world = T_imu_to_world.unsqueeze(0).to(args.device) if T_imu_to_world is not None else None
 
     frame_id = int(sample["frame_id"])
     drive_name = str(sample["drive"])
@@ -379,10 +375,10 @@ def main() -> None:
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        refinement_block_config={"enable": not bool(args.disable_refinement)},
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
+        perspective_pe_enabled=True,
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")
@@ -392,7 +388,7 @@ def main() -> None:
     model.eval()
 
     logger.info("Materializing lazy condition modules before loading checkpoint")
-    _materialize_lazy_modules(model, sat_image, front_bev_xy, front_ground_valid_mask, target_size)
+    _materialize_lazy_modules(model, sat_image, K, T_cam_to_world, T_imu_to_world, target_size)
 
     checkpoint_meta = load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()
@@ -427,13 +423,14 @@ def main() -> None:
 
             generated = model.generate(
                 sat_image,
-                front_bev_xy=front_bev_xy,
-                front_ground_valid_mask=front_ground_valid_mask,
                 target_size=target_size,
                 num_inference_steps=args.inference_steps,
                 guidance_scale=guidance_scale,
                 generator=generator,
                 sat_condition_mode=args.sat_condition_mode,
+                K=K,
+                T_cam_to_world=T_cam_to_world,
+                T_imu_to_world=T_imu_to_world,
             )[0].cpu()
 
             if single_cfg:

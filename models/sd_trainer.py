@@ -13,23 +13,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from diffusers import (
-    UNet2DConditionModel,
-    AutoencoderKL,
-    DDPMScheduler,
-)
 from diffusers.optimization import get_scheduler
 from diffusers.utils import is_wandb_available
 from tqdm.auto import tqdm
-import os
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Sequence, Tuple
 import logging
 from PIL import Image, ImageDraw, ImageOps
 
 from models.conditioning import SatelliteMemoryState
-from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
-from models.sd_model import SatelliteConditionedUNet
 
 
 logger = logging.getLogger(__name__)
@@ -40,53 +32,6 @@ DEFAULT_ATTENTION_VIS_LAYERS = [
     "down_blocks.2.attentions.1.transformer_blocks.0.attn2",
     "mid_block.attentions.0.transformer_blocks.0.attn2",
 ]
-
-
-def _aggregate_refinement_stats(
-    refinement_stats: Optional[Dict[str, Dict[str, torch.Tensor]]],
-) -> Dict[str, torch.Tensor]:
-    if not refinement_stats:
-        return {}
-
-    aggregated: Dict[str, torch.Tensor] = {}
-    sem_values = []
-    geom_values = []
-    ratio_values = []
-    update_norm_values = []
-    adapter_residual_norm_values = []
-    for site, site_stats in refinement_stats.items():
-        sem = site_stats.get("logits_sem_std")
-        geom = site_stats.get("logits_geom_std")
-        ratio = site_stats.get("logits_geom_to_sem_ratio")
-        update_norm = site_stats.get("sat_update_norm")
-        adapter_residual_norm = site_stats.get("adapter_residual_norm")
-        if sem is not None:
-            aggregated[f"{site}_logits_sem_std"] = sem
-            sem_values.append(sem)
-        if geom is not None:
-            aggregated[f"{site}_logits_geom_std"] = geom
-            geom_values.append(geom)
-        if ratio is not None:
-            aggregated[f"{site}_logits_geom_to_sem_ratio"] = ratio
-            ratio_values.append(ratio)
-        if update_norm is not None:
-            aggregated[f"{site}_sat_update_norm"] = update_norm
-            update_norm_values.append(update_norm)
-        if adapter_residual_norm is not None:
-            aggregated[f"{site}_adapter_residual_norm"] = adapter_residual_norm
-            adapter_residual_norm_values.append(adapter_residual_norm)
-    if sem_values:
-        aggregated["refinement_logits_sem_std_mean"] = torch.stack(sem_values).mean()
-    if geom_values:
-        aggregated["refinement_logits_geom_std_mean"] = torch.stack(geom_values).mean()
-    if ratio_values:
-        aggregated["refinement_logits_geom_to_sem_ratio_mean"] = torch.stack(ratio_values).mean()
-    if update_norm_values:
-        aggregated["refinement_sat_update_norm_mean"] = torch.stack(update_norm_values).mean()
-    if adapter_residual_norm_values:
-        aggregated["refinement_adapter_residual_norm_mean"] = torch.stack(adapter_residual_norm_values).mean()
-    return aggregated
-
 
 def _is_missing_processor_key(key: str) -> bool:
     return ".processor." in key
@@ -117,709 +62,31 @@ def load_model_checkpoint(
     return checkpoint if isinstance(checkpoint, dict) else {}
 
 
-def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> Optional[Path]:
-    candidate_path = Path(model_id).expanduser()
-    if candidate_path.is_dir():
-        return candidate_path
-
-    if "/" not in model_id:
-        return None
-
-    hf_home = os.environ.get("HF_HOME")
-    if not hf_home:
-        return None
-
-    cache_root = Path(hf_home).expanduser() / "hub" / f"models--{model_id.replace('/', '--')}"
-    if not cache_root.is_dir():
-        return None
-
-    ref_name = revision or "main"
-    ref_file = cache_root / "refs" / ref_name
-    if ref_file.is_file():
-        snapshot_hash = ref_file.read_text().strip()
-        snapshot_dir = cache_root / "snapshots" / snapshot_hash
-        if snapshot_dir.is_dir():
-            return snapshot_dir
-
-    snapshots_dir = cache_root / "snapshots"
-    if not snapshots_dir.is_dir():
-        return None
-
-    snapshot_dirs = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
-    if not snapshot_dirs:
-        return None
-
-    return snapshot_dirs[-1]
-
-
-@torch.no_grad()
-def _materialize_lazy_modules(
-    model: "SatelliteConditionedSDModel",
-    sat_images: torch.Tensor,
-    front_bev_xy: Optional[torch.Tensor],
-    front_ground_valid_mask: Optional[torch.Tensor],
-    target_size: Tuple[int, int],
-) -> None:
-    sat_state = model.encode_satellite(sat_images)
-
-    vae_scale_factor = model._get_vae_scale_factor()
-    latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
-    latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
-    unet_param = next(model.unet.parameters(), None)
-    latent_dtype = unet_param.dtype if unet_param is not None else sat_state.tokens.dtype
-    latents = torch.randn(
-        (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
-        device=sat_images.device,
-        dtype=latent_dtype,
-    )
-    timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
-
-    model.unet(
-        latents,
-        timestep,
-        encoder_hidden_states=None,
-        sat_tokens=sat_state.tokens,
-        sat_xy=sat_state.xy,
-        sat_bev_coords=sat_state.bev_coords,
-        front_bev_xy=front_bev_xy,
-        front_ground_valid_mask=front_ground_valid_mask,
-        return_attn_map=False,
-    )
-
-
-class SatelliteConditionedSDModel(nn.Module):
-    """
-    Stable Diffusion model conditioned on satellite images with coordinate encoding.
-
-    This model combines:
-    - Base Stable Diffusion UNet
-    - Satellite image encoder with coordinate positional encoding
-    - Self-attention for spatial consistency
-    """
-
-    def __init__(
-        self,
-        unet: UNet2DConditionModel,
-        vae: AutoencoderKL,
-        noise_scheduler: DDPMScheduler,
-        satellite_encoder: Optional[SatelliteConditionEncoder] = None,
-        freeze_base: bool = True,
-        cond_drop_prob: float = 0.1,
-    ):
-        super().__init__()
-
-        self.unet = unet
-        self.vae = vae
-        self.noise_scheduler = noise_scheduler
-        self.cond_drop_prob = float(cond_drop_prob)
-        if not 0.0 <= self.cond_drop_prob <= 1.0:
-            raise ValueError(f"cond_drop_prob must be in [0, 1], got {self.cond_drop_prob}")
-
-        # Satellite encoder
-        if satellite_encoder is None:
-            sat_embed_dim = int(unet.config.cross_attention_dim or 768)
-            sat_num_heads = 12
-            if sat_embed_dim % sat_num_heads != 0:
-                if sat_embed_dim % 64 == 0:
-                    sat_num_heads = sat_embed_dim // 64
-                else:
-                    for candidate in range(min(sat_num_heads, sat_embed_dim), 0, -1):
-                        if sat_embed_dim % candidate == 0:
-                            sat_num_heads = candidate
-                            break
-            logger.info(
-                f"[SatelliteConditionedSDModel] Satellite encoder config: embed_dim={sat_embed_dim}, num_heads={sat_num_heads}"
-            )
-            self.satellite_encoder = SatelliteConditionEncoder(
-                embed_dim=sat_embed_dim,
-                num_heads=sat_num_heads,
-            )
-        else:
-            self.satellite_encoder = satellite_encoder
-
-        # Freeze base layers
-        if freeze_base:
-            # Freeze VAE
-            for param in self.vae.parameters():
-                param.requires_grad = False
-
-            # Freeze the pretrained UNet backbone. Satellite-specific modules are
-            # trained separately to preserve the SD prior and avoid scene drift.
-            for name, param in self.unet.named_parameters():
-                if (
-                    ".attn2.to_k." in name
-                    or ".attn2.to_v." in name
-                    or ".attn2.processor." in name
-                ):
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-
-        # Satellite encoder is always trainable
-        for param in self.satellite_encoder.parameters():
-            param.requires_grad = True
-
-        logger.info(f"[SatelliteConditionedSDModel] Initialized")
-        logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
-        logger.info(f"  Satellite encoder params: {sum(p.numel() for p in self.satellite_encoder.parameters())}")
-        logger.info(
-            f"  Trainable attn2 k/v params: "
-            f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and ('.attn2.to_k.' in n or '.attn2.to_v.' in n))}"
-        )
-        logger.info(
-            f"  Trainable attn2 processor params: "
-            f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and '.attn2.processor.' in n)}"
-        )
-        logger.info("  Main attn2 route: satellite tokens")
-        logger.info(f"  Condition dropout: {self.cond_drop_prob}")
-
-    def encode_satellite(self, sat_images: torch.Tensor) -> SatelliteMemoryState:
-        """Encode satellite images into a structured satellite memory state."""
-        encoder_param = next(self.satellite_encoder.parameters(), None)
-        if encoder_param is not None:
-            sat_images = sat_images.to(dtype=encoder_param.dtype)
-        return self.satellite_encoder(sat_images)
-
-    @staticmethod
-    def _normalize_images_for_vae(images: torch.Tensor) -> torch.Tensor:
-        """Map dataset images from [0, 1] to the SD VAE's expected [-1, 1] range."""
-        return images * 2.0 - 1.0
-
-    @staticmethod
-    def _expand_condition_mask(condition_mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-        mask = condition_mask.to(device=reference.device, dtype=reference.dtype)
-        while mask.ndim < reference.ndim:
-            mask = mask.unsqueeze(-1)
-        return mask
-
-    def _build_unet_kwargs(
-        self,
-        encoder_hidden_states: Optional[torch.Tensor],
-        sat_state: SatelliteMemoryState,
-        front_bev_xy: Optional[torch.Tensor],
-        front_ground_valid_mask: Optional[torch.Tensor],
-        condition_mask: Optional[torch.Tensor],
-    ) -> Dict[str, Any]:
-        unet_kwargs: Dict[str, Any] = {}
-        if encoder_hidden_states is not None:
-            unet_kwargs['encoder_hidden_states'] = encoder_hidden_states
-        if getattr(self.unet, 'supports_cross_view_refinement', False):
-            unet_kwargs.update({
-                'sat_tokens': sat_state.tokens,
-                'sat_xy': sat_state.xy,
-                'sat_bev_coords': sat_state.bev_coords,
-                'front_bev_xy': front_bev_xy,
-                'front_ground_valid_mask': front_ground_valid_mask,
-                'condition_mask': condition_mask,
-                'return_attn_map': False,
-            })
-        return unet_kwargs
-
-    def _sample_condition_mask(
-        self,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        condition_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-        if self.training and self.cond_drop_prob > 0.0:
-            condition_mask = torch.rand(batch_size, device=device) >= self.cond_drop_prob
-            if not bool(condition_mask.any().item()):
-                keep_index = torch.randint(0, batch_size, (1,), device=device)
-                condition_mask[keep_index] = True
-        return condition_mask
-
-    def _apply_condition_dropout(
-        self,
-        sat_state: SatelliteMemoryState,
-        condition_mask: torch.Tensor,
-    ) -> SatelliteMemoryState:
-        return sat_state.replace(
-            tokens=sat_state.tokens * self._expand_condition_mask(condition_mask, sat_state.tokens),
-            xy=sat_state.xy * self._expand_condition_mask(condition_mask, sat_state.xy),
-            bev_coords=(
-                sat_state.bev_coords * self._expand_condition_mask(condition_mask, sat_state.bev_coords)
-                if sat_state.bev_coords is not None
-                else None
-            ),
-        )
-
-    @staticmethod
-    def _merge_satellite_states(
-        base_state: SatelliteMemoryState,
-        updated_state: SatelliteMemoryState,
-        condition_mask: torch.Tensor,
-    ) -> SatelliteMemoryState:
-        keep_mask = condition_mask.to(device=base_state.tokens.device, dtype=base_state.tokens.dtype).view(-1, 1, 1)
-        merged_tokens = keep_mask * updated_state.tokens + (1.0 - keep_mask) * base_state.tokens
-        merged_xy = keep_mask * updated_state.xy + (1.0 - keep_mask) * base_state.xy
-
-        base_bev = base_state.bev_coords
-        updated_bev = updated_state.bev_coords
-        if base_bev is None or updated_bev is None:
-            merged_bev = updated_bev if base_bev is None else base_bev
-        else:
-            merged_bev = keep_mask * updated_bev + (1.0 - keep_mask) * base_bev
-
-        return SatelliteMemoryState(tokens=merged_tokens, xy=merged_xy, bev_coords=merged_bev)
-
-    def forward_view_with_satellite_state(
-        self,
-        sat_state: SatelliteMemoryState,
-        target_images: torch.Tensor,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        front_ground_valid_mask: Optional[torch.Tensor] = None,
-        condition_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Run one street-view update/read step against a provided satellite memory.
-
-        Returns the per-view diffusion loss together with the updated satellite state.
-        """
-        batch_size = target_images.shape[0]
-        device = target_images.device
-
-        if condition_mask is None:
-            condition_mask = self._sample_condition_mask(batch_size=batch_size, device=device)
-        conditioned_sat_state = self._apply_condition_dropout(sat_state, condition_mask)
-        encoder_hidden_states = None
-
-        with torch.no_grad():
-            target_images_vae = self._normalize_images_for_vae(target_images)
-            latents = self.vae.encode(target_images_vae).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
-
-        noise = torch.randn_like(latents)
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (batch_size,),
-            device=device,
-            dtype=torch.long,
-        )
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-
-        unet_kwargs = self._build_unet_kwargs(
-            encoder_hidden_states=encoder_hidden_states,
-            sat_state=conditioned_sat_state,
-            front_bev_xy=front_bev_xy,
-            front_ground_valid_mask=front_ground_valid_mask,
-            condition_mask=condition_mask,
-        )
-        model_pred = self.unet(
-            noisy_latents,
-            timesteps,
-            **unet_kwargs,
-        ).sample
-
-        if self.noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif self.noise_scheduler.config.prediction_type == "v_prediction":
-            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-        else:
-            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-
-        loss = F.mse_loss(model_pred, target, reduction="mean")
-        updated_sat_state = getattr(self.unet, "last_satellite_state", None)
-        if updated_sat_state is None:
-            updated_sat_state = conditioned_sat_state
-        updated_sat_state = self._merge_satellite_states(
-            base_state=sat_state,
-            updated_state=updated_sat_state,
-            condition_mask=condition_mask,
-        )
-
-        refinement_stats_by_site = getattr(self.unet, "last_refinement_stats", {})
-        refinement_stats = _aggregate_refinement_stats(refinement_stats_by_site)
-
-        return {
-            "loss": loss,
-            "model_pred": model_pred,
-            "target": target,
-            "sat_state": updated_sat_state,
-            "condition_mask": condition_mask,
-            "refinement_stats": refinement_stats,
-            "refinement_stats_by_site": refinement_stats_by_site,
-            **refinement_stats,
-        }
-
-    def forward(
-        self,
-        sat_images: torch.Tensor,
-        target_images: torch.Tensor,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        front_ground_valid_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for training.
-
-        Args:
-            sat_images: (B, 3, H_sat, W_sat) - Satellite images
-            target_images: (B, 3, H, W) - Target frontview images
-            front_bev_xy: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
-
-        Returns:
-            dict with 'loss' and other info
-        """
-        if target_images.ndim != 4:
-            raise ValueError(
-                "This experiment trains one random-yaw street view per sample; "
-                f"target_images must be [B,C,H,W], got {list(target_images.shape)}"
-            )
-
-        sat_state = self.encode_satellite(sat_images)
-        return self.forward_view_with_satellite_state(
-            sat_state=sat_state,
-            target_images=target_images,
-            front_bev_xy=front_bev_xy,
-            front_ground_valid_mask=front_ground_valid_mask,
-        )
-
-    @torch.no_grad()
-    def _get_vae_scale_factor(self) -> int:
-        block_out_channels = getattr(self.vae.config, "block_out_channels", None)
-        if block_out_channels is None:
-            return 8
-        return max(1, 2 ** (len(block_out_channels) - 1))
-
-    @staticmethod
-    def _infer_image_size_from_front_bev_xy(front_bev_xy: Optional[torch.Tensor]) -> Optional[Tuple[int, int]]:
-        if front_bev_xy is None or not torch.is_tensor(front_bev_xy):
-            return None
-
-        if front_bev_xy.ndim == 4 and front_bev_xy.shape[1] == 2:
-            return int(front_bev_xy.shape[2]), int(front_bev_xy.shape[3])
-        if front_bev_xy.ndim == 4 and front_bev_xy.shape[-1] == 2:
-            return int(front_bev_xy.shape[1]), int(front_bev_xy.shape[2])
-        if front_bev_xy.ndim == 3 and front_bev_xy.shape[0] == 2:
-            return int(front_bev_xy.shape[1]), int(front_bev_xy.shape[2])
-        if front_bev_xy.ndim == 3 and front_bev_xy.shape[-1] == 2:
-            return int(front_bev_xy.shape[0]), int(front_bev_xy.shape[1])
-
-        return None
-
-    def _infer_generation_size(
-        self,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        target_size: Optional[Tuple[int, int]] = None,
-    ) -> Tuple[int, int]:
-        if target_size is not None:
-            return int(target_size[0]), int(target_size[1])
-
-        coords_size = self._infer_image_size_from_front_bev_xy(front_bev_xy)
-        if coords_size is not None:
-            return coords_size
-
-        sample_size = self.unet.config.sample_size
-        if isinstance(sample_size, (tuple, list)):
-            return int(sample_size[0]), int(sample_size[1])
-        return int(sample_size), int(sample_size)
-
-    @staticmethod
-    def _first_batch_satellite_state(
-        sat_state: SatelliteMemoryState,
-        batch_size: int,
-    ) -> SatelliteMemoryState:
-        return SatelliteMemoryState(
-            tokens=sat_state.tokens[:batch_size],
-            xy=sat_state.xy[:batch_size],
-            bev_coords=(
-                sat_state.bev_coords[:batch_size]
-                if sat_state.bev_coords is not None
-                else None
-            ),
-        )
-
-    @torch.no_grad()
-    def generate_with_satellite_state(
-        self,
-        sat_state: SatelliteMemoryState,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        front_ground_valid_mask: Optional[torch.Tensor] = None,
-        target_size: Optional[Tuple[int, int]] = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        generator: Optional[torch.Generator] = None,
-        sat_condition_mode: str = "normal",
-    ) -> Tuple[torch.Tensor, SatelliteMemoryState]:
-        """
-        Generate images from a precomputed satellite memory state.
-
-        The memory is initialized by the caller for one target yaw and updated
-        only inside that denoising trajectory.
-
-        Args:
-            sat_state: Satellite memory state shared by the current view.
-            front_bev_xy: (B, 2, H_cam, W_cam) - BEV coordinates for each camera pixel
-            target_size: Optional target image size as (H, W)
-            num_inference_steps: Number of denoising steps
-            guidance_scale: Guidance scale for classifier-free guidance
-            sat_condition_mode: "normal" uses encoded satellite conditioning,
-                "zero" disables satellite conditioning by zeroing tokens and masks.
-
-        Returns:
-            generated_images: (B, 3, H, W) and the updated satellite state.
-        """
-        B = sat_state.tokens.shape[0]
-        device = sat_state.tokens.device
-
-        if sat_condition_mode == "normal":
-            condition_mask = torch.ones(B, device=device, dtype=torch.bool)
-        elif sat_condition_mode == "zero":
-            sat_state = sat_state.replace(
-                tokens=torch.zeros_like(sat_state.tokens),
-                xy=torch.zeros_like(sat_state.xy),
-                bev_coords=(torch.zeros_like(sat_state.bev_coords) if sat_state.bev_coords is not None else None),
-            )
-            condition_mask = torch.zeros(B, device=device, dtype=torch.bool)
-        else:
-            raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
-
-        encoder_hidden_states = None
-
-        image_h, image_w = self._infer_generation_size(front_bev_xy=front_bev_xy, target_size=target_size)
-        vae_scale_factor = self._get_vae_scale_factor()
-        latent_h = max(1, (image_h + vae_scale_factor - 1) // vae_scale_factor)
-        latent_w = max(1, (image_w + vae_scale_factor - 1) // vae_scale_factor)
-        unet_param = next(self.unet.parameters(), None)
-        latent_dtype = unet_param.dtype if unet_param is not None else sat_state.tokens.dtype
-
-        # Initialize latents
-        latents = torch.randn(
-            (B, self.unet.config.in_channels, latent_h, latent_w),
-            device=device,
-            dtype=latent_dtype,
-            generator=generator,
-        )
-
-        # Prepare CFG branches once and reuse them for every timestep.
-        use_cfg = guidance_scale > 1.0
-        if use_cfg:
-            uncond_state = sat_state.replace(
-                tokens=torch.zeros_like(sat_state.tokens),
-                xy=torch.zeros_like(sat_state.xy),
-                bev_coords=(torch.zeros_like(sat_state.bev_coords) if sat_state.bev_coords is not None else None),
-            )
-            encoder_hidden_states_double = None
-            sat_state_double = sat_state.replace(
-                tokens=torch.cat([sat_state.tokens, uncond_state.tokens], dim=0),
-                xy=torch.cat([sat_state.xy, uncond_state.xy], dim=0),
-                bev_coords=(
-                    torch.cat([sat_state.bev_coords, uncond_state.bev_coords], dim=0)
-                    if sat_state.bev_coords is not None and uncond_state.bev_coords is not None
-                    else None
-                ),
-            )
-            front_bev_xy_double = torch.cat([front_bev_xy, front_bev_xy], dim=0) if front_bev_xy is not None else None
-            front_ground_valid_mask_double = (
-                torch.cat([front_ground_valid_mask, front_ground_valid_mask], dim=0)
-                if front_ground_valid_mask is not None
-                else None
-            )
-            condition_mask_double = torch.cat([
-                condition_mask,
-                torch.zeros_like(condition_mask),
-            ], dim=0)
-
-        # Set timesteps
-        self.noise_scheduler.set_timesteps(num_inference_steps)
-
-        updated_sat_state = sat_state
-
-        # Denoising loop
-        for t in self.noise_scheduler.timesteps:
-            if use_cfg:
-                latent_model_input = torch.cat([latents, latents], dim=0)
-                unet_kwargs = self._build_unet_kwargs(
-                    encoder_hidden_states=encoder_hidden_states_double,
-                    sat_state=sat_state_double,
-                    front_bev_xy=front_bev_xy_double,
-                    front_ground_valid_mask=front_ground_valid_mask_double,
-                    condition_mask=condition_mask_double,
-                )
-                noise_pred_both = self.unet(
-                    latent_model_input,
-                    t,
-                    **unet_kwargs,
-                ).sample
-                noise_pred_cond, noise_pred_uncond = noise_pred_both.chunk(2, dim=0)
-                noise_pred = noise_pred_uncond + guidance_scale * (
-                    noise_pred_cond - noise_pred_uncond
-                )
-                last_sat_state = getattr(self.unet, "last_satellite_state", None)
-                if last_sat_state is not None:
-                    updated_sat_state = self._first_batch_satellite_state(last_sat_state, B)
-            else:
-                unet_kwargs = self._build_unet_kwargs(
-                    encoder_hidden_states=encoder_hidden_states,
-                    sat_state=sat_state,
-                    front_bev_xy=front_bev_xy,
-                    front_ground_valid_mask=front_ground_valid_mask,
-                    condition_mask=condition_mask,
-                )
-                noise_pred = self.unet(
-                    latents,
-                    t,
-                    **unet_kwargs,
-                ).sample
-                last_sat_state = getattr(self.unet, "last_satellite_state", None)
-                if last_sat_state is not None:
-                    updated_sat_state = last_sat_state
-
-            # Compute previous noisy sample
-            if generator is not None:
-                try:
-                    latents = self.noise_scheduler.step(
-                        noise_pred, t, latents, generator=generator
-                    ).prev_sample
-                except TypeError:
-                    latents = self.noise_scheduler.step(
-                        noise_pred, t, latents
-                    ).prev_sample
-            else:
-                latents = self.noise_scheduler.step(
-                    noise_pred, t, latents
-                ).prev_sample
-
-        # Decode latents to images
-        vae_param = next(self.vae.parameters(), None)
-        vae_dtype = vae_param.dtype if vae_param is not None else latents.dtype
-        latents = (latents / self.vae.config.scaling_factor).to(dtype=vae_dtype)
-        generated_images = self.vae.decode(latents).sample
-
-        # Normalize to [0, 1]
-        generated_images = (generated_images / 2 + 0.5).clamp(0, 1)
-
-        if generated_images.shape[-2:] != (image_h, image_w):
-            generated_images = F.interpolate(
-                generated_images,
-                size=(image_h, image_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        return generated_images, updated_sat_state
-
-    @torch.no_grad()
-    def generate(
-        self,
-        sat_images: torch.Tensor,
-        front_bev_xy: Optional[torch.Tensor] = None,
-        front_ground_valid_mask: Optional[torch.Tensor] = None,
-        target_size: Optional[Tuple[int, int]] = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        generator: Optional[torch.Generator] = None,
-        sat_condition_mode: str = "normal",
-    ) -> torch.Tensor:
-        """
-        Generate images from satellite images.
-
-        This preserves the original independent single-view inference behavior.
-        """
-        sat_state = self.encode_satellite(sat_images)
-        generated_images, _ = self.generate_with_satellite_state(
-            sat_state,
-            front_bev_xy=front_bev_xy,
-            front_ground_valid_mask=front_ground_valid_mask,
-            target_size=target_size,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            sat_condition_mode=sat_condition_mode,
-        )
-        return generated_images
-
 
 def create_sd_model(
     base_model: str = 'stabilityai/stable-diffusion-2-1-base',
     freeze_base: bool = True,
-    refinement_block_config: Optional[Dict] = None,
-    refinement_injection_sites: Optional[Tuple[str, ...]] = None,
-    native_cross_attention_config: Optional[Dict] = None,
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
-) -> SatelliteConditionedSDModel:
-    """
-    Create a satellite-conditioned Stable Diffusion model.
+    perspective_pe_enabled: bool = True,
+    satellite_encoder_config: Optional[Dict[str, Any]] = None,
+) -> nn.Module:
+    """Backward-compatible import surface for the clean perspective-PE model."""
+    from models.sd_model import create_sd_model as _create_sd_model
 
-    Args:
-        base_model: Name of base Stable Diffusion model
-        freeze_base: Whether to freeze base layers
-
-    Returns:
-        SatelliteConditionedSDModel
-    """
-    resolved_base_model = _resolve_hf_snapshot_path(base_model, revision=revision)
-    load_source = str(resolved_base_model) if resolved_base_model is not None else base_model
-    if resolved_base_model is not None:
-        logger.info(f"Using cached base model snapshot: {resolved_base_model}")
-
-    # Load base components
-    component_load_kwargs: Dict[str, Any] = {}
-    if revision is not None and resolved_base_model is None:
-        component_load_kwargs["revision"] = revision
-    if torch_dtype is not None:
-        component_load_kwargs["torch_dtype"] = torch_dtype
-    if resolved_base_model is not None:
-        component_load_kwargs["local_files_only"] = True
-
-    vae = AutoencoderKL.from_pretrained(
-        load_source,
-        subfolder="vae",
-        **component_load_kwargs,
-    )
-    base_unet = UNet2DConditionModel.from_pretrained(
-        load_source,
-        subfolder="unet",
-        **component_load_kwargs,
-    )
-
-    refinement_cfg = refinement_block_config or {}
-    unet = SatelliteConditionedUNet(
-        enable_cross_view_refinement=refinement_cfg.get('enable', True),
-        refinement_injection_sites=list(refinement_injection_sites) if refinement_injection_sites is not None else None,
-        refinement_block_config={
-            'num_heads': refinement_cfg.get('num_heads', 8),
-            'head_dim': refinement_cfg.get('head_dim', 64),
-            'geo_ratio': refinement_cfg.get('geo_ratio', 0.5),
-            'rope_base': refinement_cfg.get('rope_base', 10000.0),
-            'lambda_geo': refinement_cfg.get('lambda_geo', 1.0),
-            'lambda_geom': refinement_cfg.get('lambda_geom', 1.0),
-            'geom_hidden_dim': refinement_cfg.get('geom_hidden_dim', 128),
-            'geom_head_dim': refinement_cfg.get('geom_head_dim', 16),
-            'sat_update_layers': refinement_cfg.get('sat_update_layers', 1),
-            'use_geom_bias': refinement_cfg.get('use_geom_bias', True),
-            'adapter_residual': refinement_cfg.get('adapter_residual', True),
-            'adapter_residual_scale': refinement_cfg.get('adapter_residual_scale', 1.0),
-        },
-        native_cross_attention_config=native_cross_attention_config,
-        **base_unet.config,
-    )
-    unet.load_state_dict(base_unet.state_dict(), strict=False)
-    if torch_dtype is not None:
-        unet = unet.to(dtype=torch_dtype)
-    scheduler_load_kwargs: Dict[str, Any] = {}
-    if revision is not None and resolved_base_model is None:
-        scheduler_load_kwargs["revision"] = revision
-    if resolved_base_model is not None:
-        scheduler_load_kwargs["local_files_only"] = True
-
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        load_source,
-        subfolder="scheduler",
-        **scheduler_load_kwargs,
-    )
-
-    model = SatelliteConditionedSDModel(
-        unet=unet,
-        vae=vae,
-        noise_scheduler=noise_scheduler,
+    return _create_sd_model(
+        base_model=base_model,
         freeze_base=freeze_base,
+        revision=revision,
+        torch_dtype=torch_dtype,
         cond_drop_prob=cond_drop_prob,
+        perspective_pe_enabled=perspective_pe_enabled,
+        satellite_encoder_config=satellite_encoder_config,
     )
 
-    return model
+
+from models.sd_model import SatelliteConditionedSDModel as SatelliteConditionedSDModel
 
 
 class SDTrainer:
@@ -921,8 +188,6 @@ class SDTrainer:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         self._barrier()
 
-        # Refinement blocks are created lazily on first forward. Materialize them before
-        # building the optimizer so their parameters are actually trainable.
         self._materialize_lazy_condition_modules()
         self._ensure_trainable_params_fp32()
         self._assert_no_trainable_fp16_params()
@@ -1020,50 +285,17 @@ class SDTrainer:
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         return bool(flag.item())
 
+    def _move_batch_geometry(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        geometry: Dict[str, torch.Tensor] = {}
+        for key in ("K", "T_cam_to_world", "T_imu_to_world"):
+            value = batch.get(key)
+            if torch.is_tensor(value):
+                geometry[key] = value.to(self.device)
+        return geometry
+
     @torch.no_grad()
     def _materialize_lazy_condition_modules(self) -> None:
-        unet = getattr(self.model, "unet", None)
-        if unet is None or not getattr(unet, "enable_cross_view_refinement", False):
-            return
-        if len(getattr(unet, "refinement_blocks", {})) > 0:
-            return
-
-        try:
-            batch = next(iter(self.train_dataloader))
-        except StopIteration:
-            logger.warning("Skipped lazy module materialization because the training dataloader is empty")
-            return
-
-        sat_images = batch.get("sat")
-        target_images = batch.get("image")
-        if sat_images is None or target_images is None:
-            logger.warning("Skipped lazy module materialization because batch is missing 'sat' or 'image'")
-            return
-
-        sat_images = sat_images[:1].to(self.device)
-        front_bev_xy = batch.get("front_bev_xy")
-        if front_bev_xy is not None:
-            front_bev_xy = front_bev_xy[:1].to(self.device)
-            if front_bev_xy.ndim == 5:
-                front_bev_xy = front_bev_xy[:, 0]
-        front_ground_valid_mask = batch.get("front_ground_valid_mask")
-        if front_ground_valid_mask is not None:
-            front_ground_valid_mask = front_ground_valid_mask[:1].to(self.device)
-            if front_ground_valid_mask.ndim == 5:
-                front_ground_valid_mask = front_ground_valid_mask[:, 0]
-        target_size = tuple(int(x) for x in target_images.shape[-2:])
-
-        was_training = self.model.training
-        self.model.eval()
-        _materialize_lazy_modules(self.model, sat_images, front_bev_xy, front_ground_valid_mask, target_size)
-        if was_training:
-            self.model.train()
-
-        refinement_param_count = sum(p.numel() for p in unet.refinement_blocks.parameters())
-        logger.info(
-            f"Materialized {len(unet.refinement_blocks)} refinement block(s) before optimizer init "
-            f"({refinement_param_count} parameters)"
-        )
+        return
 
     def _ensure_trainable_params_fp32(self) -> None:
         fp16_params = []
@@ -1175,13 +407,10 @@ class SDTrainer:
                         ("outputs.sat_state.tokens", sat_state.tokens),
                         ("outputs.sat_state.xy", sat_state.xy),
                         ("outputs.sat_state.bev_coords", sat_state.bev_coords),
+                        ("outputs.sat_state.perspective_uv", sat_state.perspective_uv),
+                        ("outputs.sat_state.perspective_valid", sat_state.perspective_valid),
                     ]
                 )
-            refinement_stats = outputs.get("refinement_stats", {})
-            if isinstance(refinement_stats, dict):
-                for key, value in refinement_stats.items():
-                    if torch.is_tensor(value):
-                        output_tensors.append((f"outputs.refinement_stats.{key}", value))
             issue = self._first_nonfinite_named_tensor(output_tensors)
             if issue is not None:
                 logger.warning("  First non-finite output: %s", issue)
@@ -1360,13 +589,7 @@ class SDTrainer:
             # Move data to device
             sat_images = batch['sat'].to(self.device)
             target_images = batch['image'].to(self.device)
-
-            front_bev_xy = batch.get('front_bev_xy')
-            if front_bev_xy is not None:
-                front_bev_xy = front_bev_xy.to(self.device)
-            front_ground_valid_mask = batch.get('front_ground_valid_mask')
-            if front_ground_valid_mask is not None:
-                front_ground_valid_mask = front_ground_valid_mask.to(self.device)
+            geometry_kwargs = self._move_batch_geometry(batch)
 
             # Forward pass
             with torch.autocast(
@@ -1377,16 +600,14 @@ class SDTrainer:
                 outputs = self.model(
                     sat_images,
                     target_images,
-                    front_bev_xy=front_bev_xy,
-                    front_ground_valid_mask=front_ground_valid_mask,
+                    **geometry_kwargs,
                 )
                 raw_loss = outputs['loss']
 
             batch_tensors = {
                 "sat": sat_images,
                 "image": target_images,
-                "front_bev_xy": front_bev_xy,
-                "front_ground_valid_mask": front_ground_valid_mask,
+                **geometry_kwargs,
             }
             loss_is_finite = bool(torch.isfinite(raw_loss.detach()).all().item())
             if self._any_rank_true(not loss_is_finite):
@@ -1472,55 +693,17 @@ class SDTrainer:
             total_raw_loss += raw_loss.item()
             finite_loss_batches += 1
             postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
-            geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
-            if torch.is_tensor(geom_ratio):
-                postfix['geom/sem'] = f"{geom_ratio.item():.2f}"
             if self.is_main_process:
                 progress_bar.set_postfix(postfix)
 
             # Log
             if self.is_main_process and (step + 1) % self.log_every == 0:
-                geom_std = outputs.get('refinement_logits_geom_std_mean')
-                sem_std = outputs.get('refinement_logits_sem_std_mean')
-                geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
-                sat_update_norm = outputs.get('refinement_sat_update_norm_mean')
-                adapter_residual_norm = outputs.get('refinement_adapter_residual_norm_mean')
-                if all(torch.is_tensor(v) for v in (geom_std, sem_std, geom_ratio)):
-                    site_ratio_parts = []
-                    for site, site_stats in outputs.get('refinement_stats_by_site', {}).items():
-                        ratio = site_stats.get('logits_geom_to_sem_ratio')
-                        if torch.is_tensor(ratio):
-                            site_ratio_parts.append(f"{site}={ratio.item():.3f}")
-                    site_ratio_text = f" ({', '.join(site_ratio_parts)})" if site_ratio_parts else ""
-                    update_norm_text = (
-                        f" sat_update={sat_update_norm.item():.6f}"
-                        if torch.is_tensor(sat_update_norm)
-                        else ""
-                    )
-                    adapter_residual_norm_text = (
-                        f" adapter_residual={adapter_residual_norm.item():.6f}"
-                        if torch.is_tensor(adapter_residual_norm)
-                        else ""
-                    )
-                    logger.info(
-                        "Train step %d/%d: raw_loss=%.6f sem_std=%.6f geom_std=%.6f geom/sem=%.3f%s%s%s",
-                        step + 1,
-                        num_batches,
-                        raw_loss.item(),
-                        sem_std.item(),
-                        geom_std.item(),
-                        geom_ratio.item(),
-                        site_ratio_text,
-                        update_norm_text,
-                        adapter_residual_norm_text,
-                    )
-                else:
-                    logger.info(
-                        "Train step %d/%d: raw_loss=%.6f",
-                        step + 1,
-                        num_batches,
-                        raw_loss.item(),
-                    )
+                logger.info(
+                    "Train step %d/%d: raw_loss=%.6f",
+                    step + 1,
+                    num_batches,
+                    raw_loss.item(),
+                )
                 log_payload = {
                     'train/raw_loss': raw_loss.item(),
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
@@ -1528,16 +711,6 @@ class SDTrainer:
                 }
                 if last_grad_norm is not None:
                     log_payload['train/grad_norm'] = last_grad_norm
-                if torch.is_tensor(sem_std):
-                    log_payload['refinement/logits_sem_std_mean'] = sem_std.item()
-                if torch.is_tensor(geom_std):
-                    log_payload['refinement/logits_geom_std_mean'] = geom_std.item()
-                if torch.is_tensor(geom_ratio):
-                    log_payload['refinement/logits_geom_to_sem_ratio_mean'] = geom_ratio.item()
-                if torch.is_tensor(sat_update_norm):
-                    log_payload['refinement/sat_update_norm_mean'] = sat_update_norm.item()
-                if torch.is_tensor(adapter_residual_norm):
-                    log_payload['refinement/adapter_residual_norm_mean'] = adapter_residual_norm.item()
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
         local_mean = total_raw_loss / max(1, finite_loss_batches)
@@ -1554,13 +727,7 @@ class SDTrainer:
         for batch in tqdm(self.val_dataloader, desc=f"Val Epoch {epoch+1}"):
             sat_images = batch['sat'].to(self.device)
             target_images = batch['image'].to(self.device)
-
-            front_bev_xy = batch.get('front_bev_xy')
-            if front_bev_xy is not None:
-                front_bev_xy = front_bev_xy.to(self.device)
-            front_ground_valid_mask = batch.get('front_ground_valid_mask')
-            if front_ground_valid_mask is not None:
-                front_ground_valid_mask = front_ground_valid_mask.to(self.device)
+            geometry_kwargs = self._move_batch_geometry(batch)
 
             with torch.autocast(
                 device_type="cuda",
@@ -1570,8 +737,7 @@ class SDTrainer:
                 outputs = eval_model(
                     sat_images,
                     target_images,
-                    front_bev_xy=front_bev_xy,
-                    front_ground_valid_mask=front_ground_valid_mask,
+                    **geometry_kwargs,
                 )
                 loss = outputs['loss']
             total_loss += loss.item()
@@ -2085,7 +1251,7 @@ class SDTrainer:
         if not items:
             return None
 
-        required_keys = ("sat", "image", "front_bev_xy", "front_ground_valid_mask")
+        required_keys = ("sat", "image", "K", "T_cam_to_world", "T_imu_to_world")
         for key in required_keys:
             if any(key not in item or not torch.is_tensor(item[key]) for item in items):
                 return None
@@ -2100,12 +1266,24 @@ class SDTrainer:
         result = {
             "sat": torch.stack([item["sat"] for item in items], dim=0),
             "image": torch.stack([item["image"] for item in items], dim=0),
-            "front_bev_xy": torch.stack([item["front_bev_xy"] for item in items], dim=0),
-            "front_ground_valid_mask": torch.stack([item["front_ground_valid_mask"] for item in items], dim=0),
             "frame_ids": frame_ids,
             "view_labels": [str(item["_visualization_view_label"]) for item in items],
             "yaw_degs": [item["_visualization_yaw_deg"] for item in items],
         }
+        if all("front_bev_xy" in item and torch.is_tensor(item["front_bev_xy"]) for item in items):
+            result["front_bev_xy"] = torch.stack([item["front_bev_xy"] for item in items], dim=0)
+        else:
+            result["front_bev_xy"] = None
+        if all(
+            "front_ground_valid_mask" in item and torch.is_tensor(item["front_ground_valid_mask"])
+            for item in items
+        ):
+            result["front_ground_valid_mask"] = torch.stack(
+                [item["front_ground_valid_mask"] for item in items],
+                dim=0,
+            )
+        else:
+            result["front_ground_valid_mask"] = None
         for cam_key in ("K", "T_cam_to_world", "T_imu_to_world"):
             if all(cam_key in item and torch.is_tensor(item[cam_key]) for item in items):
                 result[cam_key] = torch.stack([item[cam_key] for item in items], dim=0)
@@ -2262,12 +1440,6 @@ class SDTrainer:
                     else None
                 ),
             )
-            view_front_bev_xy = front_bev_xy[idx:idx + 1] if front_bev_xy is not None else None
-            view_front_ground_valid_mask = (
-                front_ground_valid_mask[idx:idx + 1]
-                if front_ground_valid_mask is not None
-                else None
-            )
             attention_debug: Dict[str, Any] = {}
             if unet is not None and hasattr(unet, "enable_attention_debug"):
                 unet.enable_attention_debug(
@@ -2277,8 +1449,6 @@ class SDTrainer:
             try:
                 generated_view, _ = eval_model.generate_with_satellite_state(
                     view_sat_state,
-                    front_bev_xy=view_front_bev_xy,
-                    front_ground_valid_mask=view_front_ground_valid_mask,
                     target_size=tuple(target_images.shape[-2:]),
                     num_inference_steps=self.visualization_inference_steps,
                     guidance_scale=self.visualization_guidance_scale,

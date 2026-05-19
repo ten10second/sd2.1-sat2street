@@ -24,7 +24,8 @@ import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from models.sd_trainer import create_sd_model, load_model_checkpoint, SDTrainer
+from models.sd_model import create_sd_model, load_model_checkpoint
+from models.sd_trainer import SDTrainer
 from data import Kitti360dDataset
 from torch.utils.data import DataLoader, default_collate
 from torch.utils.data.distributed import DistributedSampler
@@ -554,11 +555,9 @@ def main():
     front_resize_cfg = _config_get(config, ("data", "front_resize"), [640, 256])
     front_resize = tuple(int(x) for x in front_resize_cfg)
     log_dir = Path(str(_config_get(config, ("logging", "log_dir"), args.output_dir)))
-    refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
-    refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
-    native_cross_attention_config = dict(_config_get(config, ("model", "native_cross_attention"), {}) or {})
+    satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
-    perspective_pe_enabled = bool(perspective_pe_config.get("enable", False))
+    perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
 
     _configure_logging(log_dir)
 
@@ -696,13 +695,11 @@ def main():
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=freeze_base,
-        refinement_block_config=refinement_block_config,
-        refinement_injection_sites=tuple(refinement_injection_sites) if refinement_injection_sites is not None else None,
-        native_cross_attention_config=native_cross_attention_config,
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
         perspective_pe_enabled=perspective_pe_enabled,
+        satellite_encoder_config=satellite_encoder_config,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":
         if is_main_process:

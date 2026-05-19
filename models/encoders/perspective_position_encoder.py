@@ -1,16 +1,11 @@
-"""
-Perspective Position Encoding for satellite tokens.
-
-Projects BEV patch centers into the perspective view and encodes the resulting
-pixel coordinates as a learnable positional encoding that is added to satellite
-tokens before they enter the UNet cross-attention.
-"""
+"""Perspective position encoding for satellite tokens."""
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
 
 
 def compute_sat_patch_perspective_uv(
@@ -104,12 +99,20 @@ class PerspectivePositionEncoder(nn.Module):
             nn.LayerNorm(dim),
         )
 
-    def forward(self, uv_norm: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        uv_norm: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             uv_norm: (B, N, 2) normalised pixel coords in [-1, 1].
+            valid: Optional (B, N) validity mask.
 
         Returns:
             pe: (B, N, dim) perspective position encoding.
         """
-        return self.mlp(uv_norm)
+        pe = self.mlp(uv_norm)
+        if valid is not None:
+            pe = pe * valid.to(dtype=pe.dtype).unsqueeze(-1)
+        return pe

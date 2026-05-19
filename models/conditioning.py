@@ -1,11 +1,9 @@
-"""
-Structured conditioning state for cross-view satellite/street refinement.
-"""
+"""Structured conditioning state for satellite conditioning."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -13,7 +11,7 @@ import torch
 @dataclass
 class SatelliteMemoryState:
     """
-    Mutable satellite memory carried across U-Net refinement sites.
+    Satellite token state carried through Stable Diffusion conditioning.
     """
 
     tokens: torch.Tensor
@@ -38,18 +36,3 @@ class SatelliteMemoryState:
             perspective_uv=self.perspective_uv if perspective_uv is None else perspective_uv,
             perspective_valid=self.perspective_valid if perspective_valid is None else perspective_valid,
         )
-
-
-@dataclass
-class CrossViewConditioningState:
-    """
-    Structured conditioning payload threaded through explicit UNet refinement.
-    """
-
-    satellite: SatelliteMemoryState
-    front_bev_xy: Any
-    front_ground_valid_mask: Any = None
-    condition_mask: Optional[torch.Tensor] = None
-    return_attn_map: bool = False
-    attn_maps: Dict[str, torch.Tensor] = field(default_factory=dict)
-    refinement_stats: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)

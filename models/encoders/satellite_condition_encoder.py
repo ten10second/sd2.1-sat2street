@@ -1,200 +1,194 @@
-"""
-Satellite Image Condition Encoder.
+"""Satellite image condition encoder with ground-plane perspective PE."""
 
-Encodes satellite images with coordinate positional encoding for Stable Diffusion.
-"""
+from __future__ import annotations
+
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from typing import Optional
 
 from models.conditioning import SatelliteMemoryState
-from ..unet.relative_position_attention import RelativePositionAttention
+
+from .perspective_position_encoder import (
+    PerspectivePositionEncoder,
+    compute_sat_patch_perspective_uv,
+)
 
 
 class SatelliteConditionEncoder(nn.Module):
-    """
-    Encode satellite images with coordinate positional encoding.
-
-    This encoder implements the core idea:
-    "给卫星图加入另一个位置编码——透视平面上每个 token 在 BEV 图上的相对位置，然后做 self-attention"
-
-    Key insight:
-    - Satellite image patches are in BEV space with fixed physical coordinates
-    - We use BEV space coordinates (not image grid coordinates) for relative position
-    - This maintains spatial consistency through self-attention
-
-    Args:
-        embed_dim: Embedding dimension
-        patch_size: Patch size for dividing satellite image
-        num_layers: Number of transformer layers
-        num_heads: Number of attention heads
-        use_relative_pos: Whether to use relative position attention
-        sat_resolution: Meters per pixel in satellite image
-        sat_size: Size of satellite image
-    """
+    """Encode satellite patches with grid PE, perspective PE, and self-attention."""
 
     def __init__(
         self,
         embed_dim: int = 768,
         patch_size: int = 16,
-        num_layers: int = 4,
-        num_heads: int = 12,
-        use_relative_pos: bool = True,
         sat_resolution: float = 0.2,
         sat_size: int = 512,
+        perspective_pe_enabled: bool = True,
+        num_heads: int = 12,
+        num_layers: int = 4,
+        attn_dropout: float = 0.1,
     ):
         super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.patch_size = int(patch_size)
+        self.sat_resolution = float(sat_resolution)
+        self.sat_size = int(sat_size)
+        self.perspective_pe_enabled = bool(perspective_pe_enabled)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
 
-        self.embed_dim = embed_dim
-        self.patch_size = patch_size
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.use_relative_pos = use_relative_pos
-        self.sat_resolution = sat_resolution
-        self.sat_size = sat_size
+        self.grid_size = self.sat_size // self.patch_size
+        self.grid_num_patches = self.grid_size ** 2
 
-        # Patch embedding
         self.patch_embed = nn.Conv2d(
             in_channels=3,
-            out_channels=embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
             padding=0,
         )
 
-        # Coordinate encoder - for BEV space coordinates (meters)
-        self.coord_encoder = nn.Sequential(
-            nn.Linear(2, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
+        # Learnable grid position embedding (row-major order)
+        self.grid_pos_embed = nn.Parameter(
+            torch.zeros(1, self.grid_num_patches, self.embed_dim)
         )
+        nn.init.trunc_normal_(self.grid_pos_embed, std=0.02)
 
-        # Transformer layers with relative position attention
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.layers.append(
-                RelativePositionAttention(
-                    embed_dim=embed_dim,
-                    num_heads=num_heads,
-                    dropout=0.1,
-                    use_relative_pos=use_relative_pos,
-                )
-            )
+        self.perspective_pos_encoder = PerspectivePositionEncoder(dim=self.embed_dim)
+        self.token_norm = nn.LayerNorm(self.embed_dim)
 
-        # Layer norm
-        self.norm = nn.LayerNorm(embed_dim)
+        # Self-attention layers
+        self.self_attn = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=self.embed_dim,
+                nhead=self.num_heads,
+                dim_feedforward=4 * self.embed_dim,
+                dropout=float(attn_dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            ),
+            num_layers=self.num_layers,
+        )
+        self.attn_norm = nn.LayerNorm(self.embed_dim)
 
-    def _compute_patch_bev_coords(
-        self,
-        B: int,
-        H: int,
-        W: int,
-    ) -> torch.Tensor:
-        """
-        Compute BEV space coordinates (in meters) for each satellite patch.
+        # Zero-init output projections so self-attention starts as near-identity
+        for layer in self.self_attn.layers:
+            nn.init.zeros_(layer.self_attn.out_proj.weight)
+            nn.init.zeros_(layer.self_attn.out_proj.bias)
+            nn.init.zeros_(layer.linear2.weight)
+            nn.init.zeros_(layer.linear2.bias)
+        nn.init.zeros_(self.attn_norm.weight)
+        nn.init.zeros_(self.attn_norm.bias)
 
-        This is the key: each satellite patch has a fixed physical position
-        in BEV space, not just a grid position in the image.
-
-        Args:
-            B: Batch size
-            H: Height of satellite image
-            W: Width of satellite image
-
-        Returns:
-            patch_coords: (B, N, 2) - BEV coordinates in meters for each patch
-        """
+    def _compute_patch_bev_coords(self, B: int, H: int, W: int) -> torch.Tensor:
         patch_h = H // self.patch_size
         patch_w = W // self.patch_size
 
-        # Compute patch centers in pixel coordinates
-        patch_pixel_h = torch.arange(patch_h, dtype=torch.float32) * self.patch_size + self.patch_size / 2
-        patch_pixel_w = torch.arange(patch_w, dtype=torch.float32) * self.patch_size + self.patch_size / 2
+        patch_pixel_h = (
+            torch.arange(patch_h, dtype=torch.float32) * self.patch_size + self.patch_size / 2
+        )
+        patch_pixel_w = (
+            torch.arange(patch_w, dtype=torch.float32) * self.patch_size + self.patch_size / 2
+        )
+        w_grid, h_grid = torch.meshgrid(patch_pixel_w, patch_pixel_h, indexing="xy")
 
-        # Create meshgrid
-        w_grid, h_grid = torch.meshgrid(patch_pixel_w, patch_pixel_h, indexing='xy')
-
-        # Convert to BEV space coordinates in meters
-        # Satellite image is centered at (0, 0) in BEV space
-        # Positive x is east, positive y is north
-        half_sat = self.sat_size / 2.0
-        x_meters = (w_grid - half_sat) * self.sat_resolution  # (patch_h, patch_w)
-        y_meters = (half_sat - h_grid) * self.sat_resolution  # (patch_h, patch_w)
-
-        # Stack to (patch_h*patch_w, 2)
+        half_w = float(W) / 2.0
+        half_h = float(H) / 2.0
+        x_meters = (w_grid - half_w) * self.sat_resolution
+        y_meters = (half_h - h_grid) * self.sat_resolution
         coords = torch.stack([x_meters.reshape(-1), y_meters.reshape(-1)], dim=-1)
-
-        # Expand for batch
         return coords.unsqueeze(0).expand(B, -1, 2)
 
-    def _compute_patch_normalized_coords(
-        self,
-        B: int,
-        H: int,
-        W: int,
-    ) -> torch.Tensor:
-        """
-        Compute normalized ego-centric xy for each patch center in [-1, 1].
-
-        Coordinate origin is the satellite image center.
-        x is positive to the right, y is positive upward.
-        """
+    def _compute_patch_normalized_coords(self, B: int, H: int, W: int) -> torch.Tensor:
         patch_h = H // self.patch_size
         patch_w = W // self.patch_size
-
-        patch_pixel_h = torch.arange(patch_h, dtype=torch.float32) * self.patch_size + self.patch_size / 2
-        patch_pixel_w = torch.arange(patch_w, dtype=torch.float32) * self.patch_size + self.patch_size / 2
-        w_grid, h_grid = torch.meshgrid(patch_pixel_w, patch_pixel_h, indexing='xy')
-
-        x_norm = (w_grid - (W / 2.0)) / (W / 2.0)
-        y_norm = ((H / 2.0) - h_grid) / (H / 2.0)
+        u = torch.arange(patch_w, dtype=torch.float32) * self.patch_size + self.patch_size / 2
+        v = torch.arange(patch_h, dtype=torch.float32) * self.patch_size + self.patch_size / 2
+        vv, uu = torch.meshgrid(v, u, indexing="ij")
+        x_norm = (uu - (W / 2.0)) / (W / 2.0)
+        y_norm = ((H / 2.0) - vv) / (H / 2.0)
         coords = torch.stack([x_norm.reshape(-1), y_norm.reshape(-1)], dim=-1)
         return coords.unsqueeze(0).expand(B, -1, 2)
+
+    @staticmethod
+    def _validate_geometry(
+        K: Optional[torch.Tensor],
+        T_cam_to_world: Optional[torch.Tensor],
+        T_imu_to_world: Optional[torch.Tensor],
+        image_size: Optional[Tuple[int, int]],
+    ) -> None:
+        missing = []
+        if K is None:
+            missing.append("K")
+        if T_cam_to_world is None:
+            missing.append("T_cam_to_world")
+        if T_imu_to_world is None:
+            missing.append("T_imu_to_world")
+        if image_size is None:
+            missing.append("image_size")
+        if missing:
+            raise ValueError(
+                "perspective PE is enabled but geometry inputs are missing: " + ", ".join(missing)
+            )
 
     def forward(
         self,
         sat_images: torch.Tensor,
+        *,
+        K: Optional[torch.Tensor] = None,
+        T_cam_to_world: Optional[torch.Tensor] = None,
+        T_imu_to_world: Optional[torch.Tensor] = None,
+        image_size: Optional[Tuple[int, int]] = None,
     ) -> SatelliteMemoryState:
-        """
-        Encode satellite images into the initial satellite memory state.
-
-        Args:
-            sat_images: (B, 3, H, W) - Satellite images
-
-        Returns:
-            Structured satellite memory with token features, normalized xy, and metric BEV coords.
-        """
         B, _, H, W = sat_images.shape
+        device = sat_images.device
 
-        # Step 1: Patch embedding
-        patches = self.patch_embed(sat_images)  # (B, D, H/P, W/P)
-        patches_flat = patches.permute(0, 2, 3, 1).reshape(B, -1, self.embed_dim)  # (B, N, D)
+        patches = self.patch_embed(sat_images)
+        tokens = patches.permute(0, 2, 3, 1).reshape(B, -1, self.embed_dim)
+        tokens = self.token_norm(tokens)
 
-        # Step 2: Compute BEV space coordinates for each patch
-        # These are fixed physical positions in meters
-        bev_coords = self._compute_patch_bev_coords(B, H, W)
-        bev_coords = bev_coords.to(sat_images.device)  # (B, N, 2)
+        # Add learnable grid position embedding
+        grid_pe = self.grid_pos_embed[:, : tokens.shape[1], :].to(device=device, dtype=tokens.dtype)
+        tokens = tokens + grid_pe
 
-        # Step 3: Encode BEV coordinates
-        coord_emb = self.coord_encoder(bev_coords)  # (B, N, D)
+        bev_coords = self._compute_patch_bev_coords(B, H, W).to(device=device, dtype=sat_images.dtype)
+        sat_xy = self._compute_patch_normalized_coords(B, H, W).to(device=device, dtype=sat_images.dtype)
 
-        # Step 4: Combine patch features and coordinate encoding
-        x = patches_flat + coord_emb  # (B, N, D)
+        perspective_uv = None
+        perspective_valid = None
+        if self.perspective_pe_enabled:
+            self._validate_geometry(K, T_cam_to_world, T_imu_to_world, image_size)
+            image_h, image_w = int(image_size[0]), int(image_size[1])
+            perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
+                bev_coords=bev_coords,
+                K=K.to(device=device, dtype=sat_images.dtype),
+                T_cam_to_world=T_cam_to_world.to(device=device, dtype=sat_images.dtype),
+                T_imu_to_world=T_imu_to_world.to(device=device, dtype=sat_images.dtype),
+                image_w=image_w,
+                image_h=image_h,
+            )
+            tokens = tokens + self.perspective_pos_encoder(perspective_uv, perspective_valid)
+        elif K is not None and T_cam_to_world is not None and T_imu_to_world is not None and image_size is not None:
+            image_h, image_w = int(image_size[0]), int(image_size[1])
+            perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
+                bev_coords=bev_coords,
+                K=K.to(device=device, dtype=sat_images.dtype),
+                T_cam_to_world=T_cam_to_world.to(device=device, dtype=sat_images.dtype),
+                T_imu_to_world=T_imu_to_world.to(device=device, dtype=sat_images.dtype),
+                image_w=image_w,
+                image_h=image_h,
+            )
 
-        # Step 5: Pass through transformer layers
-        # The self-attention uses BEV coordinates to compute relative positions
-        for layer in self.layers:
-            x = layer(x, bev_coords)  # (B, N, D)
+        # Self-attention among satellite patches
+        tokens = tokens + self.self_attn(tokens)
+        tokens = self.attn_norm(tokens)
 
-        # Step 6: Apply final layer norm
-        x = self.norm(x)
-
-        sat_xy = self._compute_patch_normalized_coords(B, H, W).to(sat_images.device)
         return SatelliteMemoryState(
-            tokens=x,
+            tokens=tokens,
             xy=sat_xy,
             bev_coords=bev_coords,
+            perspective_uv=perspective_uv,
+            perspective_valid=perspective_valid,
         )
