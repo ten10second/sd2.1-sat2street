@@ -27,12 +27,28 @@ logger = logging.getLogger(__name__)
 class SatelliteConditionedUNet(UNet2DConditionModel):
     """Thin UNet wrapper that routes satellite tokens into cross-attention."""
 
+    _logged_diag: bool = False
+
     def forward(self, *args, sat_tokens: Optional[torch.Tensor] = None, **kwargs):
         encoder_hidden_states = kwargs.pop("encoder_hidden_states", None)
         if sat_tokens is not None:
             encoder_hidden_states = sat_tokens
         if encoder_hidden_states is None:
             raise ValueError("SatelliteConditionedUNet requires sat_tokens or encoder_hidden_states")
+
+        # Diagnostic log (once per process)
+        if not SatelliteConditionedUNet._logged_diag:
+            import logging
+            _logger = logging.getLogger(__name__)
+            _logger.info(
+                "[SatelliteConditionedUNet] encoder_hidden_states: "
+                "shape=%s mean=%.4f std=%.4f nonzero_frac=%.3f",
+                tuple(encoder_hidden_states.shape),
+                encoder_hidden_states.float().mean().item(),
+                encoder_hidden_states.float().std().item(),
+                (encoder_hidden_states.abs() > 1e-6).float().mean().item(),
+            )
+            SatelliteConditionedUNet._logged_diag = True
 
         return super().forward(
             *args,

@@ -79,8 +79,6 @@ class SatelliteConditionEncoder(nn.Module):
             nn.init.zeros_(layer.self_attn.out_proj.bias)
             nn.init.zeros_(layer.linear2.weight)
             nn.init.zeros_(layer.linear2.bias)
-        nn.init.zeros_(self.attn_norm.weight)
-        nn.init.zeros_(self.attn_norm.bias)
 
     def _compute_patch_bev_coords(self, B: int, H: int, W: int) -> torch.Tensor:
         patch_h = H // self.patch_size
