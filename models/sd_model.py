@@ -16,12 +16,24 @@ try:
     from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 except ImportError:  # pragma: no cover - compatibility with older diffusers layouts
     from diffusers.models.unet_2d_condition import UNet2DConditionModel
+from diffusers.models.attention_processor import AttnProcessor2_0
 
 from models.conditioning import SatelliteMemoryState
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
+from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
 
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_module_path(root: nn.Module, path: str) -> nn.Module:
+    module: nn.Module = root
+    for part in path.split("."):
+        if part.isdigit():
+            module = module[int(part)]  # type: ignore[index]
+        else:
+            module = getattr(module, part)
+    return module
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
@@ -29,12 +41,71 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
     _logged_diag: bool = False
 
+    def __init__(
+        self,
+        query_uv_pe_enabled: bool = True,
+        query_uv_gate_init: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.query_uv_pe_enabled = bool(query_uv_pe_enabled)
+        self.query_uv_gate_init = float(query_uv_gate_init)
+        self._install_query_uv_attention_processors()
+
+    def _build_attention_processors(self):
+        if not self.query_uv_pe_enabled:
+            return AttnProcessor2_0()
+
+        processors = {}
+        for name in self.attn_processors.keys():
+            attn_module = _resolve_module_path(self, name.removesuffix(".processor"))
+            query_dim = int(attn_module.to_q.out_features)
+            if name.endswith(".attn2.processor"):
+                processors[name] = QueryUVAttnProcessor2_0(
+                    query_dim=query_dim,
+                    query_uv_enabled=True,
+                    gate_init=self.query_uv_gate_init,
+                )
+            else:
+                processors[name] = QueryUVAttnProcessor2_0(
+                    query_dim=query_dim,
+                    query_uv_enabled=False,
+                )
+        return processors
+
+    def _install_query_uv_attention_processors(self) -> None:
+        self.set_attn_processor(self._build_attention_processors())
+
+    @staticmethod
+    def _normalize_query_base_hw(cross_attention_kwargs):
+        if cross_attention_kwargs is None:
+            return None
+        if not isinstance(cross_attention_kwargs, dict):
+            raise ValueError(f"cross_attention_kwargs must be a dict when query UV PE is enabled, got {type(cross_attention_kwargs)!r}")
+        query_base_hw = cross_attention_kwargs.get("query_base_hw")
+        if query_base_hw is None:
+            return None
+        if isinstance(query_base_hw, torch.Tensor):
+            if query_base_hw.numel() != 2:
+                raise ValueError(f"query_base_hw tensor must contain 2 values, got {tuple(query_base_hw.shape)}")
+            query_base_hw = tuple(int(x) for x in query_base_hw.reshape(-1).tolist())
+        elif hasattr(query_base_hw, "__len__") and len(query_base_hw) != 2:
+            raise ValueError(f"query_base_hw must contain 2 values, got {query_base_hw}")
+        return tuple(int(x) for x in query_base_hw)
+
     def forward(self, *args, sat_tokens: Optional[torch.Tensor] = None, **kwargs):
         encoder_hidden_states = kwargs.pop("encoder_hidden_states", None)
+        cross_attention_kwargs = kwargs.get("cross_attention_kwargs")
         if sat_tokens is not None:
             encoder_hidden_states = sat_tokens
         if encoder_hidden_states is None:
             raise ValueError("SatelliteConditionedUNet requires sat_tokens or encoder_hidden_states")
+        if self.query_uv_pe_enabled:
+            if self._normalize_query_base_hw(cross_attention_kwargs) is None:
+                raise ValueError(
+                    "query_uv_pe_enabled requires cross_attention_kwargs['query_base_hw'] "
+                    "to thread latent spatial coordinates into cross-attention"
+                )
 
         # Diagnostic log (once per process)
         if not SatelliteConditionedUNet._logged_diag:
@@ -178,6 +249,7 @@ class SatelliteConditionedSDModel(nn.Module):
             f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and '.attn2.processor.' in n)}"
         )
         logger.info(f"  Perspective PE enabled: {self.perspective_pe_enabled}")
+        logger.info(f"  Query UV PE enabled: {bool(getattr(self.unet, 'query_uv_pe_enabled', False))}")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
     def encode_satellite(
@@ -248,6 +320,13 @@ class SatelliteConditionedSDModel(nn.Module):
             ),
         )
 
+    def _build_query_uv_cross_attention_kwargs(self, reference: torch.Tensor):
+        if not bool(getattr(self.unet, "query_uv_pe_enabled", False)):
+            return None
+        if reference.ndim != 4:
+            raise ValueError(f"reference tensor must be [B,C,H,W], got {list(reference.shape)}")
+        return {"query_base_hw": tuple(int(x) for x in reference.shape[-2:])}
+
     @torch.no_grad()
     def _get_vae_scale_factor(self) -> int:
         block_out_channels = getattr(self.vae.config, "block_out_channels", None)
@@ -309,12 +388,14 @@ class SatelliteConditionedSDModel(nn.Module):
         self.noise_scheduler.set_timesteps(num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
+            cross_attention_kwargs = self._build_query_uv_cross_attention_kwargs(latents)
             if use_cfg:
                 latent_model_input = torch.cat([latents, latents], dim=0)
                 noise_pred_both = self.unet(
                     latent_model_input,
                     t,
                     sat_tokens=sat_state_double.tokens,
+                    cross_attention_kwargs=cross_attention_kwargs,
                 ).sample
                 noise_pred_cond, noise_pred_uncond = noise_pred_both.chunk(2, dim=0)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
@@ -323,6 +404,7 @@ class SatelliteConditionedSDModel(nn.Module):
                     latents,
                     t,
                     sat_tokens=sat_state.tokens,
+                    cross_attention_kwargs=cross_attention_kwargs,
                 ).sample
 
             if generator is not None:
@@ -425,10 +507,12 @@ class SatelliteConditionedSDModel(nn.Module):
             dtype=torch.long,
         )
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+        cross_attention_kwargs = self._build_query_uv_cross_attention_kwargs(noisy_latents)
         model_pred = self.unet(
             noisy_latents,
             timesteps,
             sat_tokens=conditioned_sat_state.tokens,
+            cross_attention_kwargs=cross_attention_kwargs,
         ).sample
 
         if self.noise_scheduler.config.prediction_type == "epsilon":
@@ -455,6 +539,8 @@ def create_sd_model(
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
     perspective_pe_enabled: bool = True,
+    query_uv_pe_enabled: bool = True,
+    query_uv_gate_init: float = 0.0,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> SatelliteConditionedSDModel:
     """Create a satellite-conditioned Stable Diffusion model."""
@@ -487,7 +573,11 @@ def create_sd_model(
     sat_encoder_cfg.setdefault("perspective_pe_enabled", perspective_pe_enabled)
     satellite_encoder = SatelliteConditionEncoder(**sat_encoder_cfg)
 
-    unet = SatelliteConditionedUNet(**base_unet.config)
+    unet = SatelliteConditionedUNet(
+        query_uv_pe_enabled=query_uv_pe_enabled,
+        query_uv_gate_init=query_uv_gate_init,
+        **base_unet.config,
+    )
     unet.load_state_dict(base_unet.state_dict(), strict=False)
     if torch_dtype is not None:
         unet = unet.to(dtype=torch_dtype)

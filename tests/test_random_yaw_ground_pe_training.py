@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 import torch.nn as nn
+from diffusers.models.attention_processor import Attention
 from torch.utils.data import DataLoader, Dataset
 
 from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
@@ -14,6 +15,7 @@ from models.encoders.perspective_position_encoder import compute_sat_patch_persp
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import SatelliteConditionedSDModel
 from models.sd_trainer import SDTrainer
+from models.unet.query_uv_attn_processor import build_normalized_image_uv_grid, infer_spatial_hw
 
 
 def _identity_geometry(batch_size: int = 1):
@@ -76,8 +78,10 @@ class _DummyUNet(nn.Module):
         super().__init__()
         self.config = SimpleNamespace(in_channels=3, sample_size=8, cross_attention_dim=embed_dim)
         self.scale = nn.Parameter(torch.tensor(0.0))
+        self.query_uv_pe_enabled = True
         self.call_sat_token_means = []
         self.extra_kwarg_keys = []
+        self.cross_attention_kwargs = []
 
     def forward(
         self,
@@ -92,6 +96,7 @@ class _DummyUNet(nn.Module):
         tokens = sat_tokens if sat_tokens is not None else encoder_hidden_states
         self.call_sat_token_means.append(float(tokens.mean().detach().item()))
         self.extra_kwarg_keys.append(tuple(sorted(kwargs.keys())))
+        self.cross_attention_kwargs.append(kwargs.get("cross_attention_kwargs"))
         return SimpleNamespace(sample=noisy_latents * self.scale)
 
 
@@ -269,6 +274,53 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertTrue(torch.allclose(uv[0, 2], torch.tensor([0.0, -0.2]), atol=1e-5))
         self.assertEqual(valid.tolist(), [[True, True, True, False]])
 
+    def test_query_uv_helpers_use_the_same_normalized_pixel_convention(self) -> None:
+        uv = build_normalized_image_uv_grid(
+            2,
+            2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                uv[0],
+                torch.tensor(
+                    [
+                        [-0.5, -0.5],
+                        [0.5, -0.5],
+                        [-0.5, 0.5],
+                        [0.5, 0.5],
+                    ],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+        self.assertEqual(infer_spatial_hw(4, (8, 8)), (2, 2))
+        self.assertEqual(infer_spatial_hw(640, (32, 80)), (16, 40))
+
+    def test_query_uv_attn_processor_runs_on_flattened_cross_attention(self) -> None:
+        from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
+
+        torch.manual_seed(0)
+        attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)
+        attn.set_processor(
+            QueryUVAttnProcessor2_0(
+                query_dim=int(attn.to_q.out_features),
+                query_uv_enabled=True,
+            )
+        )
+        hidden_states = torch.randn(1, 4, 8)
+        encoder_hidden_states = torch.randn(1, 3, 8)
+
+        output = attn(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            query_base_hw=(2, 2),
+        )
+
+        self.assertEqual(output.shape, hidden_states.shape)
+
     def test_model_forward_stores_perspective_state_and_uses_only_sat_tokens(self) -> None:
         torch.manual_seed(0)
         model = _SmallPerspectiveModel()
@@ -289,7 +341,8 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertIsNotNone(sat_state.perspective_uv)
         self.assertIsNotNone(sat_state.perspective_valid)
         self.assertEqual(sat_state.perspective_uv.shape, (1, 4, 2))
-        self.assertEqual(model.unet.extra_kwarg_keys, [()])
+        self.assertEqual(model.unet.extra_kwarg_keys, [("cross_attention_kwargs",)])
+        self.assertEqual(model.unet.cross_attention_kwargs[0]["query_base_hw"], (10, 10))
 
     def test_rank5_view_group_forward_is_rejected(self) -> None:
         model = _SmallPerspectiveModel()

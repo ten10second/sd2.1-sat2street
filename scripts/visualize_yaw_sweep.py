@@ -332,11 +332,15 @@ def _materialize_lazy_modules(
         dtype=sat_state.tokens.dtype,
     )
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
+    cross_attention_kwargs = None
+    if bool(getattr(model.unet, "query_uv_pe_enabled", False)):
+        cross_attention_kwargs = {"query_base_hw": (latent_h, latent_w)}
 
     model.unet(
         latents,
         timestep,
         sat_tokens=sat_state.tokens,
+        cross_attention_kwargs=cross_attention_kwargs,
     )
 
 
@@ -389,6 +393,7 @@ def main() -> None:
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
         perspective_pe_enabled=True,
+        query_uv_pe_enabled=True,
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")

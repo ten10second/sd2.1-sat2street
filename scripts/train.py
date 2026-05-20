@@ -558,6 +558,8 @@ def main():
     satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
     perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
+    query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
+    query_uv_pe_enabled = bool(query_pe_config.get("enable", True))
 
     _configure_logging(log_dir)
 
@@ -699,6 +701,7 @@ def main():
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
         perspective_pe_enabled=perspective_pe_enabled,
+        query_uv_pe_enabled=query_uv_pe_enabled,
         satellite_encoder_config=satellite_encoder_config,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":

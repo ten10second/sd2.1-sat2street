@@ -70,6 +70,8 @@ def create_sd_model(
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
     perspective_pe_enabled: bool = True,
+    query_uv_pe_enabled: bool = True,
+    query_uv_gate_init: float = 0.0,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
     """Backward-compatible import surface for the clean perspective-PE model."""
@@ -82,6 +84,8 @@ def create_sd_model(
         torch_dtype=torch_dtype,
         cond_drop_prob=cond_drop_prob,
         perspective_pe_enabled=perspective_pe_enabled,
+        query_uv_pe_enabled=query_uv_pe_enabled,
+        query_uv_gate_init=query_uv_gate_init,
         satellite_encoder_config=satellite_encoder_config,
     )
 

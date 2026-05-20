@@ -47,6 +47,10 @@ model:
   perspective_position_encoding:
     enable: true
 
+  # Query-side UV positional encoding for UNet cross-attention
+  query_position_encoding:
+    enable: true
+
 # 训练配置
 training:
   epochs: 100

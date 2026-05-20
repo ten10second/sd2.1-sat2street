@@ -32,6 +32,7 @@ def main():
         freeze_base=True,
         torch_dtype=torch.float32,
         perspective_pe_enabled=True,
+        query_uv_pe_enabled=True,
     )
     model = model.to(device)
 

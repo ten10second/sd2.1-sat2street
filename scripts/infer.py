@@ -296,6 +296,7 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     if not config:
         args.satellite_encoder_config = {}
         args.perspective_pe_enabled = True
+        args.query_uv_pe_enabled = True
         return
 
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
@@ -330,6 +331,8 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
     args.perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
+    query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
+    args.query_uv_pe_enabled = bool(query_pe_config.get("enable", True))
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -794,6 +797,9 @@ def _materialize_lazy_modules(
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
 
     amp_dtype = latent_dtype if latent_dtype in {torch.float16, torch.bfloat16} else torch.float32
+    cross_attention_kwargs = None
+    if bool(getattr(model.unet, "query_uv_pe_enabled", False)):
+        cross_attention_kwargs = {"query_base_hw": (latent_h, latent_w)}
     with torch.autocast(
         device_type="cuda",
         dtype=amp_dtype,
@@ -803,6 +809,7 @@ def _materialize_lazy_modules(
             latents,
             timestep,
             sat_tokens=sat_state.tokens,
+            cross_attention_kwargs=cross_attention_kwargs,
         )
 
 
@@ -821,6 +828,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
         perspective_pe_enabled=getattr(args, "perspective_pe_enabled", True),
+        query_uv_pe_enabled=getattr(args, "query_uv_pe_enabled", True),
         satellite_encoder_config=getattr(args, "satellite_encoder_config", None),
     )
     if hasattr(model.unet, "set_attention_slice"):
