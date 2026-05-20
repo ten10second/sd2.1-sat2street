@@ -287,7 +287,7 @@ class SDTrainer:
 
     def _move_batch_geometry(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         geometry: Dict[str, torch.Tensor] = {}
-        for key in ("K", "T_cam_to_world", "T_imu_to_world"):
+        for key in ("K", "T_cam_to_world", "T_imu_to_world", "camera_height_m"):
             value = batch.get(key)
             if torch.is_tensor(value):
                 geometry[key] = value.to(self.device)
@@ -1270,6 +1270,16 @@ class SDTrainer:
             "view_labels": [str(item["_visualization_view_label"]) for item in items],
             "yaw_degs": [item["_visualization_yaw_deg"] for item in items],
         }
+        camera_heights = []
+        for item in items:
+            camera_height = item.get("camera_height_m")
+            if torch.is_tensor(camera_height):
+                camera_height = float(camera_height.item())
+            if camera_height is None:
+                return None
+            camera_heights.append(float(camera_height))
+        result["camera_height_m"] = torch.tensor(camera_heights, dtype=torch.float32)
+
         if all("front_bev_xy" in item and torch.is_tensor(item["front_bev_xy"]) for item in items):
             result["front_bev_xy"] = torch.stack([item["front_bev_xy"] for item in items], dim=0)
         else:
@@ -1297,6 +1307,7 @@ class SDTrainer:
         K_chunks = []
         T_cam_to_world_chunks = []
         T_imu_to_world_chunks = []
+        camera_height_chunks = []
         frame_ids = []
         view_labels = []
         yaw_degs = []
@@ -1326,6 +1337,9 @@ class SDTrainer:
                 cam_val = batch.get(cam_key)
                 if cam_val is not None:
                     chunks.append(cam_val[:take])
+            camera_height = batch.get('camera_height_m')
+            if torch.is_tensor(camera_height):
+                camera_height_chunks.append(camera_height[:take])
 
             batch_frame_ids = batch.get('frame_id')
             if batch_frame_ids is None:
@@ -1353,6 +1367,8 @@ class SDTrainer:
             "view_labels": view_labels,
             "yaw_degs": yaw_degs,
         }
+        if camera_height_chunks:
+            result["camera_height_m"] = torch.cat(camera_height_chunks, dim=0)
         for cam_key, chunks in [
             ('K', K_chunks),
             ('T_cam_to_world', T_cam_to_world_chunks),
@@ -1401,6 +1417,9 @@ class SDTrainer:
         T_imu_to_world = visualization_batch.get("T_imu_to_world")
         if T_imu_to_world is not None:
             T_imu_to_world = T_imu_to_world.to(self.device)
+        camera_height_m = visualization_batch.get("camera_height_m")
+        if torch.is_tensor(camera_height_m):
+            camera_height_m = camera_height_m.to(self.device)
         target_size = (int(target_images.shape[2]), int(target_images.shape[3]))
 
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
@@ -1413,6 +1432,7 @@ class SDTrainer:
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
             image_size=target_size,
         )
         generator = torch.Generator(device=generator_device)

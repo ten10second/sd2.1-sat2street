@@ -23,7 +23,9 @@ def _identity_geometry(batch_size: int = 1):
     K[:, 0, 2] = 5.0
     K[:, 1, 2] = 5.0
     T_cam_to_world = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
-    T_cam_to_world[:, 2, 3] = -1.0
+    T_cam_to_world[:, 1, 1] = -1.0
+    T_cam_to_world[:, 2, 2] = -1.0
+    T_cam_to_world[:, 2, 3] = 132.85
     T_imu_to_world = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
     return K, T_cam_to_world, T_imu_to_world
 
@@ -106,6 +108,7 @@ class _SingleSampleDataset(Dataset):
             "K": K[0],
             "T_cam_to_world": T_cam_to_world[0],
             "T_imu_to_world": T_imu_to_world[0],
+            "camera_height_m": torch.tensor(1.0, dtype=torch.float32),
             "front_bev_xy": torch.zeros((2, 8, 8), dtype=torch.float32),
             "front_ground_valid_mask": torch.ones((1, 8, 8), dtype=torch.float32),
             "frame_id": torch.tensor(7),
@@ -124,6 +127,7 @@ class _SmallPerspectiveModel(SatelliteConditionedSDModel):
             embed_dim=4,
             patch_size=4,
             perspective_pe_enabled=True,
+            num_heads=1,
         )
 
 
@@ -255,13 +259,14 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=torch.tensor([1.0], dtype=torch.float32),
             image_w=10,
             image_h=10,
         )
 
         self.assertTrue(torch.allclose(uv[0, 0], torch.tensor([0.0, 0.0]), atol=1e-5))
         self.assertTrue(torch.allclose(uv[0, 1], torch.tensor([0.2, 0.0]), atol=1e-5))
-        self.assertTrue(torch.allclose(uv[0, 2], torch.tensor([0.0, 0.2]), atol=1e-5))
+        self.assertTrue(torch.allclose(uv[0, 2], torch.tensor([0.0, -0.2]), atol=1e-5))
         self.assertEqual(valid.tolist(), [[True, True, True, False]])
 
     def test_model_forward_stores_perspective_state_and_uses_only_sat_tokens(self) -> None:
@@ -276,6 +281,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=torch.tensor([1.0], dtype=torch.float32),
         )
 
         self.assertTrue(torch.is_tensor(outputs["loss"]))
@@ -295,6 +301,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
                 K=K,
                 T_cam_to_world=T_cam_to_world,
                 T_imu_to_world=T_imu_to_world,
+                camera_height_m=torch.tensor([1.0], dtype=torch.float32),
             )
 
     def test_resume_checkpoint_restores_next_epoch_index(self) -> None:

@@ -115,6 +115,7 @@ class SatelliteConditionEncoder(nn.Module):
         K: Optional[torch.Tensor],
         T_cam_to_world: Optional[torch.Tensor],
         T_imu_to_world: Optional[torch.Tensor],
+        camera_height_m: Optional[torch.Tensor],
         image_size: Optional[Tuple[int, int]],
     ) -> None:
         missing = []
@@ -124,6 +125,8 @@ class SatelliteConditionEncoder(nn.Module):
             missing.append("T_cam_to_world")
         if T_imu_to_world is None:
             missing.append("T_imu_to_world")
+        if camera_height_m is None:
+            missing.append("camera_height_m")
         if image_size is None:
             missing.append("image_size")
         if missing:
@@ -138,6 +141,7 @@ class SatelliteConditionEncoder(nn.Module):
         K: Optional[torch.Tensor] = None,
         T_cam_to_world: Optional[torch.Tensor] = None,
         T_imu_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
         image_size: Optional[Tuple[int, int]] = None,
     ) -> SatelliteMemoryState:
         B, _, H, W = sat_images.shape
@@ -157,24 +161,32 @@ class SatelliteConditionEncoder(nn.Module):
         perspective_uv = None
         perspective_valid = None
         if self.perspective_pe_enabled:
-            self._validate_geometry(K, T_cam_to_world, T_imu_to_world, image_size)
+            self._validate_geometry(K, T_cam_to_world, T_imu_to_world, camera_height_m, image_size)
             image_h, image_w = int(image_size[0]), int(image_size[1])
             perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
                 bev_coords=bev_coords,
                 K=K.to(device=device, dtype=sat_images.dtype),
                 T_cam_to_world=T_cam_to_world.to(device=device, dtype=sat_images.dtype),
                 T_imu_to_world=T_imu_to_world.to(device=device, dtype=sat_images.dtype),
+                camera_height_m=camera_height_m,
                 image_w=image_w,
                 image_h=image_h,
             )
             tokens = tokens + self.perspective_pos_encoder(perspective_uv, perspective_valid)
-        elif K is not None and T_cam_to_world is not None and T_imu_to_world is not None and image_size is not None:
+        elif (
+            K is not None
+            and T_cam_to_world is not None
+            and T_imu_to_world is not None
+            and camera_height_m is not None
+            and image_size is not None
+        ):
             image_h, image_w = int(image_size[0]), int(image_size[1])
             perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
                 bev_coords=bev_coords,
                 K=K.to(device=device, dtype=sat_images.dtype),
                 T_cam_to_world=T_cam_to_world.to(device=device, dtype=sat_images.dtype),
                 T_imu_to_world=T_imu_to_world.to(device=device, dtype=sat_images.dtype),
+                camera_height_m=camera_height_m,
                 image_w=image_w,
                 image_h=image_h,
             )

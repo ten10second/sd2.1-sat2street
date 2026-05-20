@@ -291,6 +291,19 @@ def _resize_satellite_for_front(sat_image: torch.Tensor, target_h: int) -> torch
     ).squeeze(0)
 
 
+def _batched_camera_height(sample: Dict, device: str) -> Optional[torch.Tensor]:
+    value = sample.get("camera_height_m")
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        tensor = value
+    else:
+        tensor = torch.as_tensor(value, dtype=torch.float32)
+    if tensor.ndim == 0:
+        tensor = tensor.reshape(1)
+    return tensor.to(device=device, dtype=torch.float32)
+
+
 @torch.no_grad()
 def _materialize_lazy_modules(
     model,
@@ -298,6 +311,7 @@ def _materialize_lazy_modules(
     K: Optional[torch.Tensor],
     T_cam_to_world: Optional[torch.Tensor],
     T_imu_to_world: Optional[torch.Tensor],
+    camera_height_m: Optional[torch.Tensor],
     target_size: Tuple[int, int],
 ) -> None:
     sat_state = model.encode_satellite(
@@ -305,6 +319,7 @@ def _materialize_lazy_modules(
         K=K,
         T_cam_to_world=T_cam_to_world,
         T_imu_to_world=T_imu_to_world,
+        camera_height_m=camera_height_m,
         image_size=target_size,
     )
 
@@ -358,6 +373,7 @@ def main() -> None:
         if T_imu_to_world_90 is not None
         else None
     )
+    camera_height_90 = _batched_camera_height(sample_90, args.device)
 
     model_torch_dtype = None
     if args.device.startswith("cuda") and args.mixed_precision == "fp16":
@@ -382,7 +398,15 @@ def main() -> None:
     model.eval()
 
     logger.info("Materializing lazy condition modules before loading checkpoint")
-    _materialize_lazy_modules(model, sat_image, K_90, T_cam_to_world_90, T_imu_to_world_90, target_size)
+    _materialize_lazy_modules(
+        model,
+        sat_image,
+        K_90,
+        T_cam_to_world_90,
+        T_imu_to_world_90,
+        camera_height_90,
+        target_size,
+    )
 
     load_model_checkpoint(model, Path(args.checkpoint), args.device)
     model.eval()
@@ -417,6 +441,7 @@ def main() -> None:
             if T_imu_to_world is not None
             else None
         )
+        camera_height_m = _batched_camera_height(sample, args.device)
 
         generator = torch.Generator(device=generator_device)
         generator.manual_seed(args.seed)
@@ -429,6 +454,7 @@ def main() -> None:
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
         )[0].cpu()
 
         yaw_token = str(yaw).replace("-", "m").replace(".", "p")

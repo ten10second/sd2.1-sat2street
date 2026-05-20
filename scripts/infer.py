@@ -742,6 +742,19 @@ def _filter_sample_indices(
     return indices
 
 
+def _batched_camera_height(sample: Dict, device: str) -> Optional[torch.Tensor]:
+    value = sample.get("camera_height_m")
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        tensor = value
+    else:
+        tensor = torch.as_tensor(value, dtype=torch.float32)
+    if tensor.ndim == 0:
+        tensor = tensor.reshape(1)
+    return tensor.to(device=device, dtype=torch.float32)
+
+
 @torch.no_grad()
 def _materialize_lazy_modules(
     model,
@@ -757,12 +770,14 @@ def _materialize_lazy_modules(
     T_cam_to_world = T_cam_to_world.unsqueeze(0).to(device) if T_cam_to_world is not None else None
     T_imu_to_world = sample.get("T_imu_to_world")
     T_imu_to_world = T_imu_to_world.unsqueeze(0).to(device) if T_imu_to_world is not None else None
+    camera_height_m = _batched_camera_height(sample, device)
 
     sat_state = model.encode_satellite(
         sat_images,
         K=K,
         T_cam_to_world=T_cam_to_world,
         T_imu_to_world=T_imu_to_world,
+        camera_height_m=camera_height_m,
         image_size=target_size,
     )
 
@@ -840,6 +855,7 @@ def _generate_one(
     T_cam_to_world = T_cam_to_world.unsqueeze(0).to(args.device) if T_cam_to_world is not None else None
     T_imu_to_world = sample.get("T_imu_to_world")
     T_imu_to_world = T_imu_to_world.unsqueeze(0).to(args.device) if T_imu_to_world is not None else None
+    camera_height_m = _batched_camera_height(sample, args.device)
 
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
     generator = torch.Generator(device=generator_device)
@@ -861,6 +877,7 @@ def _generate_one(
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
         )[0].cpu()
 
 

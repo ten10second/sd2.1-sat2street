@@ -64,13 +64,15 @@ def main():
     K = batch["K"].to(device)
     T_cam_to_world = batch["T_cam_to_world"].to(device)
     T_imu_to_world = batch["T_imu_to_world"].to(device)
+    camera_height_m = batch["camera_height_m"].to(device)
 
     model.eval()
     with torch.no_grad():
         # Encode satellite
         sat_state = model.encode_satellite(
             sat_images, K=K, T_cam_to_world=T_cam_to_world,
-            T_imu_to_world=T_imu_to_world, image_size=target_size,
+            T_imu_to_world=T_imu_to_world, camera_height_m=camera_height_m,
+            image_size=target_size,
         )
 
         print(f"\nSat tokens stats:")

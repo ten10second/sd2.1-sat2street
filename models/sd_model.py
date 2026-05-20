@@ -38,7 +38,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
         # Diagnostic log (once per process)
         if not SatelliteConditionedUNet._logged_diag:
-            import logging
             _logger = logging.getLogger(__name__)
             _logger.info(
                 "[SatelliteConditionedUNet] encoder_hidden_states: "
@@ -188,6 +187,7 @@ class SatelliteConditionedSDModel(nn.Module):
         K: Optional[torch.Tensor] = None,
         T_cam_to_world: Optional[torch.Tensor] = None,
         T_imu_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
         image_size: Optional[Tuple[int, int]] = None,
     ) -> SatelliteMemoryState:
         """Encode satellite images into a structured memory state."""
@@ -199,6 +199,7 @@ class SatelliteConditionedSDModel(nn.Module):
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
             image_size=image_size,
         )
 
@@ -356,6 +357,7 @@ class SatelliteConditionedSDModel(nn.Module):
         K: Optional[torch.Tensor] = None,
         T_cam_to_world: Optional[torch.Tensor] = None,
         T_imu_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
@@ -367,6 +369,7 @@ class SatelliteConditionedSDModel(nn.Module):
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
             image_size=target_size,
         )
         generated_images, _ = self.generate_with_satellite_state(
@@ -387,6 +390,7 @@ class SatelliteConditionedSDModel(nn.Module):
         K: Optional[torch.Tensor] = None,
         T_cam_to_world: Optional[torch.Tensor] = None,
         T_imu_to_world: Optional[torch.Tensor] = None,
+        camera_height_m: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if target_images.ndim != 4:
             raise ValueError(
@@ -399,6 +403,7 @@ class SatelliteConditionedSDModel(nn.Module):
             K=K,
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
             image_size=tuple(int(x) for x in target_images.shape[-2:]),
         )
 
