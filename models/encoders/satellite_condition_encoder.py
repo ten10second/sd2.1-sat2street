@@ -73,13 +73,6 @@ class SatelliteConditionEncoder(nn.Module):
         )
         self.attn_norm = nn.LayerNorm(self.embed_dim)
 
-        # Zero-init output projections so self-attention starts as near-identity
-        for layer in self.self_attn.layers:
-            nn.init.zeros_(layer.self_attn.out_proj.weight)
-            nn.init.zeros_(layer.self_attn.out_proj.bias)
-            nn.init.zeros_(layer.linear2.weight)
-            nn.init.zeros_(layer.linear2.bias)
-
     def _compute_patch_bev_coords(self, B: int, H: int, W: int) -> torch.Tensor:
         patch_h = H // self.patch_size
         patch_w = W // self.patch_size

@@ -342,6 +342,22 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertIsInstance(processor.query_uv_encoder.mlp[3], nn.Linear)
         self.assertIsInstance(processor.query_uv_encoder.mlp[4], nn.LayerNorm)
 
+    def test_satellite_condition_encoder_self_attention_is_not_zero_initialized(self) -> None:
+        encoder = SatelliteConditionEncoder(
+            embed_dim=32,
+            patch_size=4,
+            sat_resolution=0.2,
+            sat_size=16,
+            perspective_pe_enabled=False,
+            num_heads=4,
+            num_layers=2,
+            attn_dropout=0.0,
+        )
+
+        layer0 = encoder.self_attn.layers[0]
+        self.assertGreater(layer0.self_attn.out_proj.weight.abs().max().item(), 0.0)
+        self.assertGreater(layer0.linear2.weight.abs().max().item(), 0.0)
+
     def test_query_uv_sliced_attn_processor_preserves_query_base_hw(self) -> None:
         torch.manual_seed(0)
         attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)
