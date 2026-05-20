@@ -325,6 +325,23 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
 
         self.assertEqual(output.shape, hidden_states.shape)
 
+    def test_query_uv_attn_processor_uses_two_layer_coord_mlp(self) -> None:
+        from models.encoders.perspective_position_encoder import PerspectivePositionEncoder
+        from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
+
+        processor = QueryUVAttnProcessor2_0(
+            query_dim=16,
+            query_uv_enabled=True,
+        )
+
+        self.assertIsInstance(processor.query_uv_encoder, PerspectivePositionEncoder)
+        self.assertEqual(len(processor.query_uv_encoder.mlp), 5)
+        self.assertIsInstance(processor.query_uv_encoder.mlp[0], nn.Linear)
+        self.assertIsInstance(processor.query_uv_encoder.mlp[1], nn.LayerNorm)
+        self.assertIsInstance(processor.query_uv_encoder.mlp[2], nn.GELU)
+        self.assertIsInstance(processor.query_uv_encoder.mlp[3], nn.Linear)
+        self.assertIsInstance(processor.query_uv_encoder.mlp[4], nn.LayerNorm)
+
     def test_query_uv_sliced_attn_processor_preserves_query_base_hw(self) -> None:
         torch.manual_seed(0)
         attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)

@@ -218,6 +218,15 @@ def _configure_logging(log_dir: Path) -> None:
     )
 
 
+def _resolve_query_uv_config(config: Dict[str, Any]) -> Tuple[bool, float]:
+    query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
+    query_uv_pe_enabled = bool(query_pe_config.get("enable", True))
+    query_uv_gate_init = query_pe_config.get("gate_init", 1.0)
+    if query_uv_gate_init is None:
+        query_uv_gate_init = 1.0
+    return query_uv_pe_enabled, float(query_uv_gate_init)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Stable Diffusion for satellite-to-frontview generation"
@@ -558,8 +567,7 @@ def main():
     satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
     perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
-    query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
-    query_uv_pe_enabled = bool(query_pe_config.get("enable", True))
+    query_uv_pe_enabled, query_uv_gate_init = _resolve_query_uv_config(config)
 
     _configure_logging(log_dir)
 
@@ -702,6 +710,7 @@ def main():
         cond_drop_prob=args.cond_drop_prob,
         perspective_pe_enabled=perspective_pe_enabled,
         query_uv_pe_enabled=query_uv_pe_enabled,
+        query_uv_gate_init=query_uv_gate_init,
         satellite_encoder_config=satellite_encoder_config,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":

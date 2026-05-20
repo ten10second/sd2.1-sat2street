@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.encoders.perspective_position_encoder import PerspectivePositionEncoder
+
 
 def build_normalized_image_uv_grid(
     height: int,
@@ -72,10 +74,7 @@ class _QueryUVAttnProcessorBase(nn.Module):
         self.query_uv_enabled = bool(query_uv_enabled)
 
         if self.query_uv_enabled:
-            self.query_uv_encoder = nn.Sequential(
-                nn.Linear(2, self.query_dim),
-                nn.LayerNorm(self.query_dim),
-            )
+            self.query_uv_encoder = PerspectivePositionEncoder(dim=self.query_dim)
             self.query_uv_gate = nn.Parameter(torch.tensor(float(gate_init)))
         else:
             self.query_uv_encoder = None
