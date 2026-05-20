@@ -20,7 +20,7 @@ from diffusers.models.attention_processor import AttnProcessor2_0
 
 from models.conditioning import SatelliteMemoryState
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
-from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
+from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0, QueryUVSlicedAttnProcessor
 
 
 logger = logging.getLogger(__name__)
@@ -55,26 +55,49 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
     def _build_attention_processors(self):
         if not self.query_uv_pe_enabled:
             return AttnProcessor2_0()
+        return self._build_query_uv_attention_processors()
 
+    def _build_query_uv_attention_processors(self):
         processors = {}
         for name in self.attn_processors.keys():
             attn_module = _resolve_module_path(self, name.removesuffix(".processor"))
             query_dim = int(attn_module.to_q.out_features)
-            if name.endswith(".attn2.processor"):
-                processors[name] = QueryUVAttnProcessor2_0(
-                    query_dim=query_dim,
-                    query_uv_enabled=True,
-                    gate_init=self.query_uv_gate_init,
-                )
-            else:
-                processors[name] = QueryUVAttnProcessor2_0(
-                    query_dim=query_dim,
-                    query_uv_enabled=False,
-                )
+            processors[name] = QueryUVAttnProcessor2_0(
+                query_dim=query_dim,
+                query_uv_enabled=name.endswith(".attn2.processor"),
+                gate_init=self.query_uv_gate_init,
+            )
         return processors
 
     def _install_query_uv_attention_processors(self) -> None:
         self.set_attn_processor(self._build_attention_processors())
+
+    def set_attention_slice(self, slice_size="auto"):
+        if not self.query_uv_pe_enabled:
+            return super().set_attention_slice(slice_size)
+
+        if slice_size is None:
+            self._install_query_uv_attention_processors()
+            return
+
+        super().set_attention_slice(slice_size)
+        sliced_processors = {}
+        for name, processor in self.attn_processors.items():
+            slice_value = getattr(processor, "slice_size", None)
+            if slice_value is None:
+                raise ValueError(
+                    f"Unable to preserve query UV attention slicing for {name}: "
+                    f"{type(processor).__name__} has no slice_size"
+                )
+            attn_module = _resolve_module_path(self, name.removesuffix(".processor"))
+            query_dim = int(attn_module.to_q.out_features)
+            sliced_processors[name] = QueryUVSlicedAttnProcessor(
+                query_dim=query_dim,
+                slice_size=int(slice_value),
+                query_uv_enabled=name.endswith(".attn2.processor"),
+                gate_init=self.query_uv_gate_init,
+            )
+        self.set_attn_processor(sliced_processors)
 
     @staticmethod
     def _normalize_query_base_hw(cross_attention_kwargs):

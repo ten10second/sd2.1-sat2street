@@ -13,9 +13,13 @@ from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
 from models.conditioning import SatelliteMemoryState
 from models.encoders.perspective_position_encoder import compute_sat_patch_perspective_uv
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
-from models.sd_model import SatelliteConditionedSDModel
+from models.sd_model import SatelliteConditionedSDModel, SatelliteConditionedUNet
 from models.sd_trainer import SDTrainer
-from models.unet.query_uv_attn_processor import build_normalized_image_uv_grid, infer_spatial_hw
+from models.unet.query_uv_attn_processor import (
+    QueryUVSlicedAttnProcessor,
+    build_normalized_image_uv_grid,
+    infer_spatial_hw,
+)
 
 
 def _identity_geometry(batch_size: int = 1):
@@ -320,6 +324,62 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         )
 
         self.assertEqual(output.shape, hidden_states.shape)
+
+    def test_query_uv_sliced_attn_processor_preserves_query_base_hw(self) -> None:
+        torch.manual_seed(0)
+        attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)
+        attn.set_processor(
+            QueryUVSlicedAttnProcessor(
+                query_dim=int(attn.to_q.out_features),
+                slice_size=1,
+                query_uv_enabled=True,
+            )
+        )
+        hidden_states = torch.randn(1, 4, 8)
+        encoder_hidden_states = torch.randn(1, 3, 8)
+
+        output = attn(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            query_base_hw=(2, 2),
+        )
+
+        self.assertEqual(output.shape, hidden_states.shape)
+
+    def test_unet_attention_slicing_keeps_query_uv_processor(self) -> None:
+        torch.manual_seed(0)
+        model = SatelliteConditionedUNet(
+            sample_size=8,
+            in_channels=4,
+            out_channels=4,
+            center_input_sample=False,
+            flip_sin_to_cos=True,
+            freq_shift=0,
+            down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(16, 32),
+            layers_per_block=1,
+            cross_attention_dim=16,
+            attention_head_dim=8,
+            norm_num_groups=8,
+            query_uv_pe_enabled=True,
+        )
+
+        model.set_attention_slice("auto")
+        self.assertTrue(
+            any(isinstance(processor, QueryUVSlicedAttnProcessor) for processor in model.attn_processors.values())
+        )
+
+        latents = torch.randn(1, 4, 8, 8)
+        encoder_hidden_states = torch.randn(1, 4, 16)
+        output = model(
+            latents,
+            torch.tensor([0], dtype=torch.long),
+            encoder_hidden_states=encoder_hidden_states,
+            cross_attention_kwargs={"query_base_hw": (8, 8)},
+        ).sample
+
+        self.assertEqual(output.shape, latents.shape)
 
     def test_model_forward_stores_perspective_state_and_uses_only_sat_tokens(self) -> None:
         torch.manual_seed(0)

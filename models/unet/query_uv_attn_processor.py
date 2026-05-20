@@ -59,14 +59,7 @@ def infer_spatial_hw(sequence_length: int, base_hw: Tuple[int, int]) -> Tuple[in
     return int(best[1]), int(best[2])
 
 
-class QueryUVAttnProcessor2_0(nn.Module):
-    """
-    Diffusers AttnProcessor2_0-compatible processor with optional query UV PE.
-
-    The UV PE is applied only to processors configured with ``query_uv_enabled=True``.
-    It is added to the projected query vector, before head reshaping and q-normalization.
-    """
-
+class _QueryUVAttnProcessorBase(nn.Module):
     def __init__(
         self,
         query_dim: int,
@@ -148,6 +141,14 @@ class QueryUVAttnProcessor2_0(nn.Module):
         )
         return uv.expand(batch_size, -1, -1)
 
+class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
+    """
+    Diffusers AttnProcessor2_0-compatible processor with optional query UV PE.
+
+    The UV PE is applied only to processors configured with ``query_uv_enabled=True``.
+    It is added to the projected query vector, before head reshaping and q-normalization.
+    """
+
     def forward(
         self,
         attn,
@@ -228,6 +229,126 @@ class QueryUVAttnProcessor2_0(nn.Module):
         )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(hidden_states.shape[0], -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(hidden_states.shape[0], channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
+class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
+    """Sliced attention processor that preserves query UV positional encoding."""
+
+    def __init__(
+        self,
+        query_dim: int,
+        *,
+        slice_size: int,
+        query_uv_enabled: bool,
+        gate_init: float = 0.0,
+    ) -> None:
+        super().__init__(
+            query_dim=query_dim,
+            query_uv_enabled=query_uv_enabled,
+            gate_init=gate_init,
+        )
+        self.slice_size = int(slice_size)
+
+    def forward(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        *args,
+        query_base_hw: Optional[Tuple[int, int]] = None,
+        query_uv: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del args, kwargs
+
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        elif input_ndim == 3:
+            batch_size = hidden_states.shape[0]
+            channel = None
+        else:
+            raise ValueError(f"hidden_states must be rank 3 or 4, got {input_ndim}")
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+        if self.query_uv_enabled and encoder_hidden_states is not None:
+            uv = self._resolve_query_uv(
+                hidden_states,
+                batch_size=hidden_states.shape[0],
+                query_base_hw=query_base_hw,
+                query_uv=query_uv,
+            ).to(dtype=query.dtype)
+            query_pe = self.query_uv_encoder(uv)
+            query = query + self.query_uv_gate.to(dtype=query.dtype) * query_pe
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        batch_size_attention, query_tokens, dim = query.shape
+        hidden_states = torch.zeros(
+            (batch_size_attention, query_tokens, dim),
+            device=query.device,
+            dtype=query.dtype,
+        )
+
+        for i in range((batch_size_attention - 1) // self.slice_size + 1):
+            start_idx = i * self.slice_size
+            end_idx = (i + 1) * self.slice_size
+
+            query_slice = query[start_idx:end_idx]
+            key_slice = key[start_idx:end_idx]
+            attn_mask_slice = attention_mask[start_idx:end_idx] if attention_mask is not None else None
+
+            attn_slice = attn.get_attention_scores(query_slice, key_slice, attn_mask_slice)
+            attn_slice = torch.bmm(attn_slice, value[start_idx:end_idx])
+
+            hidden_states[start_idx:end_idx] = attn_slice
+
+        hidden_states = attn.batch_to_head_dim(hidden_states)
         hidden_states = hidden_states.to(query.dtype)
 
         hidden_states = attn.to_out[0](hidden_states)
