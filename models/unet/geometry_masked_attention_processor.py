@@ -18,71 +18,6 @@ except ImportError:  # pragma: no cover - compatibility with older diffusers lay
 
 
 GeometryContextProvider = Callable[[], Optional[dict[str, Any]]]
-BEV_ROPE_NUM_FREQS = 8
-
-
-def _rope_angle_dtype(dtype: torch.dtype) -> torch.dtype:
-    if dtype in {torch.float16, torch.bfloat16}:
-        return torch.float32
-    return dtype
-
-
-def _apply_1d_rope_segment(
-    tensor: torch.Tensor,
-    coord: torch.Tensor,
-    inv_freq: torch.Tensor,
-) -> torch.Tensor:
-    if tensor.shape[-1] == 0:
-        return tensor
-
-    angle_dtype = _rope_angle_dtype(tensor.dtype)
-    coord = coord.to(device=tensor.device, dtype=angle_dtype)
-    inv_freq = inv_freq.to(device=tensor.device, dtype=angle_dtype)
-    angles = coord.unsqueeze(-1) * inv_freq.view(1, 1, -1)
-    cos = angles.cos().to(dtype=tensor.dtype).unsqueeze(1)
-    sin = angles.sin().to(dtype=tensor.dtype).unsqueeze(1)
-
-    even = tensor[..., 0::2]
-    odd = tensor[..., 1::2]
-    out = torch.empty_like(tensor)
-    out[..., 0::2] = even * cos - odd * sin
-    out[..., 1::2] = even * sin + odd * cos
-    return out
-
-
-def apply_2d_rope(
-    tensor: torch.Tensor,
-    xy: torch.Tensor,
-    *,
-    num_freqs: int = BEV_ROPE_NUM_FREQS,
-) -> torch.Tensor:
-    """Apply xy-separable rotary embedding to Q/K tensors shaped [B,H,N,D]."""
-    if tensor.ndim != 4:
-        raise ValueError(f"Expected tensor [B,H,N,D], got {tuple(tensor.shape)}")
-    if xy.ndim != 3 or xy.shape[-1] != 2:
-        raise ValueError(f"Expected xy [B,N,2], got {tuple(xy.shape)}")
-    if xy.shape[0] != tensor.shape[0] or xy.shape[1] != tensor.shape[2]:
-        raise ValueError(
-            f"xy shape {tuple(xy.shape)} does not match tensor batch/tokens {tuple(tensor.shape[:3])}"
-        )
-
-    freqs = min(int(num_freqs), tensor.shape[-1] // 4)
-    if freqs <= 0:
-        return tensor
-
-    segment_dim = 2 * freqs
-    rot_dim = 2 * segment_dim
-    angle_dtype = _rope_angle_dtype(tensor.dtype)
-    index = torch.arange(freqs, device=tensor.device, dtype=angle_dtype)
-    inv_freq = (2.0 * math.pi) * torch.pow(torch.tensor(2.0, device=tensor.device, dtype=angle_dtype), index)
-
-    x_part = tensor[..., :segment_dim]
-    y_part = tensor[..., segment_dim:rot_dim]
-    tail = tensor[..., rot_dim:]
-
-    x_rot = _apply_1d_rope_segment(x_part, xy[..., 0], inv_freq)
-    y_rot = _apply_1d_rope_segment(y_part, xy[..., 1], inv_freq)
-    return torch.cat((x_rot, y_rot, tail), dim=-1)
 
 
 def build_topk_mask(
@@ -92,7 +27,6 @@ def build_topk_mask(
     topk: int,
     query_mask: Optional[torch.Tensor] = None,
     key_mask: Optional[torch.Tensor] = None,
-    condition_mask: Optional[torch.Tensor] = None,
     mask_invalid_queries: bool = True,
     dtype: Optional[torch.dtype] = None,
     min_value: float = -10000.0,
@@ -124,11 +58,6 @@ def build_topk_mask(
         key_mask = key_mask.to(device=front_xy.device, dtype=torch.bool)
         if key_mask.shape == sat_xy.shape[:2]:
             keep = keep & key_mask.unsqueeze(1)
-
-    if condition_mask is not None:
-        condition_mask = condition_mask.to(device=front_xy.device, dtype=torch.bool).view(-1)
-        if condition_mask.shape[0] == keep.shape[0]:
-            keep = keep | (~condition_mask).view(-1, 1, 1)
 
     mask = torch.zeros(keep.shape, device=front_xy.device, dtype=dtype)
     return mask.masked_fill(~keep, min_value)
@@ -417,11 +346,6 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         topk = min(self.topk, int(key_length))
-        condition_mask = context.get("condition_mask")
-        if torch.is_tensor(condition_mask):
-            condition_mask = condition_mask.to(device=device, dtype=torch.bool).view(-1)
-        else:
-            condition_mask = None
 
         if not self.enable_geometry_bias:
             mask = build_topk_mask(
@@ -430,7 +354,6 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
                 topk=topk,
                 query_mask=query_mask,
                 key_mask=key_mask,
-                condition_mask=condition_mask,
                 mask_invalid_queries=self.mask_invalid_queries,
                 dtype=dtype,
             )
@@ -451,9 +374,6 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
 
         if key_mask is not None and key_mask.shape == sat_xy.shape[:2]:
             keep = keep & key_mask.to(device=device, dtype=torch.bool).unsqueeze(1)
-
-        if condition_mask is not None and condition_mask.shape[0] == keep.shape[0]:
-            keep = keep | (~condition_mask).view(-1, 1, 1)
 
         bias = self._build_geometry_attention_bias(
             front_xy=front_xy,

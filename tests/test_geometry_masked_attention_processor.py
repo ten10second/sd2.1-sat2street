@@ -5,7 +5,6 @@ import torch.nn as nn
 
 from models.unet.geometry_masked_attention_processor import (
     GeometryMaskedAttnProcessor2_0,
-    apply_2d_rope,
     build_topk_mask,
 )
 
@@ -32,27 +31,6 @@ class _DummyAttention(nn.Module):
 
 
 class GeometryMaskedAttentionProcessorTest(unittest.TestCase):
-    def test_apply_2d_rope_changes_rotated_channels(self) -> None:
-        tensor = torch.zeros((1, 2, 2, 16), dtype=torch.float32)
-        tensor[..., 0] = 1.0
-        tensor[..., 2] = 1.0
-        xy = torch.tensor([[[0.0, 0.0], [1.0, -1.0]]], dtype=torch.float32)
-
-        rotated = apply_2d_rope(tensor, xy, num_freqs=2)
-
-        self.assertFalse(torch.allclose(rotated[:, :, 0], rotated[:, :, 1]))
-        self.assertTrue(torch.allclose(rotated[..., 8:], tensor[..., 8:]))
-
-    def test_apply_2d_rope_uses_visual_octave_frequencies(self) -> None:
-        tensor = torch.zeros((1, 1, 1, 16), dtype=torch.float32)
-        tensor[..., 0] = 1.0
-        xy = torch.tensor([[[0.25, 0.0]]], dtype=torch.float32)
-
-        rotated = apply_2d_rope(tensor, xy, num_freqs=2)
-
-        self.assertAlmostEqual(float(rotated[0, 0, 0, 0]), 0.0, places=5)
-        self.assertAlmostEqual(float(rotated[0, 0, 0, 1]), 1.0, places=5)
-
     def test_topk_mask_excludes_invalid_satellite_keys(self) -> None:
         front_xy = torch.tensor([[[0.0, 0.0]]], dtype=torch.float32)
         sat_xy = torch.tensor([[[0.0, 0.0], [0.9, 0.0]]], dtype=torch.float32)
@@ -63,7 +41,7 @@ class GeometryMaskedAttentionProcessorTest(unittest.TestCase):
         self.assertLess(float(mask[0, 0, 0]), -9999.0)
         self.assertEqual(float(mask[0, 0, 1]), 0.0)
 
-    def test_geometry_context_rotates_q_and_k_before_sdpa(self) -> None:
+    def test_geometry_bias_changes_cross_attention_output(self) -> None:
         torch.manual_seed(0)
         attn = _DummyAttention(hidden_dim=32, heads=2)
         processor = GeometryMaskedAttnProcessor2_0(

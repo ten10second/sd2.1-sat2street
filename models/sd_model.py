@@ -134,17 +134,9 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             return satellite_state
 
         token_mask = self._token_condition_mask(condition_mask, satellite_state.tokens)
-        xy_mask = self._token_condition_mask(condition_mask, satellite_state.xy)
-        bev_coords = satellite_state.bev_coords
-        if bev_coords is not None:
-            bev_mask = self._token_condition_mask(condition_mask, bev_coords)
-            bev_coords = bev_coords * bev_mask
-
-        return satellite_state.replace(
-            tokens=satellite_state.tokens * token_mask,
-            xy=satellite_state.xy * xy_mask,
-            bev_coords=bev_coords,
-        )
+        # Only tokens are cleared for CFG; xy and bev_coords stay intact
+        # so geometric bias remains valid on the unconditioned branch.
+        return satellite_state.replace(tokens=satellite_state.tokens * token_mask)
 
     def _build_conditioning_state(
         self,

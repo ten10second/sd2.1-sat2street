@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw, ImageOps
 from models.conditioning import SatelliteMemoryState
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import SatelliteConditionedUNet
+from models.unet.geometry_masked_attention_processor import GeometryMaskedAttnProcessor2_0
 
 
 logger = logging.getLogger(__name__)
@@ -298,14 +299,10 @@ class SatelliteConditionedSDModel(nn.Module):
         sat_state: SatelliteMemoryState,
         condition_mask: torch.Tensor,
     ) -> SatelliteMemoryState:
+        # Only tokens are cleared for CFG; xy and bev_coords stay intact
+        # so geometric bias remains valid on the unconditioned branch.
         return sat_state.replace(
             tokens=sat_state.tokens * self._expand_condition_mask(condition_mask, sat_state.tokens),
-            xy=sat_state.xy * self._expand_condition_mask(condition_mask, sat_state.xy),
-            bev_coords=(
-                sat_state.bev_coords * self._expand_condition_mask(condition_mask, sat_state.bev_coords)
-                if sat_state.bev_coords is not None
-                else None
-            ),
         )
 
     @staticmethod
@@ -1158,6 +1155,35 @@ class SDTrainer:
                     global_step=step,
                 )
 
+    def _geometry_bias_monitor_metrics(self) -> Dict[str, float]:
+        unet = getattr(self.unwrapped_model, "unet", None)
+        if unet is None:
+            return {}
+
+        lambda_dists: List[float] = []
+        lambda_dirs: List[float] = []
+        for module in unet.modules():
+            processor = getattr(module, "processor", None)
+            if not isinstance(processor, GeometryMaskedAttnProcessor2_0):
+                continue
+            lambda_dists.append(float(processor.lambda_dist.detach().float().mean().item()))
+            lambda_dirs.append(float(processor.lambda_dir.detach().float().mean().item()))
+
+        if not lambda_dists:
+            return {}
+
+        bias_abs_bound = [8.0 * max(0.0, value) for value in lambda_dists]
+        return {
+            "geometry/lambda_dist_mean": float(np.mean(lambda_dists)),
+            "geometry/lambda_dist_min": float(np.min(lambda_dists)),
+            "geometry/lambda_dist_max": float(np.max(lambda_dists)),
+            "geometry/lambda_dir_mean": float(np.mean(lambda_dirs)),
+            "geometry/lambda_dir_min": float(np.min(lambda_dirs)),
+            "geometry/lambda_dir_max": float(np.max(lambda_dirs)),
+            "geometry/theoretical_bias_abs_max_mean": float(np.mean(bias_abs_bound)),
+            "geometry/theoretical_bias_abs_max_max": float(np.max(bias_abs_bound)),
+        }
+
     def _close_loggers(self) -> None:
         if self.tb_writer is not None:
             self.tb_writer.close()
@@ -1383,6 +1409,7 @@ class SDTrainer:
                 geom_ratio = outputs.get('refinement_logits_geom_to_sem_ratio_mean')
                 sat_update_norm = outputs.get('refinement_sat_update_norm_mean')
                 adapter_residual_norm = outputs.get('refinement_adapter_residual_norm_mean')
+                geometry_monitor_metrics = self._geometry_bias_monitor_metrics()
                 if all(torch.is_tensor(v) for v in (geom_std, sem_std, geom_ratio)):
                     site_ratio_parts = []
                     for site, site_stats in outputs.get('refinement_stats_by_site', {}).items():
@@ -1436,6 +1463,7 @@ class SDTrainer:
                     log_payload['refinement/sat_update_norm_mean'] = sat_update_norm.item()
                 if torch.is_tensor(adapter_residual_norm):
                     log_payload['refinement/adapter_residual_norm_mean'] = adapter_residual_norm.item()
+                log_payload.update(geometry_monitor_metrics)
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
 
         local_mean = total_raw_loss / max(1, finite_loss_batches)
