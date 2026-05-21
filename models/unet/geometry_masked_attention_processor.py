@@ -645,8 +645,6 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
                 )
                 if geometry is not None:
                     front_xy, sat_xy, query_mask, key_mask, _ = geometry
-                    query = apply_2d_rope(query, front_xy, num_freqs=BEV_ROPE_NUM_FREQS)
-                    key = apply_2d_rope(key, sat_xy, num_freqs=BEV_ROPE_NUM_FREQS)
                     geometry_mask = self._build_geometry_attention_mask_from_xy(
                         context=context,
                         front_xy=front_xy,

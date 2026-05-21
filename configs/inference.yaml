@@ -40,11 +40,11 @@ model:
     mask_invalid_queries: true
     fallback_to_unmasked: true
     use_metric_coords: false
-    enable_geometry_bias: false
+    enable_geometry_bias: true
     geometry_bias_type: 'dist_dir'
-    lambda_dist: 2.0
+    lambda_dist: 10.0
     lambda_dir: 0.5
-    learnable_geometry_bias: false
+    learnable_geometry_bias: true
 
 # 推理配置
 inference:

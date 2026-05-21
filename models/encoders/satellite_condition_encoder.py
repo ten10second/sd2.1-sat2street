@@ -63,15 +63,6 @@ class SatelliteConditionEncoder(nn.Module):
             padding=0,
         )
 
-        # Coordinate encoder - for BEV space coordinates (meters)
-        self.coord_encoder = nn.Sequential(
-            nn.Linear(2, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-        )
-
         # Transformer layers with relative position attention
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
@@ -178,18 +169,16 @@ class SatelliteConditionEncoder(nn.Module):
         bev_coords = self._compute_patch_bev_coords(B, H, W)
         bev_coords = bev_coords.to(sat_images.device)  # (B, N, 2)
 
-        # Step 3: Encode BEV coordinates
-        coord_emb = self.coord_encoder(bev_coords)  # (B, N, D)
+        # Step 3: Raw patch features — position injected only through
+        # geometric bias in cross-attention and RelativePositionAttention bias.
+        x = patches_flat  # (B, N, D)
 
-        # Step 4: Combine patch features and coordinate encoding
-        x = patches_flat + coord_emb  # (B, N, D)
-
-        # Step 5: Pass through transformer layers
+        # Step 4: Pass through transformer layers
         # The self-attention uses BEV coordinates to compute relative positions
         for layer in self.layers:
             x = layer(x, bev_coords)  # (B, N, D)
 
-        # Step 6: Apply final layer norm
+        # Step 5: Apply final layer norm
         x = self.norm(x)
 
         sat_xy = self._compute_patch_normalized_coords(B, H, W).to(sat_images.device)
