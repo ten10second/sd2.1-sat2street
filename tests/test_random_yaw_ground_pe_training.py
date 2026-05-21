@@ -11,8 +11,6 @@ from torch.utils.data import DataLoader, Dataset
 from data.kitti360d_dataset import Kitti360dDataset, SampleIndex, _apply_virtual_pose_delta
 from models.conditioning import SatelliteMemoryState
 from models.sd_trainer import SDTrainer, SatelliteConditionedSDModel
-from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
-from models.unet.street_to_satellite_attention import StreetToSatelliteAttention
 
 
 class _DummyLatentDistribution:
@@ -52,7 +50,7 @@ class _DummyScheduler:
 class _DummyUNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.supports_cross_view_refinement = True
+        self.supports_satellite_conditioning = True
         self.config = SimpleNamespace(in_channels=3, sample_size=8)
         self.call_sat_token_means = []
         self.last_satellite_state = None
@@ -81,16 +79,7 @@ class _DummyUNet(nn.Module):
             xy=sat_xy,
             bev_coords=sat_bev_coords,
         )
-        signal_scalar = view_signal.mean()
-        self.last_refinement_stats = {
-            "mid": {
-                "logits_sem_std": signal_scalar + 1.0,
-                "logits_geom_std": signal_scalar + 2.0,
-                "logits_geom_to_sem_ratio": signal_scalar + 3.0,
-                "sat_update_norm": signal_scalar + 4.0,
-                "adapter_residual_norm": signal_scalar + 5.0,
-            }
-        }
+        self.last_refinement_stats = {}
         return SimpleNamespace(sample=noisy_latents)
 
 
@@ -294,10 +283,8 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertAlmostEqual(model.unet.call_sat_token_means[0], 0.0, places=5)
         self.assertTrue(torch.is_tensor(outputs["loss"]))
         self.assertAlmostEqual(float(outputs["sat_state"].tokens.mean().item()), 1.0, places=5)
-        self.assertIn("refinement_logits_geom_to_sem_ratio_mean", outputs)
-        self.assertIn("refinement_sat_update_norm_mean", outputs)
-        self.assertAlmostEqual(float(outputs["refinement_sat_update_norm_mean"].item()), 5.0, places=5)
-        self.assertIn("refinement_adapter_residual_norm_mean", outputs)
+        self.assertEqual(outputs["refinement_stats"], {})
+        self.assertEqual(outputs["refinement_stats_by_site"], {})
 
     def test_rank5_view_group_forward_is_rejected(self) -> None:
         model = _TestSatelliteConditionedSDModel()
@@ -359,152 +346,6 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             trainer.train(resume_from=checkpoint_path)
 
             self.assertEqual(observed_epochs, [3, 4])
-
-    def test_street_to_sat_uses_ground_pe_only(self) -> None:
-        torch.manual_seed(0)
-        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
-        front_bev_xy = torch.tensor(
-            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
-            dtype=torch.float32,
-        )
-        sat_tokens = torch.randn((1, 3, 6), dtype=torch.float32)
-        sat_xy = torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32)
-
-        attention = StreetToSatelliteAttention(
-            sat_in_dim=6,
-            front_in_dim=4,
-            num_heads=2,
-            head_dim=8,
-            geom_head_dim=2,
-        )
-        attention.eval()
-        with torch.no_grad():
-            output, _, stats = attention(
-                front_feat,
-                front_bev_xy,
-                sat_tokens,
-                sat_xy,
-                front_ground_valid_mask=None,
-            )
-        self.assertEqual(output.shape, sat_tokens.shape)
-        self.assertIn("logits_geom_to_sem_ratio", stats)
-
-    def test_street_to_sat_out_proj_is_zero_initialized(self) -> None:
-        torch.manual_seed(0)
-        attention = StreetToSatelliteAttention(
-            sat_in_dim=6,
-            front_in_dim=4,
-            num_heads=2,
-            head_dim=8,
-            geom_head_dim=2,
-        )
-
-        self.assertTrue(torch.allclose(attention.out_proj.weight, torch.zeros_like(attention.out_proj.weight)))
-        self.assertTrue(torch.allclose(attention.out_proj.bias, torch.zeros_like(attention.out_proj.bias)))
-
-        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
-        front_bev_xy = torch.tensor(
-            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
-            dtype=torch.float32,
-        )
-        sat_tokens = torch.randn((1, 3, 6), dtype=torch.float32)
-        sat_xy = torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32)
-
-        attention.eval()
-        with torch.no_grad():
-            _, _, stats = attention(
-                front_feat,
-                front_bev_xy,
-                sat_tokens,
-                sat_xy,
-                front_ground_valid_mask=None,
-            )
-
-        self.assertTrue(torch.allclose(stats["sat_update_norm"], torch.tensor(0.0)))
-
-    def test_cross_view_refinement_stacks_sat_update_layers(self) -> None:
-        torch.manual_seed(0)
-        block = CrossViewRefinementBlock(
-            front_dim=4,
-            sat_in_dim=6,
-            num_heads=2,
-            head_dim=8,
-            geom_head_dim=2,
-            sat_update_layers=2,
-        )
-        block.eval()
-
-        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
-        front_bev_xy = torch.tensor(
-            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
-            dtype=torch.float32,
-        )
-        sat_state = SatelliteMemoryState(
-            tokens=torch.randn((1, 3, 6), dtype=torch.float32),
-            xy=torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32),
-            bev_coords=None,
-        )
-
-        with torch.no_grad():
-            output = block(front_feat, sat_state, front_bev_xy)
-
-        self.assertEqual(len(block.street_to_sat_layers), 2)
-        self.assertEqual(len(block.sat_self_refine_layers), 2)
-        stats = output["stats"]
-        self.assertIn("sat_update_l0_sat_update_norm", stats)
-        self.assertIn("sat_update_l1_sat_update_norm", stats)
-        self.assertIn("sat_update_norm", stats)
-        self.assertIn("adapter_residual_norm", stats)
-        self.assertTrue(torch.allclose(stats["sat_update_norm"], stats["sat_update_l1_sat_update_norm"]))
-        self.assertEqual(output["satellite_state"].tokens.shape, sat_state.tokens.shape)
-        self.assertIsNotNone(output["adapter_residual"])
-        self.assertEqual(output["adapter_residual"].shape, front_feat.shape)
-        self.assertTrue(torch.allclose(output["adapter_residual"], torch.zeros_like(front_feat)))
-
-    def test_cross_view_refinement_adapter_residual_can_affect_front_feature(self) -> None:
-        torch.manual_seed(0)
-        block = CrossViewRefinementBlock(
-            front_dim=4,
-            sat_in_dim=6,
-            num_heads=2,
-            head_dim=8,
-            geom_head_dim=2,
-            sat_update_layers=1,
-            adapter_residual=True,
-        )
-        block.eval()
-        with torch.no_grad():
-            block.adapter_out.weight.fill_(0.05)
-            block.adapter_out.bias.fill_(0.01)
-
-        front_feat = torch.randn((1, 4, 2, 2), dtype=torch.float32)
-        front_bev_xy = torch.tensor(
-            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
-            dtype=torch.float32,
-        )
-        sat_state = SatelliteMemoryState(
-            tokens=torch.randn((1, 3, 6), dtype=torch.float32),
-            xy=torch.tensor([[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]], dtype=torch.float32),
-            bev_coords=None,
-        )
-
-        with torch.no_grad():
-            output = block(front_feat, sat_state, front_bev_xy)
-
-        residual = output["adapter_residual"]
-        self.assertIsNotNone(residual)
-        self.assertEqual(residual.shape, front_feat.shape)
-        self.assertGreater(float(output["stats"]["adapter_residual_norm"].item()), 0.0)
-
-    def test_cross_view_refinement_rejects_empty_sat_update_stack(self) -> None:
-        with self.assertRaisesRegex(ValueError, "sat_update_layers must be positive"):
-            CrossViewRefinementBlock(
-                front_dim=4,
-                sat_in_dim=6,
-                num_heads=2,
-                head_dim=8,
-                sat_update_layers=0,
-            )
 
     def test_nonfinite_loss_skips_optimizer_update(self) -> None:
         model = _NonFiniteLossModel()

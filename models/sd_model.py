@@ -1,9 +1,8 @@
 """
-Cross-view-refined UNet for satellite-to-frontview generation.
+Satellite-conditioned UNet for satellite-to-frontview generation.
 """
 
 import torch
-import torch.nn.functional as F
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from models.conditioning import CrossViewConditioningState, SatelliteMemoryState
@@ -13,53 +12,22 @@ except ImportError:
     from diffusers.models.unet_2d_condition import UNet2DConditionModel, UNet2DConditionOutput
 from diffusers.utils import USE_PEFT_BACKEND, deprecate, scale_lora_layers, unscale_lora_layers
 
-from models.unet.cross_view_refinement_block import CrossViewRefinementBlock
 from models.unet.geometry_masked_attention_processor import apply_geometry_masked_attn_processors
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
     """
-    UNet2DConditionModel with explicit cross-view refinement support.
-
-    Args:
-        enable_cross_view_refinement: Whether to run cross-view refinement blocks
-        refinement_injection_sites: Which U-Net layers run refinement
-        refinement_block_config: Configuration for refinement blocks
-        **kwargs: Additional arguments for UNet2DConditionModel
+    UNet2DConditionModel that routes satellite tokens through native cross-attention.
     """
 
     def __init__(
         self,
-        enable_cross_view_refinement: bool = True,
-        refinement_injection_sites: Optional[List[str]] = None,
-        refinement_block_config: Optional[Dict[str, Any]] = None,
         native_cross_attention_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        self.supports_cross_view_refinement = True
-        self.enable_cross_view_refinement = enable_cross_view_refinement
-        self.refinement_injection_sites = list(refinement_injection_sites or ["mid", "up0", "up1"])
-        self._refinement_site_set = set(self.refinement_injection_sites)
-        self.refinement_block_config = {
-            "num_heads": 8,
-            "head_dim": 64,
-            "geo_ratio": 0.5,
-            "rope_base": 10000.0,
-            "lambda_geo": 1.0,
-            "lambda_geom": 1.0,
-            "geom_hidden_dim": 128,
-            "geom_head_dim": 16,
-            "sat_update_layers": 1,
-            "use_geom_bias": True,
-            "adapter_residual": True,
-            "adapter_residual_scale": 1.0,
-        }
-        if refinement_block_config is not None:
-            self.refinement_block_config.update(refinement_block_config)
-
-        self.refinement_blocks = torch.nn.ModuleDict()
+        self.supports_satellite_conditioning = True
         self.last_attn_maps: Dict[str, torch.Tensor] = {}
         self.last_refinement_stats: Dict[str, Dict[str, torch.Tensor]] = {}
         self.last_satellite_state: Optional[SatelliteMemoryState] = None
@@ -132,123 +100,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
     def set_attention_slice(self, slice_size: Union[str, int, List[int], None]) -> None:
         super().set_attention_slice(slice_size)
         self._apply_native_geometry_mask_processors()
-
-    def _get_or_create_refinement_block(
-        self,
-        site: str,
-        front_feat: torch.Tensor,
-        sat_tokens: torch.Tensor,
-    ) -> CrossViewRefinementBlock:
-        if site in self.refinement_blocks:
-            block = self.refinement_blocks[site]
-            block_param = next(block.parameters(), None)
-            if block_param is not None and block_param.device != front_feat.device:
-                block = block.to(device=front_feat.device)
-                self.refinement_blocks[site] = block
-            return block
-
-        block = CrossViewRefinementBlock(
-            front_dim=front_feat.shape[1],
-            sat_in_dim=sat_tokens.shape[-1],
-            num_heads=self.refinement_block_config["num_heads"],
-            head_dim=self.refinement_block_config["head_dim"],
-            geo_ratio=self.refinement_block_config["geo_ratio"],
-            rope_base=self.refinement_block_config["rope_base"],
-            lambda_geo=self.refinement_block_config["lambda_geo"],
-            lambda_geom=self.refinement_block_config["lambda_geom"],
-            geom_hidden_dim=self.refinement_block_config["geom_hidden_dim"],
-            geom_head_dim=self.refinement_block_config["geom_head_dim"],
-            sat_update_layers=self.refinement_block_config["sat_update_layers"],
-            use_geom_bias=self.refinement_block_config["use_geom_bias"],
-            adapter_residual=self.refinement_block_config["adapter_residual"],
-            adapter_residual_scale=self.refinement_block_config["adapter_residual_scale"],
-        )
-        block = block.to(device=front_feat.device)
-        self.refinement_blocks[site] = block
-        return block
-
-    def _prepare_front_bev_xy(
-        self,
-        front_bev_xy: Any,
-        site: str,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        if front_bev_xy is None:
-            return None
-
-        if isinstance(front_bev_xy, dict):
-            site_xy = front_bev_xy.get(site)
-            if site_xy is None:
-                site_xy = front_bev_xy.get("default")
-            return self._prepare_front_bev_xy(site_xy, site, height, width, device, dtype)
-
-        if not torch.is_tensor(front_bev_xy):
-            return None
-
-        front_bev_xy = front_bev_xy.to(device=device, dtype=dtype)
-
-        if front_bev_xy.ndim == 3 and front_bev_xy.shape[-1] == 2:
-            if front_bev_xy.shape[1] == height * width:
-                return front_bev_xy
-            return None
-
-        if front_bev_xy.ndim == 4 and front_bev_xy.shape[1] == 2:
-            resized = F.interpolate(front_bev_xy, size=(height, width), mode="bilinear", align_corners=False)
-            return resized.permute(0, 2, 3, 1).reshape(front_bev_xy.shape[0], height * width, 2)
-
-        if front_bev_xy.ndim == 4 and front_bev_xy.shape[-1] == 2:
-            xy = front_bev_xy.permute(0, 3, 1, 2)
-            resized = F.interpolate(xy, size=(height, width), mode="bilinear", align_corners=False)
-            return resized.permute(0, 2, 3, 1).reshape(front_bev_xy.shape[0], height * width, 2)
-
-        return None
-
-    def _prepare_front_ground_valid_mask(
-        self,
-        front_ground_valid_mask: Any,
-        site: str,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        if front_ground_valid_mask is None:
-            return None
-
-        if isinstance(front_ground_valid_mask, dict):
-            site_mask = front_ground_valid_mask.get(site)
-            if site_mask is None:
-                site_mask = front_ground_valid_mask.get("default")
-            return self._prepare_front_ground_valid_mask(site_mask, site, height, width, device, dtype)
-
-        if not torch.is_tensor(front_ground_valid_mask):
-            return None
-
-        front_ground_valid_mask = front_ground_valid_mask.to(device=device, dtype=dtype)
-
-        if front_ground_valid_mask.ndim == 2:
-            if front_ground_valid_mask.shape == (front_ground_valid_mask.shape[0], height * width):
-                return front_ground_valid_mask
-            return None
-
-        if front_ground_valid_mask.ndim == 3 and front_ground_valid_mask.shape[-1] == 1:
-            if front_ground_valid_mask.shape[1] == height * width:
-                return front_ground_valid_mask.squeeze(-1)
-            return None
-
-        if front_ground_valid_mask.ndim == 4 and front_ground_valid_mask.shape[1] == 1:
-            resized = F.interpolate(front_ground_valid_mask, size=(height, width), mode="nearest")
-            return resized.reshape(front_ground_valid_mask.shape[0], height * width)
-
-        if front_ground_valid_mask.ndim == 4 and front_ground_valid_mask.shape[-1] == 1:
-            mask = front_ground_valid_mask.permute(0, 3, 1, 2)
-            resized = F.interpolate(mask, size=(height, width), mode="nearest")
-            return resized.reshape(front_ground_valid_mask.shape[0], height * width)
-
-        return None
 
     @staticmethod
     def _token_condition_mask(condition_mask: torch.Tensor, token_states: torch.Tensor) -> torch.Tensor:
@@ -373,87 +224,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 for value in encoder_hidden_states
             )
         return encoder_hidden_states
-
-    def _run_refinement(
-        self,
-        site: str,
-        front_feat: torch.Tensor,
-        conditioning_state: Optional[CrossViewConditioningState],
-    ) -> torch.Tensor:
-        if conditioning_state is None:
-            return front_feat
-        if not self.enable_cross_view_refinement or site not in self._refinement_site_set:
-            return front_feat
-        if conditioning_state.front_bev_xy is None:
-            return front_feat
-        if conditioning_state.condition_mask is not None and not bool(conditioning_state.condition_mask.any().item()):
-            return front_feat
-
-        front_bev_xy = self._prepare_front_bev_xy(
-            conditioning_state.front_bev_xy,
-            site,
-            front_feat.shape[2],
-            front_feat.shape[3],
-            front_feat.device,
-            front_feat.dtype,
-        )
-        if front_bev_xy is None:
-            return front_feat
-
-        front_ground_valid_mask = self._prepare_front_ground_valid_mask(
-            conditioning_state.front_ground_valid_mask,
-            site,
-            front_feat.shape[2],
-            front_feat.shape[3],
-            front_feat.device,
-            front_feat.dtype,
-        )
-        satellite_state = self._move_satellite_state(
-            conditioning_state.satellite,
-            device=front_feat.device,
-            dtype=front_feat.dtype,
-        )
-        block = self._get_or_create_refinement_block(site, front_feat, satellite_state.tokens)
-        block_output = block(
-            front_feat=front_feat,
-            satellite_state=satellite_state,
-            front_bev_xy=front_bev_xy,
-            front_ground_valid_mask=front_ground_valid_mask,
-            return_attn_map=conditioning_state.return_attn_map,
-        )
-
-        updated_satellite = block_output["satellite_state"]
-        if conditioning_state.condition_mask is not None:
-            updated_satellite = self._apply_satellite_condition_mask(
-                updated_satellite,
-                conditioning_state.condition_mask,
-            )
-
-        conditioning_state.satellite = updated_satellite
-        if conditioning_state.return_attn_map:
-            attn_map = block_output.get("attn_map")
-            if attn_map is not None:
-                conditioning_state.attn_maps[site] = attn_map
-
-        stats = block_output.get("stats")
-        if stats:
-            detached_stats = {}
-            for key, value in stats.items():
-                if torch.is_tensor(value):
-                    detached_stats[key] = value.detach()
-            if detached_stats:
-                conditioning_state.refinement_stats[site] = detached_stats
-
-        adapter_residual = block_output.get("adapter_residual")
-        if torch.is_tensor(adapter_residual):
-            if conditioning_state.condition_mask is not None:
-                residual_mask = conditioning_state.condition_mask.to(
-                    device=adapter_residual.device,
-                    dtype=adapter_residual.dtype,
-                ).view(-1, 1, 1, 1)
-                adapter_residual = adapter_residual * residual_mask
-            return front_feat + adapter_residual
-        return front_feat
 
     def forward(
         self,
@@ -618,7 +388,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 if is_adapter and len(down_intrablock_additional_residuals) > 0:
                     sample = sample + down_intrablock_additional_residuals.pop(0)
 
-            sample = self._run_refinement(f"down{index}", sample, conditioning_state)
             down_block_res_samples += res_samples
 
         if is_controlnet:
@@ -656,8 +425,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             ):
                 sample = sample + down_intrablock_additional_residuals.pop(0)
 
-        sample = self._run_refinement("mid", sample, conditioning_state)
-
         if is_controlnet:
             sample = sample + mid_block_additional_residual
 
@@ -692,8 +459,6 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                     res_hidden_states_tuple=res_samples,
                     upsample_size=upsample_size,
                 )
-
-            sample = self._run_refinement(f"up{index}", sample, conditioning_state)
 
         if self.conv_norm_out:
             sample = self.conv_norm_out(sample)

@@ -152,7 +152,7 @@ def _parse_args() -> argparse.Namespace:
         "--config",
         type=str,
         default=None,
-        help="Optional inference YAML. model.refinement_block is used for model construction.",
+        help="Optional inference YAML.",
     )
     parser.add_argument(
         "--mode",
@@ -238,11 +238,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--base_model", type=str, default=DEFAULT_SD21_BASE_REPO)
     parser.add_argument("--base_model_revision", type=str, default=None)
-    parser.add_argument(
-        "--disable_refinement",
-        action="store_true",
-        help="Instantiate the model without cross-view refinement blocks.",
-    )
     parser.add_argument("--hf_endpoint", type=str, default=DEFAULT_HF_ENDPOINT)
     parser.add_argument("--hf_home", type=str, default=str(DEFAULT_HF_HOME))
     parser.add_argument(
@@ -299,7 +294,6 @@ def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
 
 def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     if not config:
-        args.refinement_block_config = {"enable": not bool(args.disable_refinement)}
         args.native_cross_attention_config = {}
         return
 
@@ -332,10 +326,6 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.roll_deg = float(_prefer_config(args.roll_deg, 0.0, _config_get(config, ("data", "roll_deg"))))
     args.output_dir = str(_prefer_config(args.output_dir, "./inference_results", _config_get(config, ("output", "output_dir"))))
 
-    refinement_block_config = dict(_config_get(config, ("model", "refinement_block"), {}) or {})
-    if args.disable_refinement:
-        refinement_block_config["enable"] = False
-    args.refinement_block_config = refinement_block_config or {"enable": not bool(args.disable_refinement)}
     args.native_cross_attention_config = dict(_config_get(config, ("model", "native_cross_attention"), {}) or {})
 
 
@@ -810,20 +800,12 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     elif args.device.startswith("cuda") and args.mixed_precision == "bf16":
         model_torch_dtype = torch.bfloat16
 
-    refinement_block_config = dict(getattr(args, "refinement_block_config", {}) or {})
-    refinement_injection_sites = refinement_block_config.pop("injection_sites", None)
     native_cross_attention_config = dict(getattr(args, "native_cross_attention_config", {}) or {})
 
     logger.info("Loading model")
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        refinement_block_config=refinement_block_config,
-        refinement_injection_sites=(
-            tuple(refinement_injection_sites)
-            if refinement_injection_sites is not None
-            else None
-        ),
         native_cross_attention_config=native_cross_attention_config,
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,

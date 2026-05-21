@@ -140,11 +140,6 @@ def _parse_args() -> argparse.Namespace:
         help="Optional model revision/branch, e.g. fp16",
     )
     parser.add_argument(
-        "--disable_refinement",
-        action="store_true",
-        help="Instantiate the model without cross-view refinement blocks.",
-    )
-    parser.add_argument(
         "--output_dir", type=str, default="output/multiseed_visualizations",
         help="Directory to save outputs",
     )
@@ -379,7 +374,6 @@ def main() -> None:
     model = create_sd_model(
         base_model=args.base_model,
         freeze_base=True,
-        refinement_block_config={"enable": not bool(args.disable_refinement)},
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,

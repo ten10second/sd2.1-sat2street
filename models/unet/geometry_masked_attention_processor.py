@@ -18,6 +18,120 @@ except ImportError:  # pragma: no cover - compatibility with older diffusers lay
 
 
 GeometryContextProvider = Callable[[], Optional[dict[str, Any]]]
+BEV_ROPE_NUM_FREQS = 8
+
+
+def _rope_angle_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return dtype
+
+
+def _apply_1d_rope_segment(
+    tensor: torch.Tensor,
+    coord: torch.Tensor,
+    inv_freq: torch.Tensor,
+) -> torch.Tensor:
+    if tensor.shape[-1] == 0:
+        return tensor
+
+    angle_dtype = _rope_angle_dtype(tensor.dtype)
+    coord = coord.to(device=tensor.device, dtype=angle_dtype)
+    inv_freq = inv_freq.to(device=tensor.device, dtype=angle_dtype)
+    angles = coord.unsqueeze(-1) * inv_freq.view(1, 1, -1)
+    cos = angles.cos().to(dtype=tensor.dtype).unsqueeze(1)
+    sin = angles.sin().to(dtype=tensor.dtype).unsqueeze(1)
+
+    even = tensor[..., 0::2]
+    odd = tensor[..., 1::2]
+    out = torch.empty_like(tensor)
+    out[..., 0::2] = even * cos - odd * sin
+    out[..., 1::2] = even * sin + odd * cos
+    return out
+
+
+def apply_2d_rope(
+    tensor: torch.Tensor,
+    xy: torch.Tensor,
+    *,
+    num_freqs: int = BEV_ROPE_NUM_FREQS,
+) -> torch.Tensor:
+    """Apply xy-separable rotary embedding to Q/K tensors shaped [B,H,N,D]."""
+    if tensor.ndim != 4:
+        raise ValueError(f"Expected tensor [B,H,N,D], got {tuple(tensor.shape)}")
+    if xy.ndim != 3 or xy.shape[-1] != 2:
+        raise ValueError(f"Expected xy [B,N,2], got {tuple(xy.shape)}")
+    if xy.shape[0] != tensor.shape[0] or xy.shape[1] != tensor.shape[2]:
+        raise ValueError(
+            f"xy shape {tuple(xy.shape)} does not match tensor batch/tokens {tuple(tensor.shape[:3])}"
+        )
+
+    freqs = min(int(num_freqs), tensor.shape[-1] // 4)
+    if freqs <= 0:
+        return tensor
+
+    segment_dim = 2 * freqs
+    rot_dim = 2 * segment_dim
+    angle_dtype = _rope_angle_dtype(tensor.dtype)
+    index = torch.arange(freqs, device=tensor.device, dtype=angle_dtype)
+    inv_freq = (2.0 * math.pi) * torch.pow(torch.tensor(2.0, device=tensor.device, dtype=angle_dtype), index)
+
+    x_part = tensor[..., :segment_dim]
+    y_part = tensor[..., segment_dim:rot_dim]
+    tail = tensor[..., rot_dim:]
+
+    x_rot = _apply_1d_rope_segment(x_part, xy[..., 0], inv_freq)
+    y_rot = _apply_1d_rope_segment(y_part, xy[..., 1], inv_freq)
+    return torch.cat((x_rot, y_rot, tail), dim=-1)
+
+
+def build_topk_mask(
+    front_xy: torch.Tensor,
+    sat_xy: torch.Tensor,
+    *,
+    topk: int,
+    query_mask: Optional[torch.Tensor] = None,
+    key_mask: Optional[torch.Tensor] = None,
+    condition_mask: Optional[torch.Tensor] = None,
+    mask_invalid_queries: bool = True,
+    dtype: Optional[torch.dtype] = None,
+    min_value: float = -10000.0,
+) -> torch.Tensor:
+    """Build an additive SDPA mask that keeps only the top-k nearest satellite tokens."""
+    if front_xy.ndim != 3 or sat_xy.ndim != 3 or front_xy.shape[-1] != 2 or sat_xy.shape[-1] != 2:
+        raise ValueError("front_xy and sat_xy must be [B,N,2]")
+    if front_xy.shape[0] != sat_xy.shape[0]:
+        raise ValueError("front_xy and sat_xy batch size must match")
+
+    dtype = front_xy.dtype if dtype is None else dtype
+    key_length = int(sat_xy.shape[1])
+    topk = min(int(topk), key_length)
+
+    dist2 = (front_xy.unsqueeze(2) - sat_xy.unsqueeze(1)).pow(2).sum(dim=-1)
+    if key_mask is not None:
+        key_mask = key_mask.to(device=front_xy.device, dtype=torch.bool)
+        if key_mask.shape == sat_xy.shape[:2]:
+            dist2 = dist2.masked_fill(~key_mask.unsqueeze(1), torch.inf)
+
+    nearest = torch.topk(dist2, k=topk, dim=-1, largest=False).indices
+    keep = torch.zeros(dist2.shape, device=front_xy.device, dtype=torch.bool)
+    keep.scatter_(dim=-1, index=nearest, value=True)
+
+    if mask_invalid_queries and query_mask is not None:
+        keep = keep | (~query_mask.to(device=front_xy.device, dtype=torch.bool)).unsqueeze(-1)
+
+    if key_mask is not None:
+        key_mask = key_mask.to(device=front_xy.device, dtype=torch.bool)
+        if key_mask.shape == sat_xy.shape[:2]:
+            keep = keep & key_mask.unsqueeze(1)
+
+    if condition_mask is not None:
+        condition_mask = condition_mask.to(device=front_xy.device, dtype=torch.bool).view(-1)
+        if condition_mask.shape[0] == keep.shape[0]:
+            keep = keep | (~condition_mask).view(-1, 1, 1)
+
+    mask = torch.zeros(keep.shape, device=front_xy.device, dtype=dtype)
+    return mask.masked_fill(~keep, min_value)
 
 
 class GeometryMaskedAttnProcessor2_0(nn.Module):
@@ -87,6 +201,16 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
         return None
 
     @staticmethod
+    def _front_mask_to_bn(front_ground_valid_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if front_ground_valid_mask is None:
+            return None
+        if front_ground_valid_mask.ndim == 2:
+            return front_ground_valid_mask
+        if front_ground_valid_mask.ndim == 3 and front_ground_valid_mask.shape[-1] == 1:
+            return front_ground_valid_mask.squeeze(-1)
+        return None
+
+    @staticmethod
     def _infer_hw_from_tokens(
         token_count: int,
         source_height: int,
@@ -128,6 +252,19 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
         front_bev_xy = context.get("front_bev_xy")
         if not torch.is_tensor(front_bev_xy):
             return None, None, None
+        if front_bev_xy.ndim == 3 and front_bev_xy.shape[-1] == 2:
+            if front_bev_xy.shape[1] != query_length:
+                return None, None, None
+            front_xy = front_bev_xy.to(device=device, dtype=dtype)
+            query_mask = self._front_mask_to_bn(context.get("front_ground_valid_mask"))
+            if query_mask is not None:
+                query_mask = query_mask.to(device=device, dtype=dtype)
+                if query_mask.shape[:1] != front_xy.shape[:1] or query_mask.shape[1] != query_length:
+                    query_mask = None
+                else:
+                    query_mask = query_mask > 0.5
+            return front_xy, query_mask, self._infer_grid_hw_from_xy(front_xy[0])
+
         front_xy_bchw = self._front_xy_to_bchw(front_bev_xy)
         if front_xy_bchw is None:
             return None, None, None
@@ -165,6 +302,84 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
             return None
         return sat_xy.to(device=device, dtype=dtype)
 
+    @staticmethod
+    def _normalize_token_mask(
+        mask: torch.Tensor,
+        *,
+        key_length: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        elif mask.ndim == 4 and mask.shape[1] == 1:
+            mask = mask.flatten(2).squeeze(1)
+        elif mask.ndim == 4 and mask.shape[-1] == 1:
+            mask = mask.reshape(mask.shape[0], -1)
+        if mask.ndim != 2 or mask.shape[1] != key_length:
+            return None
+        return mask.to(device=device, dtype=torch.bool)
+
+    def _prepare_satellite_key_mask(
+        self,
+        *,
+        context: dict[str, Any],
+        sat_xy: torch.Tensor,
+        key_length: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        for key in (
+            "sat_valid_mask",
+            "sat_key_mask",
+            "sat_bev_valid_mask",
+            "sat_perspective_valid_mask",
+            "sat_perspective_uv_valid_mask",
+        ):
+            mask = context.get(key)
+            if torch.is_tensor(mask):
+                normalized = self._normalize_token_mask(mask, key_length=key_length, device=device)
+                if normalized is not None:
+                    return normalized
+
+        sat_perspective_uv = context.get("sat_perspective_uv")
+        if torch.is_tensor(sat_perspective_uv) and sat_perspective_uv.shape[:2] == sat_xy.shape[:2]:
+            uv = sat_perspective_uv.to(device=device)
+            finite = torch.isfinite(uv).all(dim=-1)
+            in_bounds = (uv >= -1.0).all(dim=-1) & (uv <= 1.0).all(dim=-1)
+            not_sentinel_zero = uv.abs().sum(dim=-1) > 1e-6
+            return finite & in_bounds & not_sentinel_zero
+
+        return None
+
+    def _prepare_geometry_pair(
+        self,
+        *,
+        context: dict[str, Any],
+        query_length: int,
+        key_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], tuple[int, int]]]:
+        front_xy, query_mask, query_hw = self._prepare_front_geometry(
+            context=context,
+            query_length=query_length,
+            device=device,
+            dtype=dtype,
+        )
+        sat_xy = self._prepare_satellite_xy(context=context, device=device, dtype=dtype)
+        if front_xy is None or sat_xy is None or query_hw is None:
+            return None
+        if front_xy.shape[0] != sat_xy.shape[0]:
+            return None
+        if front_xy.shape[1] != query_length or sat_xy.shape[1] != key_length:
+            return None
+        key_mask = self._prepare_satellite_key_mask(
+            context=context,
+            sat_xy=sat_xy,
+            key_length=key_length,
+            device=device,
+        )
+        return front_xy, sat_xy, query_mask, key_mask, query_hw
+
     def _build_geometry_attention_bias(
         self,
         *,
@@ -189,41 +404,56 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
         masked_bias = torch.full_like(geo_bias, min_value)
         return torch.where(keep, geo_bias, masked_bias).to(dtype=dtype)
 
-    def _build_geometry_attention_mask(
+    def _build_geometry_attention_mask_from_xy(
         self,
         *,
         context: dict[str, Any],
-        query_length: int,
+        front_xy: torch.Tensor,
+        sat_xy: torch.Tensor,
+        query_mask: Optional[torch.Tensor],
+        key_mask: Optional[torch.Tensor],
         key_length: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        front_xy, query_mask, _ = self._prepare_front_geometry(
-            context=context,
-            query_length=query_length,
-            device=device,
-            dtype=dtype,
-        )
-        sat_xy = self._prepare_satellite_xy(context=context, device=device, dtype=dtype)
-        if front_xy is None or sat_xy is None:
-            return None
-        if front_xy.shape[0] != sat_xy.shape[0] or sat_xy.shape[1] != key_length:
-            return None
-
+    ) -> torch.Tensor:
         topk = min(self.topk, int(key_length))
+        condition_mask = context.get("condition_mask")
+        if torch.is_tensor(condition_mask):
+            condition_mask = condition_mask.to(device=device, dtype=torch.bool).view(-1)
+        else:
+            condition_mask = None
+
+        if not self.enable_geometry_bias:
+            mask = build_topk_mask(
+                front_xy,
+                sat_xy,
+                topk=topk,
+                query_mask=query_mask,
+                key_mask=key_mask,
+                condition_mask=condition_mask,
+                mask_invalid_queries=self.mask_invalid_queries,
+                dtype=dtype,
+            )
+            return mask[:, None, :, :]
+
         dist2 = (front_xy.unsqueeze(2) - sat_xy.unsqueeze(1)).pow(2).sum(dim=-1)
-        nearest = torch.topk(dist2, k=topk, dim=-1, largest=False).indices
+        dist2_for_topk = dist2
+        if key_mask is not None and key_mask.shape == sat_xy.shape[:2]:
+            key_mask = key_mask.to(device=device, dtype=torch.bool)
+            dist2_for_topk = dist2.masked_fill(~key_mask.unsqueeze(1), torch.inf)
+
+        nearest = torch.topk(dist2_for_topk, k=topk, dim=-1, largest=False).indices
         keep = torch.zeros(dist2.shape, device=device, dtype=torch.bool)
         keep.scatter_(dim=-1, index=nearest, value=True)
 
         if self.mask_invalid_queries and query_mask is not None:
             keep = keep | (~query_mask).unsqueeze(-1)
 
-        condition_mask = context.get("condition_mask")
-        if torch.is_tensor(condition_mask):
-            condition_mask = condition_mask.to(device=device, dtype=torch.bool).view(-1)
-            if condition_mask.shape[0] == keep.shape[0]:
-                keep = keep | (~condition_mask).view(-1, 1, 1)
+        if key_mask is not None and key_mask.shape == sat_xy.shape[:2]:
+            keep = keep & key_mask.to(device=device, dtype=torch.bool).unsqueeze(1)
+
+        if condition_mask is not None and condition_mask.shape[0] == keep.shape[0]:
+            keep = keep | (~condition_mask).view(-1, 1, 1)
 
         bias = self._build_geometry_attention_bias(
             front_xy=front_xy,
@@ -233,6 +463,36 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
             dtype=dtype,
         )
         return bias[:, None, :, :]
+
+    def _build_geometry_attention_mask(
+        self,
+        *,
+        context: dict[str, Any],
+        query_length: int,
+        key_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        geometry = self._prepare_geometry_pair(
+            context=context,
+            query_length=query_length,
+            key_length=key_length,
+            device=device,
+            dtype=dtype,
+        )
+        if geometry is None:
+            return None
+        front_xy, sat_xy, query_mask, key_mask, _ = geometry
+        return self._build_geometry_attention_mask_from_xy(
+            context=context,
+            front_xy=front_xy,
+            sat_xy=sat_xy,
+            query_mask=query_mask,
+            key_mask=key_mask,
+            key_length=key_length,
+            device=device,
+            dtype=dtype,
+        )
 
     @staticmethod
     def _infer_grid_hw_from_xy(xy: torch.Tensor) -> Optional[tuple[int, int]]:
@@ -376,14 +636,27 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
         if is_cross_attention:
             context = self.context_provider()
             if context is not None:
-                geometry_mask = self._build_geometry_attention_mask(
+                geometry = self._prepare_geometry_pair(
                     context=context,
                     query_length=query.shape[2],
                     key_length=key.shape[2],
                     device=query.device,
                     dtype=query.dtype,
                 )
-                if geometry_mask is not None:
+                if geometry is not None:
+                    front_xy, sat_xy, query_mask, key_mask, _ = geometry
+                    query = apply_2d_rope(query, front_xy, num_freqs=BEV_ROPE_NUM_FREQS)
+                    key = apply_2d_rope(key, sat_xy, num_freqs=BEV_ROPE_NUM_FREQS)
+                    geometry_mask = self._build_geometry_attention_mask_from_xy(
+                        context=context,
+                        front_xy=front_xy,
+                        sat_xy=sat_xy,
+                        query_mask=query_mask,
+                        key_mask=key_mask,
+                        key_length=key.shape[2],
+                        device=query.device,
+                        dtype=query.dtype,
+                    )
                     attention_mask = self._merge_attention_masks(attention_mask, geometry_mask)
                 elif not self.fallback_to_unmasked:
                     raise ValueError(f"Could not build geometry mask for attention site '{self.site}'")

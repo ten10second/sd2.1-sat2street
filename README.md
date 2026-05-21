@@ -20,15 +20,15 @@
 │   ├── encoders/         # 卫星图编码器
 │   │   └── SatelliteConditionEncoder  # 输出初始 satellite memory
 │   ├── unet/             # U-Net 模块
-│   │   ├── CrossViewRefinementBlock   # 双向 cross-view refinement
-│   │   ├── StreetToSatelliteAttention # street -> satellite 更新
-│   │   └── SatelliteReadingAttention  # satellite -> street 读取
+│   │   ├── geometry_masked_attention_processor.py  # native cross-attn geometry mask + RoPE
+│   │   ├── continuous_xy_georope.py   # continuous xy rotary embedding
+│   │   └── relative_position_attention.py
 │   ├── sd_model.py       # 显式 conditioning state 的 SD 模型包装
 │   └── sd_trainer.py     # 完整的训练器
 ├── utils/                # 工具函数
 │   ├── geometry/         # 几何计算（来自原始项目）
 │   │   ├── differentiable_projection.py  # 可微分投影
-│   │   ├── kitti_transforms.py          # KITTI 变换
+│   │   ├── kitti360_transforms.py        # KITTI-360 变换
 │   │   ├── pose_encoding.py             # 位姿编码
 │   │   └── ...
 │   └── pos_embed.py      # 位置编码

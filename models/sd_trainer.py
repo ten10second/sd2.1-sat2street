@@ -152,41 +152,6 @@ def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> 
     return snapshot_dirs[-1]
 
 
-@torch.no_grad()
-def _materialize_lazy_modules(
-    model: "SatelliteConditionedSDModel",
-    sat_images: torch.Tensor,
-    front_bev_xy: Optional[torch.Tensor],
-    front_ground_valid_mask: Optional[torch.Tensor],
-    target_size: Tuple[int, int],
-) -> None:
-    sat_state = model.encode_satellite(sat_images)
-
-    vae_scale_factor = model._get_vae_scale_factor()
-    latent_h = max(1, (target_size[0] + vae_scale_factor - 1) // vae_scale_factor)
-    latent_w = max(1, (target_size[1] + vae_scale_factor - 1) // vae_scale_factor)
-    unet_param = next(model.unet.parameters(), None)
-    latent_dtype = unet_param.dtype if unet_param is not None else sat_state.tokens.dtype
-    latents = torch.randn(
-        (sat_images.shape[0], model.unet.config.in_channels, latent_h, latent_w),
-        device=sat_images.device,
-        dtype=latent_dtype,
-    )
-    timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
-
-    model.unet(
-        latents,
-        timestep,
-        encoder_hidden_states=None,
-        sat_tokens=sat_state.tokens,
-        sat_xy=sat_state.xy,
-        sat_bev_coords=sat_state.bev_coords,
-        front_bev_xy=front_bev_xy,
-        front_ground_valid_mask=front_ground_valid_mask,
-        return_attn_map=False,
-    )
-
-
 class SatelliteConditionedSDModel(nn.Module):
     """
     Stable Diffusion model conditioned on satellite images with coordinate encoding.
@@ -303,7 +268,7 @@ class SatelliteConditionedSDModel(nn.Module):
         unet_kwargs: Dict[str, Any] = {}
         if encoder_hidden_states is not None:
             unet_kwargs['encoder_hidden_states'] = encoder_hidden_states
-        if getattr(self.unet, 'supports_cross_view_refinement', False):
+        if getattr(self.unet, 'supports_satellite_conditioning', False):
             unet_kwargs.update({
                 'sat_tokens': sat_state.tokens,
                 'sat_xy': sat_state.xy,
@@ -733,8 +698,6 @@ class SatelliteConditionedSDModel(nn.Module):
 def create_sd_model(
     base_model: str = 'stabilityai/stable-diffusion-2-1-base',
     freeze_base: bool = True,
-    refinement_block_config: Optional[Dict] = None,
-    refinement_injection_sites: Optional[Tuple[str, ...]] = None,
     native_cross_attention_config: Optional[Dict] = None,
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
@@ -775,24 +738,7 @@ def create_sd_model(
         **component_load_kwargs,
     )
 
-    refinement_cfg = refinement_block_config or {}
     unet = SatelliteConditionedUNet(
-        enable_cross_view_refinement=refinement_cfg.get('enable', True),
-        refinement_injection_sites=list(refinement_injection_sites) if refinement_injection_sites is not None else None,
-        refinement_block_config={
-            'num_heads': refinement_cfg.get('num_heads', 8),
-            'head_dim': refinement_cfg.get('head_dim', 64),
-            'geo_ratio': refinement_cfg.get('geo_ratio', 0.5),
-            'rope_base': refinement_cfg.get('rope_base', 10000.0),
-            'lambda_geo': refinement_cfg.get('lambda_geo', 1.0),
-            'lambda_geom': refinement_cfg.get('lambda_geom', 1.0),
-            'geom_hidden_dim': refinement_cfg.get('geom_hidden_dim', 128),
-            'geom_head_dim': refinement_cfg.get('geom_head_dim', 16),
-            'sat_update_layers': refinement_cfg.get('sat_update_layers', 1),
-            'use_geom_bias': refinement_cfg.get('use_geom_bias', True),
-            'adapter_residual': refinement_cfg.get('adapter_residual', True),
-            'adapter_residual_scale': refinement_cfg.get('adapter_residual_scale', 1.0),
-        },
         native_cross_attention_config=native_cross_attention_config,
         **base_unet.config,
     )
@@ -921,9 +867,6 @@ class SDTrainer:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         self._barrier()
 
-        # Refinement blocks are created lazily on first forward. Materialize them before
-        # building the optimizer so their parameters are actually trainable.
-        self._materialize_lazy_condition_modules()
         self._ensure_trainable_params_fp32()
         self._assert_no_trainable_fp16_params()
         if self.distributed:
@@ -1019,51 +962,6 @@ class SDTrainer:
         flag = torch.tensor(1 if value else 0, device=device, dtype=torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         return bool(flag.item())
-
-    @torch.no_grad()
-    def _materialize_lazy_condition_modules(self) -> None:
-        unet = getattr(self.model, "unet", None)
-        if unet is None or not getattr(unet, "enable_cross_view_refinement", False):
-            return
-        if len(getattr(unet, "refinement_blocks", {})) > 0:
-            return
-
-        try:
-            batch = next(iter(self.train_dataloader))
-        except StopIteration:
-            logger.warning("Skipped lazy module materialization because the training dataloader is empty")
-            return
-
-        sat_images = batch.get("sat")
-        target_images = batch.get("image")
-        if sat_images is None or target_images is None:
-            logger.warning("Skipped lazy module materialization because batch is missing 'sat' or 'image'")
-            return
-
-        sat_images = sat_images[:1].to(self.device)
-        front_bev_xy = batch.get("front_bev_xy")
-        if front_bev_xy is not None:
-            front_bev_xy = front_bev_xy[:1].to(self.device)
-            if front_bev_xy.ndim == 5:
-                front_bev_xy = front_bev_xy[:, 0]
-        front_ground_valid_mask = batch.get("front_ground_valid_mask")
-        if front_ground_valid_mask is not None:
-            front_ground_valid_mask = front_ground_valid_mask[:1].to(self.device)
-            if front_ground_valid_mask.ndim == 5:
-                front_ground_valid_mask = front_ground_valid_mask[:, 0]
-        target_size = tuple(int(x) for x in target_images.shape[-2:])
-
-        was_training = self.model.training
-        self.model.eval()
-        _materialize_lazy_modules(self.model, sat_images, front_bev_xy, front_ground_valid_mask, target_size)
-        if was_training:
-            self.model.train()
-
-        refinement_param_count = sum(p.numel() for p in unet.refinement_blocks.parameters())
-        logger.info(
-            f"Materialized {len(unet.refinement_blocks)} refinement block(s) before optimizer init "
-            f"({refinement_param_count} parameters)"
-        )
 
     def _ensure_trainable_params_fp32(self) -> None:
         fp16_params = []

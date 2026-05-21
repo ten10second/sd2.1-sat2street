@@ -31,25 +31,6 @@ model:
     num_layers: 12
     num_heads: 12
 
-  # Cross-view refinement block (bidirectional iterative)
-  refinement_block:
-    enable: false
-    injection_sites: ['mid', 'up0', 'up1']
-    num_heads: 8
-    head_dim: 64
-    geo_ratio: 0.5
-    rope_base: 10000.0
-    lambda_geo: 1.0
-    lambda_geom: 1.0
-    geom_hidden_dim: 128
-    geom_head_dim: 16
-    sat_update_layers: 2
-    use_geom_bias: true
-    adapter_residual: false
-    adapter_residual_scale: 1.0
-    # Keep BEV xy routing for independent satellite updates only.
-    return_attn_map: false
-
   # Native SD attn2 geometry mask (scheme B)
   native_cross_attention:
     enable_geometry_mask: true
@@ -59,7 +40,7 @@ model:
     mask_invalid_queries: true
     fallback_to_unmasked: true
     use_metric_coords: false
-    enable_geometry_bias: true
+    enable_geometry_bias: false
     geometry_bias_type: 'dist_dir'
     lambda_dist: 2.0
     lambda_dir: 0.5
