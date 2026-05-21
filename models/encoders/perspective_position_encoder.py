@@ -22,6 +22,9 @@ def compute_sat_patch_perspective_uv(
 
     This is the inverse of ``compute_camera_bev_xy`` in the dataset module.
 
+    All heavy geometry is computed in fp32 in an IMU-relative local frame,
+    avoiding UTM-scale (~1e6 m) values that lose precision in bf16.
+
     Args:
         bev_coords: (B, N, 2) patch centres in meters relative to satellite/IMU centre.
         K: (B, 3, 3) camera intrinsics.
@@ -37,51 +40,74 @@ def compute_sat_patch_perspective_uv(
     """
     B, N, _ = bev_coords.shape
     device = bev_coords.device
-    dtype = bev_coords.dtype
+    output_dtype = bev_coords.dtype
+
+    # --- all geometry held in fp32 to avoid bf16 UTM-scale truncation ---
+    calc_dtype = torch.float32
 
     camera_height = _as_batch_vector(
         camera_height_m,
         batch_size=B,
         device=device,
-        dtype=dtype,
+        dtype=calc_dtype,
         name="camera_height_m",
     )
 
-    # Satellite centre in world XY (the IMU position)
-    sat_center_xy = T_imu_to_world[:, :2, 3]  # (B, 2)
+    T_cam_f32 = T_cam_to_world.to(dtype=calc_dtype)   # (B, 4, 4)
+    T_imu_f32 = T_imu_to_world.to(dtype=calc_dtype)   # (B, 4, 4)
 
-    # World point on the same local ground plane used by compute_camera_bev_xy:
-    # z = camera_z - camera_height, not global world z = 0.
-    world_xy = sat_center_xy.unsqueeze(1) + bev_coords  # (B, N, 2)
-    ground_z = T_cam_to_world[:, 2, 3].to(device=device, dtype=dtype) - camera_height
-    world_z = ground_z.view(B, 1, 1).expand(B, N, 1)
-    world_xyz = torch.cat(
-        [world_xy, world_z], dim=-1
+    R_cam_to_world = T_cam_f32[:, :3, :3]              # (B, 3, 3)
+    t_cam_to_world = T_cam_f32[:, :3, 3]               # (B, 3)
+    t_imu_world    = T_imu_f32[:, :3, 3]               # (B, 3)
+
+    # analytic world→camera (R^T, -R^T·t) — no torch.inverse needed
+    R_world_to_cam = R_cam_to_world.transpose(1, 2)    # (B, 3, 3)
+    t_world_to_cam = -torch.bmm(
+        R_world_to_cam, t_cam_to_world.unsqueeze(-1)
+    ).squeeze(-1)  # (B, 3)
+
+    # IMU position in camera frame (small, ~10 m)
+    t_imu_to_cam = t_world_to_cam + torch.bmm(
+        R_world_to_cam, t_imu_world.unsqueeze(-1)
+    ).squeeze(-1)  # (B, 3)
+
+    # Ground-plane Z relative to IMU (metres, avoids UTM Z ~1e5)
+    ground_z_relative = (
+        t_cam_to_world[:, 2] - camera_height
+    ) - t_imu_world[:, 2]  # (B,)
+
+    # 3-d local offset from IMU: all components ≤ O(50 m)
+    bev_coords_f32 = bev_coords.to(dtype=calc_dtype)
+    bev_offset_3d = torch.cat(
+        [
+            bev_coords_f32,                                    # (B, N, 2)
+            ground_z_relative.view(B, 1, 1).expand(B, N, 1),  # (B, N, 1)
+        ],
+        dim=-1,
     )  # (B, N, 3)
-    world_h = torch.cat(
-        [world_xyz, torch.ones(B, N, 1, device=device, dtype=dtype)], dim=-1
-    )  # (B, N, 4)
 
-    # World → camera
-    T_world_to_cam = torch.inverse(T_cam_to_world.float()).to(dtype)  # (B, 4, 4)
-    cam_h = torch.bmm(
-        T_world_to_cam.unsqueeze(1).expand(-1, N, -1, -1).reshape(B * N, 4, 4),
-        world_h.reshape(B * N, 4, 1),
-    ).reshape(B, N, 4)  # (B, N, 4)
-    cam_xyz = cam_h[..., :3]  # (B, N, 3)
+    # cam_xyz = t_imu_to_cam + R_world_to_cam @ bev_offset
+    cam_xyz = t_imu_to_cam.unsqueeze(1) + torch.bmm(
+        bev_offset_3d, R_world_to_cam.transpose(1, 2)
+    )  # (B, N, 3)
+
+    # ensure K is batched and in calc_dtype
+    K_f32 = K.to(dtype=calc_dtype)
+    if K_f32.dim() == 2:
+        K_f32 = K_f32.unsqueeze(0).expand(B, -1, -1)
 
     # Camera → pixel
     pixel_h = torch.bmm(
-        K.unsqueeze(1).expand(-1, N, -1, -1).reshape(B * N, 3, 3),
+        K_f32.unsqueeze(1).expand(-1, N, -1, -1).reshape(B * N, 3, 3),
         cam_xyz.reshape(B * N, 3, 1),
     ).reshape(B, N, 3)  # (B, N, 3)
 
     u = pixel_h[..., 0] / (pixel_h[..., 2] + 1e-8)  # (B, N)
     v = pixel_h[..., 1] / (pixel_h[..., 2] + 1e-8)  # (B, N)
 
-    # Normalise to [-1, 1]
-    u_norm = 2.0 * u / max(image_w, 1) - 1.0
-    v_norm = 2.0 * v / max(image_h, 1) - 1.0
+    # Normalise to [-1, 1] — cast to output dtype
+    u_norm = (2.0 * u / max(image_w, 1) - 1.0).to(dtype=output_dtype)
+    v_norm = (2.0 * v / max(image_h, 1) - 1.0).to(dtype=output_dtype)
     uv_norm = torch.stack([u_norm, v_norm], dim=-1)  # (B, N, 2)
 
     # Validity: in front of camera + within image bounds
@@ -120,22 +146,44 @@ def _as_batch_vector(
 
 
 class PerspectivePositionEncoder(nn.Module):
-    """
-    Learnable MLP that encodes normalised perspective pixel coordinates.
+    """Fourier-feature positional encoding for perspective pixel coordinates.
 
-    Architecture matches ``coord_encoder`` in SatelliteConditionEncoder:
-        Linear(2 → dim) → LayerNorm → GELU → Linear(dim → dim) → LayerNorm
+    Replaces the previous deep MLP with a fixed sinusoidal Fourier feature
+    expansion (NeRF / ViT style) followed by a single linear projection +
+    LayerNorm.  Invalid (out-of-image) patches receive a dedicated learnable
+    *out-of-image* (OOI) sentinel embedding.
+
+    Args:
+        dim: output embedding dimension (default 768).
+        num_freqs: number of octave frequency bands per coordinate
+                   (default 12 → fourier_dim = 2 coords × (sin+cos) × 12 = 48).
     """
 
-    def __init__(self, dim: int = 768):
+    def __init__(self, dim: int = 768, num_freqs: int = 12):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(2, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-        )
+        self.num_freqs = int(num_freqs)
+        fourier_dim = 4 * self.num_freqs  # 2 coords × (sin + cos) per freq
+        self.fourier_linear = nn.Linear(fourier_dim, dim)
+        self.fourier_norm = nn.LayerNorm(dim)
+        self.ooi_token = nn.Parameter(torch.zeros(dim))
+
+    @staticmethod
+    def _fourier_encode(uv: torch.Tensor, num_freqs: int) -> torch.Tensor:
+        """Sinusoidal Fourier feature expansion.
+
+        Args:
+            uv:  (…, 2) normalised pixel coords in [-1, 1].
+            num_freqs: number of octave frequency bands.
+
+        Returns:
+            (…, 4·num_freqs) where the last dim is
+            [sin(u·f), cos(u·f), sin(v·f), cos(v·f), …]
+            with f ∈ {2⁰π, 2¹π, …, 2^(num_freqs-1)·π}.
+        """
+        freqs = (2.0 ** torch.arange(num_freqs, dtype=uv.dtype, device=uv.device)) * torch.pi
+        uv_exp = uv.unsqueeze(-1) * freqs          # (…, 2, F)
+        enc = torch.cat([torch.sin(uv_exp), torch.cos(uv_exp)], dim=-1)  # (…, 2, 2F)
+        return enc.flatten(-2)                     # (…, 4F)
 
     def forward(
         self,
@@ -145,12 +193,15 @@ class PerspectivePositionEncoder(nn.Module):
         """
         Args:
             uv_norm: (B, N, 2) normalised pixel coords in [-1, 1].
-            valid: Optional (B, N) validity mask.
+            valid:   optional (B, N) boolean validity mask.
 
         Returns:
             pe: (B, N, dim) perspective position encoding.
         """
-        pe = self.mlp(uv_norm)
+        pe = self.fourier_norm(
+            self.fourier_linear(self._fourier_encode(uv_norm, self.num_freqs))
+        )
         if valid is not None:
-            pe = pe * valid.to(dtype=pe.dtype).unsqueeze(-1)
+            ooi = self.ooi_token.to(dtype=pe.dtype)
+            pe = torch.where(valid.unsqueeze(-1), pe, ooi.expand_as(pe))
         return pe

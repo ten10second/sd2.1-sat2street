@@ -156,11 +156,14 @@ class SatelliteConditionEncoder(nn.Module):
         if self.perspective_pe_enabled:
             self._validate_geometry(K, T_cam_to_world, T_imu_to_world, camera_height_m, image_size)
             image_h, image_w = int(image_size[0]), int(image_size[1])
+            # Keep T_cam_to_world / T_imu_to_world in their original dtype
+            # (fp32) – compute_sat_patch_perspective_uv internally works in
+            # fp32 to avoid bf16 truncation of UTM-scale (~1e6 m) translations.
             perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
                 bev_coords=bev_coords,
-                K=K.to(device=device, dtype=sat_images.dtype),
-                T_cam_to_world=T_cam_to_world.to(device=device, dtype=sat_images.dtype),
-                T_imu_to_world=T_imu_to_world.to(device=device, dtype=sat_images.dtype),
+                K=K,
+                T_cam_to_world=T_cam_to_world,
+                T_imu_to_world=T_imu_to_world,
                 camera_height_m=camera_height_m,
                 image_w=image_w,
                 image_h=image_h,
@@ -176,9 +179,9 @@ class SatelliteConditionEncoder(nn.Module):
             image_h, image_w = int(image_size[0]), int(image_size[1])
             perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
                 bev_coords=bev_coords,
-                K=K.to(device=device, dtype=sat_images.dtype),
-                T_cam_to_world=T_cam_to_world.to(device=device, dtype=sat_images.dtype),
-                T_imu_to_world=T_imu_to_world.to(device=device, dtype=sat_images.dtype),
+                K=K,
+                T_cam_to_world=T_cam_to_world,
+                T_imu_to_world=T_imu_to_world,
                 camera_height_m=camera_height_m,
                 image_w=image_w,
                 image_h=image_h,
