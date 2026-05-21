@@ -220,11 +220,23 @@ def _configure_logging(log_dir: Path) -> None:
 
 def _resolve_query_uv_config(config: Dict[str, Any]) -> Tuple[bool, float]:
     query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
-    query_uv_pe_enabled = bool(query_pe_config.get("enable", True))
+    query_uv_pe_enabled = bool(query_pe_config.get("enable", False))
     query_uv_gate_init = query_pe_config.get("gate_init", 1.0)
     if query_uv_gate_init is None:
         query_uv_gate_init = 1.0
     return query_uv_pe_enabled, float(query_uv_gate_init)
+
+
+def _resolve_query_geometry_bias_config(config: Dict[str, Any]) -> Tuple[bool, float, float]:
+    geometry_config = dict(_config_get(config, ("model", "query_geometry_bias"), {}) or {})
+    geometry_enabled = bool(geometry_config.get("enable", True))
+    geometry_scale = geometry_config.get("distance_scale", 2.0)
+    if geometry_scale is None:
+        geometry_scale = 2.0
+    invalid_penalty = geometry_config.get("invalid_penalty", -1e4)
+    if invalid_penalty is None:
+        invalid_penalty = -1e4
+    return geometry_enabled, float(geometry_scale), float(invalid_penalty)
 
 
 def main():
@@ -568,6 +580,7 @@ def main():
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
     perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
     query_uv_pe_enabled, query_uv_gate_init = _resolve_query_uv_config(config)
+    query_geometry_bias_enabled, query_geometry_bias_scale, query_geometry_invalid_penalty = _resolve_query_geometry_bias_config(config)
 
     _configure_logging(log_dir)
 
@@ -710,6 +723,9 @@ def main():
         cond_drop_prob=args.cond_drop_prob,
         perspective_pe_enabled=perspective_pe_enabled,
         query_uv_pe_enabled=query_uv_pe_enabled,
+        query_geometry_bias_enabled=query_geometry_bias_enabled,
+        query_geometry_bias_scale=query_geometry_bias_scale,
+        query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
         satellite_encoder_config=satellite_encoder_config,
     )

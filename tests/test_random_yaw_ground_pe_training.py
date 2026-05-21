@@ -312,6 +312,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             QueryUVAttnProcessor2_0(
                 query_dim=int(attn.to_q.out_features),
                 query_uv_enabled=True,
+                geometry_bias_enabled=False,
             )
         )
         hidden_states = torch.randn(1, 4, 8)
@@ -325,6 +326,38 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
 
         self.assertEqual(output.shape, hidden_states.shape)
 
+    def test_query_geometry_bias_runs_without_query_uv_pe(self) -> None:
+        from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
+
+        torch.manual_seed(0)
+        attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)
+        processor = QueryUVAttnProcessor2_0(
+            query_dim=int(attn.to_q.out_features),
+            query_uv_enabled=False,
+            geometry_bias_enabled=True,
+            geometry_bias_scale=3.0,
+        )
+        attn.set_processor(processor)
+        hidden_states = torch.randn(1, 4, 8)
+        encoder_hidden_states = torch.randn(1, 3, 8)
+        sat_perspective_uv = torch.tensor(
+            [[[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5]]],
+            dtype=torch.float32,
+        )
+        sat_perspective_valid = torch.tensor([[True, False, True]])
+
+        output = attn(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            query_base_hw=(2, 2),
+            sat_perspective_uv=sat_perspective_uv,
+            sat_perspective_valid=sat_perspective_valid,
+        )
+
+        self.assertEqual(output.shape, hidden_states.shape)
+        self.assertIsNone(processor.query_uv_encoder)
+        self.assertIsNone(processor.query_uv_gate)
+
     def test_query_uv_attn_processor_uses_two_layer_coord_mlp(self) -> None:
         from models.encoders.perspective_position_encoder import PerspectivePositionEncoder
         from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
@@ -332,6 +365,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         processor = QueryUVAttnProcessor2_0(
             query_dim=16,
             query_uv_enabled=True,
+            geometry_bias_enabled=False,
         )
 
         self.assertIsInstance(processor.query_uv_encoder, PerspectivePositionEncoder)
@@ -366,6 +400,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
                 query_dim=int(attn.to_q.out_features),
                 slice_size=1,
                 query_uv_enabled=True,
+                geometry_bias_enabled=False,
             )
         )
         hidden_states = torch.randn(1, 4, 8)
@@ -396,6 +431,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             attention_head_dim=8,
             norm_num_groups=8,
             query_uv_pe_enabled=True,
+            query_geometry_bias_enabled=False,
         )
 
         model.set_attention_slice("auto")
@@ -410,6 +446,54 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             torch.tensor([0], dtype=torch.long),
             encoder_hidden_states=encoder_hidden_states,
             cross_attention_kwargs={"query_base_hw": (8, 8)},
+        ).sample
+
+        self.assertEqual(output.shape, latents.shape)
+
+    def test_unet_geometry_bias_runs_without_query_uv_pe_under_attention_slicing(self) -> None:
+        torch.manual_seed(0)
+        model = SatelliteConditionedUNet(
+            sample_size=8,
+            in_channels=4,
+            out_channels=4,
+            center_input_sample=False,
+            flip_sin_to_cos=True,
+            freq_shift=0,
+            down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(16, 32),
+            layers_per_block=1,
+            cross_attention_dim=16,
+            attention_head_dim=8,
+            norm_num_groups=8,
+            query_uv_pe_enabled=False,
+            query_geometry_bias_enabled=True,
+        )
+
+        model.set_attention_slice("auto")
+        self.assertTrue(
+            any(
+                isinstance(processor, QueryUVSlicedAttnProcessor) and processor.geometry_bias_enabled
+                for processor in model.attn_processors.values()
+            )
+        )
+
+        latents = torch.randn(1, 4, 8, 8)
+        encoder_hidden_states = torch.randn(1, 4, 16)
+        sat_perspective_uv = torch.tensor(
+            [[[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]]],
+            dtype=torch.float32,
+        )
+        sat_perspective_valid = torch.tensor([[True, True, False, True]])
+        output = model(
+            latents,
+            torch.tensor([0], dtype=torch.long),
+            encoder_hidden_states=encoder_hidden_states,
+            cross_attention_kwargs={
+                "query_base_hw": (8, 8),
+                "sat_perspective_uv": sat_perspective_uv,
+                "sat_perspective_valid": sat_perspective_valid,
+            },
         ).sample
 
         self.assertEqual(output.shape, latents.shape)

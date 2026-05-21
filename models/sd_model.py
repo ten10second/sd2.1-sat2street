@@ -43,17 +43,23 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
     def __init__(
         self,
-        query_uv_pe_enabled: bool = True,
+        query_uv_pe_enabled: bool = False,
+        query_geometry_bias_enabled: bool = True,
+        query_geometry_bias_scale: float = 2.0,
+        query_geometry_invalid_penalty: float = -1e4,
         query_uv_gate_init: float = 0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.query_uv_pe_enabled = bool(query_uv_pe_enabled)
+        self.query_geometry_bias_enabled = bool(query_geometry_bias_enabled)
+        self.query_geometry_bias_scale = float(query_geometry_bias_scale)
+        self.query_geometry_invalid_penalty = float(query_geometry_invalid_penalty)
         self.query_uv_gate_init = float(query_uv_gate_init)
         self._install_query_uv_attention_processors()
 
     def _build_attention_processors(self):
-        if not self.query_uv_pe_enabled:
+        if not self.query_uv_pe_enabled and not self.query_geometry_bias_enabled:
             return AttnProcessor2_0()
         return self._build_query_uv_attention_processors()
 
@@ -64,7 +70,10 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             query_dim = int(attn_module.to_q.out_features)
             processors[name] = QueryUVAttnProcessor2_0(
                 query_dim=query_dim,
-                query_uv_enabled=name.endswith(".attn2.processor"),
+                query_uv_enabled=bool(self.query_uv_pe_enabled and name.endswith(".attn2.processor")),
+                geometry_bias_enabled=bool(self.query_geometry_bias_enabled and name.endswith(".attn2.processor")),
+                geometry_bias_scale=self.query_geometry_bias_scale,
+                geometry_invalid_penalty=self.query_geometry_invalid_penalty,
                 gate_init=self.query_uv_gate_init,
             )
         return processors
@@ -73,7 +82,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.set_attn_processor(self._build_attention_processors())
 
     def set_attention_slice(self, slice_size="auto"):
-        if not self.query_uv_pe_enabled:
+        if not self.query_uv_pe_enabled and not self.query_geometry_bias_enabled:
             return super().set_attention_slice(slice_size)
 
         if slice_size is None:
@@ -94,7 +103,10 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             sliced_processors[name] = QueryUVSlicedAttnProcessor(
                 query_dim=query_dim,
                 slice_size=int(slice_value),
-                query_uv_enabled=name.endswith(".attn2.processor"),
+                query_uv_enabled=bool(self.query_uv_pe_enabled and name.endswith(".attn2.processor")),
+                geometry_bias_enabled=bool(self.query_geometry_bias_enabled and name.endswith(".attn2.processor")),
+                geometry_bias_scale=self.query_geometry_bias_scale,
+                geometry_invalid_penalty=self.query_geometry_invalid_penalty,
                 gate_init=self.query_uv_gate_init,
             )
         self.set_attn_processor(sliced_processors)
@@ -104,7 +116,10 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         if cross_attention_kwargs is None:
             return None
         if not isinstance(cross_attention_kwargs, dict):
-            raise ValueError(f"cross_attention_kwargs must be a dict when query UV PE is enabled, got {type(cross_attention_kwargs)!r}")
+            raise ValueError(
+                f"cross_attention_kwargs must be a dict when query-based geometry features are enabled, "
+                f"got {type(cross_attention_kwargs)!r}"
+            )
         query_base_hw = cross_attention_kwargs.get("query_base_hw")
         if query_base_hw is None:
             return None
@@ -123,11 +138,16 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             encoder_hidden_states = sat_tokens
         if encoder_hidden_states is None:
             raise ValueError("SatelliteConditionedUNet requires sat_tokens or encoder_hidden_states")
-        if self.query_uv_pe_enabled:
+        if self.query_uv_pe_enabled or self.query_geometry_bias_enabled:
             if self._normalize_query_base_hw(cross_attention_kwargs) is None:
                 raise ValueError(
-                    "query_uv_pe_enabled requires cross_attention_kwargs['query_base_hw'] "
+                    "query-based geometry features require cross_attention_kwargs['query_base_hw'] "
                     "to thread latent spatial coordinates into cross-attention"
+                )
+        if self.query_geometry_bias_enabled:
+            if not isinstance(cross_attention_kwargs, dict) or cross_attention_kwargs.get("sat_perspective_uv") is None:
+                raise ValueError(
+                    "query_geometry_bias_enabled requires cross_attention_kwargs['sat_perspective_uv']"
                 )
 
         # Diagnostic log (once per process)
@@ -150,17 +170,11 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         )
 
 
-def _is_missing_processor_key(key: str) -> bool:
-    return ".processor." in key
-
-
 def load_model_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
 ) -> Tuple[Sequence[str], Sequence[str]]:
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    missing_keys = [key for key in missing_keys if not _is_missing_processor_key(key)]
-    unexpected_keys = [key for key in unexpected_keys if not _is_missing_processor_key(key)]
     if missing_keys:
         raise RuntimeError(f"Missing keys when loading checkpoint: {missing_keys}")
     if unexpected_keys:
@@ -273,6 +287,7 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         logger.info(f"  Perspective PE enabled: {self.perspective_pe_enabled}")
         logger.info(f"  Query UV PE enabled: {bool(getattr(self.unet, 'query_uv_pe_enabled', False))}")
+        logger.info(f"  Query geometry bias enabled: {bool(getattr(self.unet, 'query_geometry_bias_enabled', False))}")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
     def encode_satellite(
@@ -343,12 +358,57 @@ class SatelliteConditionedSDModel(nn.Module):
             ),
         )
 
-    def _build_query_uv_cross_attention_kwargs(self, reference: torch.Tensor):
-        if not bool(getattr(self.unet, "query_uv_pe_enabled", False)):
+    def _build_cross_attention_kwargs(
+        self,
+        reference: torch.Tensor,
+        sat_state: SatelliteMemoryState,
+    ):
+        if not bool(getattr(self.unet, "query_uv_pe_enabled", False)) and not bool(
+            getattr(self.unet, "query_geometry_bias_enabled", False)
+        ):
             return None
         if reference.ndim != 4:
             raise ValueError(f"reference tensor must be [B,C,H,W], got {list(reference.shape)}")
-        return {"query_base_hw": tuple(int(x) for x in reference.shape[-2:])}
+        kwargs: Dict[str, Any] = {"query_base_hw": tuple(int(x) for x in reference.shape[-2:])}
+        if bool(getattr(self.unet, "query_geometry_bias_enabled", False)):
+            if sat_state.perspective_uv is None:
+                raise ValueError("query_geometry_bias_enabled requires sat_state.perspective_uv")
+            kwargs["sat_perspective_uv"] = sat_state.perspective_uv
+            if sat_state.perspective_valid is not None:
+                kwargs["sat_perspective_valid"] = sat_state.perspective_valid
+        return kwargs
+
+    @staticmethod
+    def _zero_sat_geometry(sat_state: SatelliteMemoryState) -> SatelliteMemoryState:
+        return sat_state.replace(
+            perspective_uv=(
+                torch.zeros_like(sat_state.perspective_uv)
+                if sat_state.perspective_uv is not None
+                else None
+            ),
+            perspective_valid=(
+                torch.zeros_like(sat_state.perspective_valid)
+                if sat_state.perspective_valid is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _concat_optional_tensors(left: Optional[torch.Tensor], right: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if left is None or right is None:
+            return None
+        return torch.cat([left, right], dim=0)
+
+    def _build_cfg_sat_state(self, sat_state: SatelliteMemoryState) -> SatelliteMemoryState:
+        zero_tokens = torch.zeros_like(sat_state.tokens)
+        zero_geometry = self._zero_sat_geometry(sat_state)
+        return SatelliteMemoryState(
+            tokens=torch.cat([sat_state.tokens, zero_tokens], dim=0),
+            xy=torch.cat([sat_state.xy, sat_state.xy], dim=0),
+            bev_coords=self._concat_optional_tensors(sat_state.bev_coords, sat_state.bev_coords),
+            perspective_uv=self._concat_optional_tensors(sat_state.perspective_uv, zero_geometry.perspective_uv),
+            perspective_valid=self._concat_optional_tensors(sat_state.perspective_valid, zero_geometry.perspective_valid),
+        )
 
     @torch.no_grad()
     def _get_vae_scale_factor(self) -> int:
@@ -382,7 +442,19 @@ class SatelliteConditionedSDModel(nn.Module):
         if sat_condition_mode == "normal":
             condition_mask = torch.ones(B, device=device, dtype=torch.bool)
         elif sat_condition_mode == "zero":
-            sat_state = sat_state.replace(tokens=torch.zeros_like(sat_state.tokens))
+            sat_state = sat_state.replace(
+                tokens=torch.zeros_like(sat_state.tokens),
+                perspective_uv=(
+                    torch.zeros_like(sat_state.perspective_uv)
+                    if sat_state.perspective_uv is not None
+                    else None
+                ),
+                perspective_valid=(
+                    torch.zeros_like(sat_state.perspective_valid)
+                    if sat_state.perspective_valid is not None
+                    else None
+                ),
+            )
             condition_mask = torch.zeros(B, device=device, dtype=torch.bool)
         else:
             raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
@@ -403,15 +475,15 @@ class SatelliteConditionedSDModel(nn.Module):
 
         use_cfg = guidance_scale > 1.0
         if use_cfg:
-            uncond_state = sat_state.replace(tokens=torch.zeros_like(sat_state.tokens))
-            sat_state_double = sat_state.replace(
-                tokens=torch.cat([sat_state.tokens, uncond_state.tokens], dim=0),
-            )
+            sat_state_double = self._build_cfg_sat_state(sat_state)
 
         self.noise_scheduler.set_timesteps(num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
-            cross_attention_kwargs = self._build_query_uv_cross_attention_kwargs(latents)
+            cross_attention_kwargs = self._build_cross_attention_kwargs(
+                latents,
+                sat_state_double if use_cfg else sat_state,
+            )
             if use_cfg:
                 latent_model_input = torch.cat([latents, latents], dim=0)
                 noise_pred_both = self.unet(
@@ -530,7 +602,7 @@ class SatelliteConditionedSDModel(nn.Module):
             dtype=torch.long,
         )
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-        cross_attention_kwargs = self._build_query_uv_cross_attention_kwargs(noisy_latents)
+        cross_attention_kwargs = self._build_cross_attention_kwargs(noisy_latents, conditioned_sat_state)
         model_pred = self.unet(
             noisy_latents,
             timesteps,
@@ -562,7 +634,10 @@ def create_sd_model(
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
     perspective_pe_enabled: bool = True,
-    query_uv_pe_enabled: bool = True,
+    query_uv_pe_enabled: bool = False,
+    query_geometry_bias_enabled: bool = True,
+    query_geometry_bias_scale: float = 2.0,
+    query_geometry_invalid_penalty: float = -1e4,
     query_uv_gate_init: float = 0.0,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> SatelliteConditionedSDModel:
@@ -598,6 +673,9 @@ def create_sd_model(
 
     unet = SatelliteConditionedUNet(
         query_uv_pe_enabled=query_uv_pe_enabled,
+        query_geometry_bias_enabled=query_geometry_bias_enabled,
+        query_geometry_bias_scale=query_geometry_bias_scale,
+        query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
         **base_unet.config,
     )

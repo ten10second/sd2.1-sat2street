@@ -32,7 +32,8 @@ def main():
         freeze_base=True,
         torch_dtype=torch.float32,
         perspective_pe_enabled=True,
-        query_uv_pe_enabled=True,
+        query_uv_pe_enabled=False,
+        query_geometry_bias_enabled=True,
     )
     model = model.to(device)
 
@@ -96,12 +97,12 @@ def main():
         )
 
         # Generate WITHOUT conditioning (zero tokens)
-        zero_state = sat_state.replace(tokens=torch.zeros_like(sat_state.tokens))
-        print("Generating WITHOUT conditioning (zero sat tokens)...")
+        print("Generating WITHOUT conditioning (zero satellite conditioning)...")
         gen_uncond, _ = model.generate_with_satellite_state(
-            zero_state, target_size=target_size,
+            sat_state, target_size=target_size,
             num_inference_steps=20, guidance_scale=1.0,
             generator=torch.Generator(device=device).manual_seed(42),
+            sat_condition_mode="zero",
         )
 
         # Compute difference

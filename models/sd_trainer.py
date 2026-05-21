@@ -33,17 +33,11 @@ DEFAULT_ATTENTION_VIS_LAYERS = [
     "mid_block.attentions.0.transformer_blocks.0.attn2",
 ]
 
-def _is_missing_processor_key(key: str) -> bool:
-    return ".processor." in key
-
-
 def load_model_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
 ) -> Tuple[Sequence[str], Sequence[str]]:
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    missing_keys = [key for key in missing_keys if not _is_missing_processor_key(key)]
-    unexpected_keys = [key for key in unexpected_keys if not _is_missing_processor_key(key)]
     if missing_keys:
         raise RuntimeError(f"Missing keys when loading checkpoint: {missing_keys}")
     if unexpected_keys:
@@ -70,7 +64,10 @@ def create_sd_model(
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
     perspective_pe_enabled: bool = True,
-    query_uv_pe_enabled: bool = True,
+    query_uv_pe_enabled: bool = False,
+    query_geometry_bias_enabled: bool = True,
+    query_geometry_bias_scale: float = 2.0,
+    query_geometry_invalid_penalty: float = -1e4,
     query_uv_gate_init: float = 0.0,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -85,6 +82,9 @@ def create_sd_model(
         cond_drop_prob=cond_drop_prob,
         perspective_pe_enabled=perspective_pe_enabled,
         query_uv_pe_enabled=query_uv_pe_enabled,
+        query_geometry_bias_enabled=query_geometry_bias_enabled,
+        query_geometry_bias_scale=query_geometry_bias_scale,
+        query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
         satellite_encoder_config=satellite_encoder_config,
     )

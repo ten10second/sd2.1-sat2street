@@ -296,7 +296,10 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     if not config:
         args.satellite_encoder_config = {}
         args.perspective_pe_enabled = True
-        args.query_uv_pe_enabled = True
+        args.query_uv_pe_enabled = False
+        args.query_geometry_bias_enabled = True
+        args.query_geometry_bias_scale = 2.0
+        args.query_geometry_invalid_penalty = -1e4
         return
 
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
@@ -332,7 +335,17 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
     args.perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
     query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
-    args.query_uv_pe_enabled = bool(query_pe_config.get("enable", True))
+    args.query_uv_pe_enabled = bool(query_pe_config.get("enable", False))
+    geometry_config = dict(_config_get(config, ("model", "query_geometry_bias"), {}) or {})
+    args.query_geometry_bias_enabled = bool(geometry_config.get("enable", True))
+    geometry_scale = geometry_config.get("distance_scale", 2.0)
+    if geometry_scale is None:
+        geometry_scale = 2.0
+    invalid_penalty = geometry_config.get("invalid_penalty", -1e4)
+    if invalid_penalty is None:
+        invalid_penalty = -1e4
+    args.query_geometry_bias_scale = float(geometry_scale)
+    args.query_geometry_invalid_penalty = float(invalid_penalty)
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -797,9 +810,7 @@ def _materialize_lazy_modules(
     timestep = torch.zeros((sat_images.shape[0],), device=sat_images.device, dtype=torch.long)
 
     amp_dtype = latent_dtype if latent_dtype in {torch.float16, torch.bfloat16} else torch.float32
-    cross_attention_kwargs = None
-    if bool(getattr(model.unet, "query_uv_pe_enabled", False)):
-        cross_attention_kwargs = {"query_base_hw": (latent_h, latent_w)}
+    cross_attention_kwargs = model._build_cross_attention_kwargs(latents, sat_state)
     with torch.autocast(
         device_type="cuda",
         dtype=amp_dtype,
@@ -828,7 +839,10 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
         perspective_pe_enabled=getattr(args, "perspective_pe_enabled", True),
-        query_uv_pe_enabled=getattr(args, "query_uv_pe_enabled", True),
+        query_uv_pe_enabled=getattr(args, "query_uv_pe_enabled", False),
+        query_geometry_bias_enabled=getattr(args, "query_geometry_bias_enabled", True),
+        query_geometry_bias_scale=getattr(args, "query_geometry_bias_scale", 2.0),
+        query_geometry_invalid_penalty=getattr(args, "query_geometry_invalid_penalty", -1e4),
         satellite_encoder_config=getattr(args, "satellite_encoder_config", None),
     )
     if hasattr(model.unet, "set_attention_slice"):

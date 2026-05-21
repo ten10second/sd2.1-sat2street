@@ -138,7 +138,8 @@ def check_sat_tokens_on_data(checkpoint_path: str, data_dir: str, device: str) -
 
     print("  Loading model...")
     model = create_sd_model(
-        query_uv_pe_enabled=True,
+        query_uv_pe_enabled=False,
+        query_geometry_bias_enabled=True,
         query_uv_gate_init=0.0,
     )
     load_model_checkpoint(model, Path(checkpoint_path), device)
