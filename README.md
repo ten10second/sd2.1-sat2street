@@ -25,7 +25,7 @@
 ├── utils/                # 工具函数
 │   ├── geometry/         # 几何计算（来自原始项目）
 │   │   ├── differentiable_projection.py  # 可微分投影
-│   │   ├── kitti_transforms.py          # KITTI 变换
+│   │   ├── kitti360_transforms.py       # KITTI-360 变换
 │   │   ├── pose_encoding.py             # 位姿编码
 │   │   └── ...
 │   └── pos_embed.py      # 位置编码

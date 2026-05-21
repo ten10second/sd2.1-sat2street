@@ -26,7 +26,8 @@ model:
   # 卫星图编码器配置
   satellite_encoder:
     name: 'satellite_condition_encoder'
-    embed_dim: 768
+    # Must match the base UNet cross_attention_dim so the checkpoint loads cleanly.
+    embed_dim: 1024
     patch_size: 16
     sat_resolution: 0.2
     sat_size: 512

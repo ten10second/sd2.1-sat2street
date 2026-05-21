@@ -669,6 +669,15 @@ def create_sd_model(
     sat_encoder_cfg = dict(satellite_encoder_config or {})
     sat_encoder_cfg.pop("name", None)
     sat_encoder_cfg.setdefault("perspective_pe_enabled", perspective_pe_enabled)
+    sat_embed_dim = int(getattr(base_unet.config, "cross_attention_dim", 768) or 768)
+    requested_embed_dim = sat_encoder_cfg.get("embed_dim")
+    if requested_embed_dim is not None and int(requested_embed_dim) != sat_embed_dim:
+        logger.warning(
+            "Overriding satellite_encoder.embed_dim=%s with base UNet cross_attention_dim=%s",
+            requested_embed_dim,
+            sat_embed_dim,
+        )
+    sat_encoder_cfg["embed_dim"] = sat_embed_dim
     satellite_encoder = SatelliteConditionEncoder(**sat_encoder_cfg)
 
     unet = SatelliteConditionedUNet(
