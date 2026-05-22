@@ -3,7 +3,7 @@
 # 基本配置
 seed: 42
 device: 'cuda'
-mixed_precision: 'fp16'
+mixed_precision: 'no'
 gradient_checkpointing: true
 
 # 数据配置

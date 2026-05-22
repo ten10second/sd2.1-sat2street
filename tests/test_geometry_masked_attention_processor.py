@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -46,6 +47,7 @@ class GeometryMaskedAttentionProcessorTest(unittest.TestCase):
         attn = _DummyAttention(hidden_dim=32, heads=2)
         processor = GeometryMaskedAttnProcessor2_0(
             site="mid",
+            topk=1,
             context_provider=lambda: {
                 "front_bev_xy": torch.tensor(
                     [[[-0.8, 0.8], [-0.4, 0.4], [-0.8, 0.8], [-0.4, 0.4]]],
@@ -73,6 +75,29 @@ class GeometryMaskedAttentionProcessorTest(unittest.TestCase):
 
         self.assertEqual(with_context.shape, hidden_states.shape)
         self.assertFalse(torch.allclose(with_context, without_context))
+
+    def test_sdpa_cudnn_failure_falls_back_to_manual_attention(self) -> None:
+        torch.manual_seed(0)
+        processor = GeometryMaskedAttnProcessor2_0(
+            site="mid",
+            context_provider=lambda: None,
+        )
+        query = torch.randn((1, 2, 3, 8), dtype=torch.float32)
+        key = torch.randn((1, 2, 4, 8), dtype=torch.float32)
+        value = torch.randn((1, 2, 4, 8), dtype=torch.float32)
+        expected = processor._manual_scaled_dot_product_attention(query, key, value, None)
+
+        cudnn_error = RuntimeError(
+            "cuDNN Frontend error: [cudnn_frontend] Error: No execution plans support the graph."
+        )
+        with patch(
+            "models.unet.geometry_masked_attention_processor.F.scaled_dot_product_attention",
+            side_effect=cudnn_error,
+        ) as mock_sdpa:
+            output = processor._scaled_dot_product_attention(query, key, value, None)
+
+        self.assertEqual(mock_sdpa.call_count, 1)
+        self.assertTrue(torch.allclose(output, expected, atol=1e-5, rtol=1e-5))
 
 
 if __name__ == "__main__":

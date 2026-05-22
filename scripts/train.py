@@ -286,7 +286,7 @@ def main():
         help="Optional model revision/branch, e.g. fp16",
     )
     parser.add_argument(
-        "--mixed_precision", type=str, default="fp16",
+        "--mixed_precision", type=str, default="no",
         choices=["no", "fp16", "bf16"],
         help="Mixed precision mode for training",
     )
@@ -424,7 +424,7 @@ def main():
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
     args.device = str(_prefer_config(args.device, "cuda", _config_get(config, ("device",))))
     args.mixed_precision = str(
-        _prefer_config(args.mixed_precision, "fp16", _config_get(config, ("mixed_precision",)))
+        _prefer_config(args.mixed_precision, "no", _config_get(config, ("mixed_precision",)))
     )
     args.data_dir = str(
         _prefer_config(

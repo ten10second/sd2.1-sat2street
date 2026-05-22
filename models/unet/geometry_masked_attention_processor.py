@@ -12,6 +12,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel as torch_sdpa_kernel
+except ImportError:  # pragma: no cover - compatibility with older torch layouts
+    SDPBackend = Any
+    torch_sdpa_kernel = None
+
+try:
     from diffusers.models.attention_processor import Attention
 except ImportError:  # pragma: no cover - compatibility with older diffusers layouts
     Attention = Any
@@ -500,6 +506,69 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
             "timestep": timestep_value,
         }
 
+    @staticmethod
+    def _manual_scaled_dot_product_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        head_dim = query.shape[-1]
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(float(head_dim))
+        if attention_mask is not None:
+            scores = scores + attention_mask.to(device=scores.device, dtype=scores.dtype)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.matmul(probs, value)
+
+    def _scaled_dot_product_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        def _call_without_cudnn() -> torch.Tensor:
+            if torch_sdpa_kernel is not None:
+                with torch_sdpa_kernel(
+                    [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+                ):
+                    return F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attention_mask,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )
+
+            if hasattr(torch.backends.cuda, "sdp_kernel"):
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_math=True,
+                    enable_mem_efficient=True,
+                    enable_cudnn=False,
+                ):
+                    return F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attention_mask,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )
+
+            return self._manual_scaled_dot_product_attention(query, key, value, attention_mask)
+
+        try:
+            return _call_without_cudnn()
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            cudnn_plan_error = "cudnn frontend" in message or "no execution plans support the graph" in message
+            if not cudnn_plan_error:
+                raise
+
+            return self._manual_scaled_dot_product_attention(query, key, value, attention_mask)
+
     def __call__(
         self,
         attn: Attention,
@@ -588,13 +657,11 @@ class GeometryMaskedAttnProcessor2_0(nn.Module):
                     head_dim=head_dim,
                 )
 
-        hidden_states = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
+        hidden_states = self._scaled_dot_product_attention(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
         )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
