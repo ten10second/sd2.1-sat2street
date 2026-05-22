@@ -10,7 +10,7 @@ gradient_checkpointing: true
 data:
   dataset: 'kitti360'
   data_dir: '/mnt/shizhm/KITTI-360'
-  batch_size: 2
+  batch_size: 8
   num_workers: 8
   image_size: [256, 256]
   sat_size: 512
