@@ -6,6 +6,7 @@ from pathlib import Path
 _TRAIN_MODULE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "train.py"))
 _resolve_query_uv_config = _TRAIN_MODULE["_resolve_query_uv_config"]
 _resolve_query_geometry_bias_config = _TRAIN_MODULE["_resolve_query_geometry_bias_config"]
+_resolve_unet_attention_slicing_config = _TRAIN_MODULE["_resolve_unet_attention_slicing_config"]
 
 
 class TrainQueryUVGateConfigTest(unittest.TestCase):
@@ -33,3 +34,7 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(scale, 2.0)
         self.assertEqual(invalid_penalty, -1e4)
+
+    def test_unet_attention_slicing_defaults_to_disabled(self) -> None:
+        self.assertFalse(_resolve_unet_attention_slicing_config({}))
+        self.assertTrue(_resolve_unet_attention_slicing_config({"attention_slicing": True}))

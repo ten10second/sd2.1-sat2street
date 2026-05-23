@@ -239,6 +239,10 @@ def _resolve_query_geometry_bias_config(config: Dict[str, Any]) -> Tuple[bool, f
     return geometry_enabled, float(geometry_scale), float(invalid_penalty)
 
 
+def _resolve_unet_attention_slicing_config(config: Dict[str, Any]) -> bool:
+    return bool(_config_get(config, ("attention_slicing",), False))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Stable Diffusion for satellite-to-frontview generation"
@@ -569,6 +573,7 @@ def main():
 
     freeze_base = bool(_config_get(config, ("model", "freeze_base"), True))
     gradient_checkpointing = bool(_config_get(config, ("gradient_checkpointing",), True))
+    unet_attention_slicing = _resolve_unet_attention_slicing_config(config)
     weight_decay = float(_config_get(config, ("training", "weight_decay"), 1e-4))
     lr_scheduler_type = str(_config_get(config, ("training", "scheduler"), "cosine"))
     save_every = int(_config_get(config, ("checkpoint", "save_every"), 50))
@@ -738,10 +743,12 @@ def main():
         model.unet.enable_gradient_checkpointing()
         if is_main_process:
             logger.info("Enabled UNet gradient checkpointing")
-    if hasattr(model.unet, "set_attention_slice"):
+    if unet_attention_slicing and hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")
         if is_main_process:
             logger.info("Enabled UNet attention slicing")
+    elif is_main_process:
+        logger.info("UNet attention slicing disabled; using SDPA attention processors")
     if hasattr(model.vae, "enable_slicing"):
         model.vae.enable_slicing()
         if is_main_process:

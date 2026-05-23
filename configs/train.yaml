@@ -5,6 +5,7 @@ seed: 42
 device: 'cuda'
 mixed_precision: 'bf16'
 gradient_checkpointing: true
+attention_slicing: false
 
 # 数据配置
 data:
