@@ -256,6 +256,27 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertEqual(expanded[6].meta["vehicle_relative_yaw_deg_override"], 120.0)
         self.assertEqual(expanded[6].meta["view_name"], "yaw_p120")
 
+    def test_fixed_vehicle_yaw_expands_pitch_roll_only_for_virtual_views(self) -> None:
+        dataset = Kitti360dDataset.__new__(Kitti360dDataset)
+        dataset.vehicle_yaw_fixed_list = Kitti360dDataset._normalize_vehicle_yaw_fixed_list(
+            ["front", 90.0]
+        )
+        dataset.pitch_fixed_list = [-10.0, 0.0, 10.0]
+        dataset.roll_fixed_list = [0.0, 5.0]
+        base_samples = [SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=10, meta=None)]
+
+        expanded = dataset._expand_samples_for_fixed_vehicle_yaws(base_samples)
+
+        self.assertEqual(len(expanded), 7)
+        self.assertEqual(expanded[0].meta["mode_override"], "front")
+        self.assertNotIn("pitch_deg_override", expanded[0].meta)
+        self.assertNotIn("roll_deg_override", expanded[0].meta)
+        virtual_samples = expanded[1:]
+        self.assertEqual(
+            sorted((s.meta["pitch_deg_override"], s.meta["roll_deg_override"]) for s in virtual_samples),
+            [(-10.0, 0.0), (-10.0, 5.0), (0.0, 0.0), (0.0, 5.0), (10.0, 0.0), (10.0, 5.0)],
+        )
+
     def test_compute_sat_patch_perspective_uv_projects_ground_points(self) -> None:
         K, T_cam_to_world, T_imu_to_world = _identity_geometry()
         bev_coords = torch.tensor(
@@ -497,6 +518,42 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
                 "sat_perspective_uv": sat_perspective_uv,
                 "sat_perspective_valid": sat_perspective_valid,
             },
+        ).sample
+
+        self.assertEqual(output.shape, latents.shape)
+
+    def test_unet_pose_time_conditioning_runs_with_target_pose(self) -> None:
+        torch.manual_seed(0)
+        model = SatelliteConditionedUNet(
+            sample_size=8,
+            in_channels=4,
+            out_channels=4,
+            center_input_sample=False,
+            flip_sin_to_cos=True,
+            freq_shift=0,
+            down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(16, 32),
+            layers_per_block=1,
+            cross_attention_dim=16,
+            attention_head_dim=8,
+            norm_num_groups=8,
+            query_uv_pe_enabled=False,
+            query_geometry_bias_enabled=False,
+            pose_time_enabled=True,
+            pose_time_dim=8,
+            pose_time_gate_init=0.1,
+        )
+
+        self.assertTrue(model.pose_time_enabled)
+        self.assertIsNotNone(model.time_embedding.cond_proj)
+        latents = torch.randn(1, 4, 8, 8)
+        encoder_hidden_states = torch.randn(1, 4, 16)
+        output = model(
+            latents,
+            torch.tensor([0], dtype=torch.long),
+            encoder_hidden_states=encoder_hidden_states,
+            target_pose_ypr=torch.tensor([[90.0, 10.0, 5.0]], dtype=torch.float32),
         ).sample
 
         self.assertEqual(output.shape, latents.shape)

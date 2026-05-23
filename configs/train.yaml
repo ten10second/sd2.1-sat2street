@@ -25,6 +25,8 @@ data:
   front_sample_prob: 0.0
   pitch_deg: 0.0
   roll_deg: 0.0
+  pitch_fixed_list: [-10.0, 0.0, 10.0]
+  roll_fixed_list: [0.0]
   front_resize: [640, 256]
 
 # 模型配置
@@ -59,6 +61,12 @@ model:
     enable: false
     distance_scale: 2.0
     invalid_penalty: -10000.0
+
+  # Global camera pose conditioning through UNet timestep embedding.
+  pose_time_conditioning:
+    enable: true
+    dim: 128
+    gate_init: 0.1
 
 # 训练配置
 training:

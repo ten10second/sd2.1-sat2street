@@ -300,6 +300,9 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
         args.query_geometry_bias_enabled = False
         args.query_geometry_bias_scale = 2.0
         args.query_geometry_invalid_penalty = -1e4
+        args.pose_time_enabled = False
+        args.pose_time_dim = 128
+        args.pose_time_gate_init = 0.1
         return
 
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
@@ -346,6 +349,10 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
         invalid_penalty = -1e4
     args.query_geometry_bias_scale = float(geometry_scale)
     args.query_geometry_invalid_penalty = float(invalid_penalty)
+    pose_time_config = dict(_config_get(config, ("model", "pose_time_conditioning"), {}) or {})
+    args.pose_time_enabled = bool(pose_time_config.get("enable", False))
+    args.pose_time_dim = int(pose_time_config.get("dim", 128))
+    args.pose_time_gate_init = float(pose_time_config.get("gate_init", 0.1))
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -771,6 +778,16 @@ def _batched_camera_height(sample: Dict, device: str) -> Optional[torch.Tensor]:
     return tensor.to(device=device, dtype=torch.float32)
 
 
+def _batched_target_pose_ypr(sample: Dict, device: str) -> Optional[torch.Tensor]:
+    value = sample.get("target_pose_ypr")
+    if value is None:
+        return None
+    tensor = value if torch.is_tensor(value) else torch.as_tensor(value, dtype=torch.float32)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor.to(device=device, dtype=torch.float32)
+
+
 @torch.no_grad()
 def _materialize_lazy_modules(
     model,
@@ -787,6 +804,7 @@ def _materialize_lazy_modules(
     T_imu_to_world = sample.get("T_imu_to_world")
     T_imu_to_world = T_imu_to_world.unsqueeze(0).to(device) if T_imu_to_world is not None else None
     camera_height_m = _batched_camera_height(sample, device)
+    target_pose_ypr = _batched_target_pose_ypr(sample, device)
 
     sat_state = model.encode_satellite(
         sat_images,
@@ -821,6 +839,7 @@ def _materialize_lazy_modules(
             timestep,
             sat_tokens=sat_state.tokens,
             cross_attention_kwargs=cross_attention_kwargs,
+            target_pose_ypr=target_pose_ypr,
         )
 
 
@@ -843,6 +862,9 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         query_geometry_bias_enabled=getattr(args, "query_geometry_bias_enabled", False),
         query_geometry_bias_scale=getattr(args, "query_geometry_bias_scale", 2.0),
         query_geometry_invalid_penalty=getattr(args, "query_geometry_invalid_penalty", -1e4),
+        pose_time_enabled=getattr(args, "pose_time_enabled", False),
+        pose_time_dim=getattr(args, "pose_time_dim", 128),
+        pose_time_gate_init=getattr(args, "pose_time_gate_init", 0.1),
         satellite_encoder_config=getattr(args, "satellite_encoder_config", None),
     )
     if hasattr(model.unet, "set_attention_slice"):
@@ -878,6 +900,7 @@ def _generate_one(
     T_imu_to_world = sample.get("T_imu_to_world")
     T_imu_to_world = T_imu_to_world.unsqueeze(0).to(args.device) if T_imu_to_world is not None else None
     camera_height_m = _batched_camera_height(sample, args.device)
+    target_pose_ypr = _batched_target_pose_ypr(sample, args.device)
 
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
     generator = torch.Generator(device=generator_device)
@@ -900,6 +923,7 @@ def _generate_one(
             T_cam_to_world=T_cam_to_world,
             T_imu_to_world=T_imu_to_world,
             camera_height_m=camera_height_m,
+            target_pose_ypr=target_pose_ypr,
         )[0].cpu()
 
 

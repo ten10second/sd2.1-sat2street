@@ -69,6 +69,9 @@ def create_sd_model(
     query_geometry_bias_scale: float = 2.0,
     query_geometry_invalid_penalty: float = -1e4,
     query_uv_gate_init: float = 0.0,
+    pose_time_enabled: bool = False,
+    pose_time_dim: int = 128,
+    pose_time_gate_init: float = 0.1,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
     """Backward-compatible import surface for the clean perspective-PE model."""
@@ -86,6 +89,9 @@ def create_sd_model(
         query_geometry_bias_scale=query_geometry_bias_scale,
         query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
+        pose_time_enabled=pose_time_enabled,
+        pose_time_dim=pose_time_dim,
+        pose_time_gate_init=pose_time_gate_init,
         satellite_encoder_config=satellite_encoder_config,
     )
 
@@ -291,7 +297,7 @@ class SDTrainer:
 
     def _move_batch_geometry(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         geometry: Dict[str, torch.Tensor] = {}
-        for key in ("K", "T_cam_to_world", "T_imu_to_world", "camera_height_m"):
+        for key in ("K", "T_cam_to_world", "T_imu_to_world", "camera_height_m", "target_pose_ypr"):
             value = batch.get(key)
             if torch.is_tensor(value):
                 geometry[key] = value.to(self.device)
@@ -1298,6 +1304,8 @@ class SDTrainer:
             )
         else:
             result["front_ground_valid_mask"] = None
+        if all("target_pose_ypr" in item and torch.is_tensor(item["target_pose_ypr"]) for item in items):
+            result["target_pose_ypr"] = torch.stack([item["target_pose_ypr"] for item in items], dim=0)
         for cam_key in ("K", "T_cam_to_world", "T_imu_to_world"):
             if all(cam_key in item and torch.is_tensor(item[cam_key]) for item in items):
                 result[cam_key] = torch.stack([item[cam_key] for item in items], dim=0)
@@ -1312,6 +1320,7 @@ class SDTrainer:
         T_cam_to_world_chunks = []
         T_imu_to_world_chunks = []
         camera_height_chunks = []
+        target_pose_chunks = []
         frame_ids = []
         view_labels = []
         yaw_degs = []
@@ -1344,6 +1353,9 @@ class SDTrainer:
             camera_height = batch.get('camera_height_m')
             if torch.is_tensor(camera_height):
                 camera_height_chunks.append(camera_height[:take])
+            target_pose_ypr = batch.get('target_pose_ypr')
+            if torch.is_tensor(target_pose_ypr):
+                target_pose_chunks.append(target_pose_ypr[:take])
 
             batch_frame_ids = batch.get('frame_id')
             if batch_frame_ids is None:
@@ -1373,6 +1385,8 @@ class SDTrainer:
         }
         if camera_height_chunks:
             result["camera_height_m"] = torch.cat(camera_height_chunks, dim=0)
+        if target_pose_chunks:
+            result["target_pose_ypr"] = torch.cat(target_pose_chunks, dim=0)
         for cam_key, chunks in [
             ('K', K_chunks),
             ('T_cam_to_world', T_cam_to_world_chunks),
@@ -1424,6 +1438,9 @@ class SDTrainer:
         camera_height_m = visualization_batch.get("camera_height_m")
         if torch.is_tensor(camera_height_m):
             camera_height_m = camera_height_m.to(self.device)
+        target_pose_ypr = visualization_batch.get("target_pose_ypr")
+        if torch.is_tensor(target_pose_ypr):
+            target_pose_ypr = target_pose_ypr.to(self.device)
         target_size = (int(target_images.shape[2]), int(target_images.shape[3]))
 
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
@@ -1471,12 +1488,16 @@ class SDTrainer:
                     storage=attention_debug,
                 )
             try:
+                generate_kwargs = {}
+                if torch.is_tensor(target_pose_ypr):
+                    generate_kwargs["target_pose_ypr"] = target_pose_ypr[idx:idx + 1]
                 generated_view, _ = eval_model.generate_with_satellite_state(
                     view_sat_state,
                     target_size=tuple(target_images.shape[-2:]),
                     num_inference_steps=self.visualization_inference_steps,
                     guidance_scale=self.visualization_guidance_scale,
                     generator=generator,
+                    **generate_kwargs,
                 )
             finally:
                 if unet is not None and hasattr(unet, "disable_attention_debug"):

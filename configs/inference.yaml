@@ -48,6 +48,11 @@ model:
     distance_scale: 2.0
     invalid_penalty: -10000.0
 
+  pose_time_conditioning:
+    enable: true
+    dim: 128
+    gate_init: 0.1
+
 # 推理配置
 inference:
   # 去噪步数

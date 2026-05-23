@@ -371,10 +371,24 @@ def main():
         help="Virtual camera pitch in degrees for fisheye remap and BEV projection.",
     )
     parser.add_argument(
+        "--pitch_fixed_list",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Fixed virtual pitch list for fisheye views. Front image_00 samples stay unmodified.",
+    )
+    parser.add_argument(
         "--roll_deg",
         type=float,
         default=0.0,
         help="Virtual camera roll in degrees for fisheye remap and BEV projection.",
+    )
+    parser.add_argument(
+        "--roll_fixed_list",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Fixed virtual roll list for fisheye views. Front image_00 samples stay unmodified.",
     )
     parser.add_argument(
         "--guidance_scale", type=float, default=3.0,
@@ -542,7 +556,17 @@ def main():
         )
     )
     args.pitch_deg = float(_prefer_config(args.pitch_deg, 0.0, _config_get(config, ("data", "pitch_deg"))))
+    args.pitch_fixed_list = _prefer_config(
+        args.pitch_fixed_list,
+        None,
+        _config_get(config, ("data", "pitch_fixed_list")),
+    )
     args.roll_deg = float(_prefer_config(args.roll_deg, 0.0, _config_get(config, ("data", "roll_deg"))))
+    args.roll_fixed_list = _prefer_config(
+        args.roll_fixed_list,
+        None,
+        _config_get(config, ("data", "roll_fixed_list")),
+    )
     args.guidance_scale = float(
         _prefer_config(args.guidance_scale, 3.0, _config_get(config, ("validation", "guidance_scale")))
     )
@@ -579,6 +603,10 @@ def main():
     satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
     perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
+    pose_time_config = dict(_config_get(config, ("model", "pose_time_conditioning"), {}) or {})
+    pose_time_enabled = bool(pose_time_config.get("enable", False))
+    pose_time_dim = int(pose_time_config.get("dim", 128))
+    pose_time_gate_init = float(pose_time_config.get("gate_init", 0.1))
     query_uv_pe_enabled, query_uv_gate_init = _resolve_query_uv_config(config)
     query_geometry_bias_enabled, query_geometry_bias_scale, query_geometry_invalid_penalty = _resolve_query_geometry_bias_config(config)
 
@@ -636,6 +664,8 @@ def main():
         front_sample_prob=0.0,
         pitch_deg=args.pitch_deg,
         roll_deg=args.roll_deg,
+        pitch_fixed_list=args.pitch_fixed_list,
+        roll_fixed_list=args.roll_fixed_list,
         seed=args.seed,
         return_bgr=False,
     )
@@ -727,6 +757,9 @@ def main():
         query_geometry_bias_scale=query_geometry_bias_scale,
         query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
+        pose_time_enabled=pose_time_enabled,
+        pose_time_dim=pose_time_dim,
+        pose_time_gate_init=pose_time_gate_init,
         satellite_encoder_config=satellite_encoder_config,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":

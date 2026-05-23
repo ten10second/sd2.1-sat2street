@@ -291,6 +291,11 @@ def _vehicle_yaw_view_name(yaw_deg: float) -> str:
     return f"yaw_{prefix}{abs(float(yaw_deg)):g}".replace(".", "p")
 
 
+def _pose_angle_view_name(name: str, angle_deg: float) -> str:
+    prefix = "p" if angle_deg > 0 else "m" if angle_deg < 0 else ""
+    return f"{name}_{prefix}{abs(float(angle_deg)):g}".replace(".", "p")
+
+
 def compute_camera_bev_xy(
     K: np.ndarray,
     T_cam_to_world: np.ndarray,
@@ -485,6 +490,8 @@ class Kitti360dDataset(Dataset):
         # IPM correction angles (degrees)
         roll_deg: float = 0.0,  # Roll correction for IPM
         pitch_deg: float = 0.0,  # Pitch correction for IPM
+        pitch_fixed_list: Optional[List[float]] = None,
+        roll_fixed_list: Optional[List[float]] = None,
 
         # Reproducible per-item randomness (e.g. yaw sampling)
         seed: Optional[int] = None,
@@ -521,6 +528,14 @@ class Kitti360dDataset(Dataset):
         self.front_sample_prob = float(front_sample_prob)
         self.roll_deg = float(roll_deg)
         self.pitch_deg = float(pitch_deg)
+        self.pitch_fixed_list = self._normalize_float_fixed_list(
+            pitch_fixed_list,
+            default_value=self.pitch_deg,
+        )
+        self.roll_fixed_list = self._normalize_float_fixed_list(
+            roll_fixed_list,
+            default_value=self.roll_deg,
+        )
 
         # For reproducible randomness
         self.seed = seed
@@ -633,11 +648,24 @@ class Kitti360dDataset(Dataset):
             normalized.append(float(value))
         return normalized
 
+    @staticmethod
+    def _normalize_float_fixed_list(
+        values: Optional[List[float]],
+        *,
+        default_value: float,
+    ) -> List[float]:
+        if values is None:
+            return [float(default_value)]
+        normalized = [float(value) for value in values]
+        return normalized or [float(default_value)]
+
     def _expand_samples_for_fixed_vehicle_yaws(
         self,
         samples: List[SampleIndex],
     ) -> List[SampleIndex]:
         expanded: List[SampleIndex] = []
+        pitch_values = list(getattr(self, "pitch_fixed_list", [getattr(self, "pitch_deg", 0.0)]))
+        roll_values = list(getattr(self, "roll_fixed_list", [getattr(self, "roll_deg", 0.0)]))
         for sample in samples:
             base_meta = dict(sample.meta or {})
             for fixed_yaw in self.vehicle_yaw_fixed_list:
@@ -648,9 +676,27 @@ class Kitti360dDataset(Dataset):
                     meta.pop("vehicle_relative_yaw_deg_override", None)
                 else:
                     yaw = float(fixed_yaw)
-                    meta["mode_override"] = "fisheye_virtual"
-                    meta["view_name"] = _vehicle_yaw_view_name(yaw)
-                    meta["vehicle_relative_yaw_deg_override"] = yaw
+                    for pitch_deg in pitch_values:
+                        for roll_deg in roll_values:
+                            virtual_meta = dict(meta)
+                            virtual_meta["mode_override"] = "fisheye_virtual"
+                            view_name = _vehicle_yaw_view_name(yaw)
+                            if len(pitch_values) > 1 or abs(float(pitch_deg)) > 1e-6:
+                                view_name += "_" + _pose_angle_view_name("pitch", float(pitch_deg))
+                            if len(roll_values) > 1 or abs(float(roll_deg)) > 1e-6:
+                                view_name += "_" + _pose_angle_view_name("roll", float(roll_deg))
+                            virtual_meta["view_name"] = view_name
+                            virtual_meta["vehicle_relative_yaw_deg_override"] = yaw
+                            virtual_meta["pitch_deg_override"] = float(pitch_deg)
+                            virtual_meta["roll_deg_override"] = float(roll_deg)
+                            expanded.append(
+                                SampleIndex(
+                                    drive_dir=sample.drive_dir,
+                                    frame_id=sample.frame_id,
+                                    meta=virtual_meta,
+                                )
+                            )
+                    continue
                 expanded.append(
                     SampleIndex(
                         drive_dir=sample.drive_dir,
@@ -809,6 +855,8 @@ class Kitti360dDataset(Dataset):
         *,
         fisheye_camera: str,
         fisheye_relative_yaw_deg: float,
+        pitch_deg: float,
+        roll_deg: float,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[str]]:
         """Return (virtual_view_bgr, K_virtual, fisheye_relative_yaw_deg, camera_name_used)."""
         cam = fisheye_camera
@@ -828,8 +876,8 @@ class Kitti360dDataset(Dataset):
             img_bgr=img,
             calib_yaml=calib_yaml,
             fisheye_relative_yaw_deg=float(fisheye_relative_yaw_deg),
-            pitch_deg=self.pitch_deg,
-            roll_deg=self.roll_deg,
+            pitch_deg=float(pitch_deg),
+            roll_deg=float(roll_deg),
             hfov_deg=self.virtual_hfov_deg,
             out_w=self.virtual_w,
             out_h=self.virtual_h,
@@ -876,6 +924,8 @@ class Kitti360dDataset(Dataset):
             fisheye_camera_used = self.fisheye_camera
         fisheye_relative_yaw_used = meta.get("fisheye_relative_yaw_deg_override", self.fisheye_relative_yaw_deg)
         vehicle_yaw_used = meta.get("vehicle_relative_yaw_deg_override", self.vehicle_relative_yaw_deg)
+        pitch_deg_used = 0.0 if sample_mode == "front" else float(meta.get("pitch_deg_override", self.pitch_deg))
+        roll_deg_used = 0.0 if sample_mode == "front" else float(meta.get("roll_deg_override", self.roll_deg))
         if sample_mode == "front":
             if self.front_resize is not None:
                 w, h = self.front_resize
@@ -900,6 +950,14 @@ class Kitti360dDataset(Dataset):
             "T_imu_to_world": torch.eye(4, dtype=torch.float32),
             "T_cam0_to_world": torch.eye(4, dtype=torch.float32),
             "T_cam_to_world": torch.eye(4, dtype=torch.float32),
+            "target_pose_ypr": torch.tensor(
+                [
+                    float(vehicle_yaw_used) if vehicle_yaw_used is not None and sample_mode != "front" else 0.0,
+                    float(pitch_deg_used),
+                    float(roll_deg_used),
+                ],
+                dtype=torch.float32,
+            ),
             "frame_id": s.frame_id,
             "drive": s.drive_dir.name,
             "meta": {
@@ -915,6 +973,8 @@ class Kitti360dDataset(Dataset):
                 "vehicle_relative_yaw_deg": vehicle_yaw_used if sample_mode != "front" else None,
                 "vehicle_yaw_deg_used": vehicle_yaw_used if sample_mode != "front" else None,
                 "virtual_hfov_deg": self.virtual_hfov_deg,
+                "virtual_pitch_deg": float(pitch_deg_used),
+                "virtual_roll_deg": float(roll_deg_used),
                 "physical_camera": physical_camera,
                 "camera_height_m": camera_height_m,
                 "oxts_yaw": None,
@@ -960,6 +1020,12 @@ class Kitti360dDataset(Dataset):
             fisheye_relative_yaw_override_deg = s.meta.get("fisheye_relative_yaw_deg_override")
             vehicle_relative_yaw_override_deg = s.meta.get("vehicle_relative_yaw_deg_override")
             fisheye_camera_override = s.meta.get("fisheye_camera_override")
+        pitch_deg_item = 0.0 if sample_mode == "front" else float(
+            s.meta.get("pitch_deg_override", self.pitch_deg) if isinstance(s.meta, dict) else self.pitch_deg
+        )
+        roll_deg_item = 0.0 if sample_mode == "front" else float(
+            s.meta.get("roll_deg_override", self.roll_deg) if isinstance(s.meta, dict) else self.roll_deg
+        )
 
         fisheye_camera_item: Optional[str] = None
         vehicle_yaw_deg_item: Optional[float] = None
@@ -1068,6 +1134,8 @@ class Kitti360dDataset(Dataset):
                 frame_id,
                 fisheye_camera=cam_used,
                 fisheye_relative_yaw_deg=fisheye_relative_yaw_deg_item,
+                pitch_deg=pitch_deg_item,
+                roll_deg=roll_deg_item,
             )
 
             if img_bgr is None:
@@ -1081,8 +1149,8 @@ class Kitti360dDataset(Dataset):
                 "final_size": (self.virtual_w, self.virtual_h),
                 "fisheye_relative_yaw_deg": float(fisheye_yaw_used),
                 "vehicle_yaw_deg": float(vehicle_yaw_deg_item) if vehicle_yaw_deg_item is not None else None,
-                "virtual_pitch_deg": float(self.pitch_deg),
-                "virtual_roll_deg": float(self.roll_deg),
+                "virtual_pitch_deg": float(pitch_deg_item),
+                "virtual_roll_deg": float(roll_deg_item),
             }
 
             # remember which camera was used for this sample
@@ -1137,8 +1205,8 @@ class Kitti360dDataset(Dataset):
                     # rotation used by fisheye_to_virtual_perspective.
                     R_rectify = _make_virtual_rectify_rotation(
                         fisheye_yaw_used,
-                        pitch_deg=self.pitch_deg,
-                        roll_deg=self.roll_deg,
+                        pitch_deg=pitch_deg_item,
+                        roll_deg=roll_deg_item,
                     )
 
                     # The virtual camera's pose in the world is the physical camera's pose
@@ -1194,6 +1262,14 @@ class Kitti360dDataset(Dataset):
             "T_imu_to_world": T_imu_to_world_t,  # (4,4) imu->world, may be None if missing
             "T_cam0_to_world": T_cam0_to_world_t,  # (4,4) cam0(rectified)->world, may be None
             "T_cam_to_world": T_cam_to_world_t,
+            "target_pose_ypr": torch.tensor(
+                [
+                    float(vehicle_yaw_deg_item) if vehicle_yaw_deg_item is not None else 0.0,
+                    float(pitch_deg_item),
+                    float(roll_deg_item),
+                ],
+                dtype=torch.float32,
+            ),
             "frame_id": frame_id,
             "drive": drive_dir.name,
             "meta": {
@@ -1210,8 +1286,8 @@ class Kitti360dDataset(Dataset):
                 "vehicle_relative_yaw_deg": aug_meta.get("vehicle_yaw_deg"),
                 "vehicle_yaw_deg_used": aug_meta.get("vehicle_yaw_deg"),
                 "virtual_hfov_deg": self.virtual_hfov_deg,
-                "virtual_pitch_deg": float(self.pitch_deg),
-                "virtual_roll_deg": float(self.roll_deg),
+                "virtual_pitch_deg": float(pitch_deg_item),
+                "virtual_roll_deg": float(roll_deg_item),
                 "camera_height_m": camera_height_m,
                 "oxts_yaw": yaw,
                 "drive_dir": str(drive_dir),

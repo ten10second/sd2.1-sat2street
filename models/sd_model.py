@@ -48,6 +48,9 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         query_geometry_bias_scale: float = 2.0,
         query_geometry_invalid_penalty: float = -1e4,
         query_uv_gate_init: float = 0.0,
+        pose_time_enabled: bool = False,
+        pose_time_dim: int = 128,
+        pose_time_gate_init: float = 0.1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -56,6 +59,24 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.query_geometry_bias_scale = float(query_geometry_bias_scale)
         self.query_geometry_invalid_penalty = float(query_geometry_invalid_penalty)
         self.query_uv_gate_init = float(query_uv_gate_init)
+        self.pose_time_enabled = bool(pose_time_enabled)
+        self.pose_time_dim = int(pose_time_dim)
+        self.pose_time_gate_init = float(pose_time_gate_init)
+        if self.pose_time_enabled:
+            self.pose_time_mlp = nn.Sequential(
+                nn.Linear(6, self.pose_time_dim),
+                nn.SiLU(),
+                nn.Linear(self.pose_time_dim, self.pose_time_dim),
+            )
+            self.pose_time_gate = nn.Parameter(torch.tensor(self.pose_time_gate_init))
+            if getattr(self.time_embedding, "cond_proj", None) is not None:
+                raise ValueError("pose_time_enabled requires a UNet time_embedding without an existing cond_proj")
+            self.time_embedding.cond_proj = nn.Linear(
+                self.pose_time_dim,
+                int(self.time_embedding.linear_1.in_features),
+                bias=False,
+            )
+            nn.init.normal_(self.time_embedding.cond_proj.weight, mean=0.0, std=1e-4)
         self._install_query_uv_attention_processors()
 
     def _build_attention_processors(self):
@@ -131,7 +152,43 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             raise ValueError(f"query_base_hw must contain 2 values, got {query_base_hw}")
         return tuple(int(x) for x in query_base_hw)
 
-    def forward(self, *args, sat_tokens: Optional[torch.Tensor] = None, **kwargs):
+    @staticmethod
+    def _pose_ypr_to_features(pose_ypr: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        if pose_ypr.ndim == 1:
+            pose_ypr = pose_ypr.unsqueeze(0)
+        if pose_ypr.ndim != 2 or pose_ypr.shape[-1] != 3:
+            raise ValueError(f"target_pose_ypr must be [B,3], got {tuple(pose_ypr.shape)}")
+        radians = torch.deg2rad(pose_ypr.float())
+        return torch.cat([radians.sin(), radians.cos()], dim=-1).to(dtype=dtype)
+
+    def _build_pose_time_condition(
+        self,
+        sample: torch.Tensor,
+        target_pose_ypr: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        batch_size = int(sample.shape[0])
+        if target_pose_ypr is None:
+            pose_ypr = torch.zeros(batch_size, 3, device=sample.device, dtype=torch.float32)
+        else:
+            pose_ypr = target_pose_ypr.to(device=sample.device)
+            if pose_ypr.ndim == 1:
+                pose_ypr = pose_ypr.unsqueeze(0)
+            if pose_ypr.shape[0] == 1 and batch_size != 1:
+                pose_ypr = pose_ypr.expand(batch_size, -1)
+            if pose_ypr.shape[0] != batch_size:
+                raise ValueError(f"target_pose_ypr batch must be 1 or {batch_size}, got {pose_ypr.shape[0]}")
+        pose_features = self._pose_ypr_to_features(pose_ypr, dtype=sample.dtype)
+        pose_condition = self.pose_time_mlp(pose_features.to(dtype=self.pose_time_mlp[0].weight.dtype))
+        pose_condition = pose_condition.to(dtype=sample.dtype)
+        return self.pose_time_gate.to(dtype=sample.dtype) * pose_condition
+
+    def forward(
+        self,
+        *args,
+        sat_tokens: Optional[torch.Tensor] = None,
+        target_pose_ypr: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
         encoder_hidden_states = kwargs.pop("encoder_hidden_states", None)
         cross_attention_kwargs = kwargs.get("cross_attention_kwargs")
         if sat_tokens is not None:
@@ -149,6 +206,13 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 raise ValueError(
                     "query_geometry_bias_enabled requires cross_attention_kwargs['sat_perspective_uv']"
                 )
+        if self.pose_time_enabled:
+            if kwargs.get("timestep_cond") is not None:
+                raise ValueError("pose_time_enabled owns timestep_cond; pass target_pose_ypr instead")
+            sample = args[0] if args else kwargs.get("sample")
+            if sample is None:
+                raise ValueError("pose_time_enabled requires a UNet sample tensor")
+            kwargs["timestep_cond"] = self._build_pose_time_condition(sample, target_pose_ypr)
 
         # Diagnostic log (once per process)
         if not SatelliteConditionedUNet._logged_diag:
@@ -266,6 +330,8 @@ class SatelliteConditionedSDModel(nn.Module):
                     ".attn2.to_k." in name
                     or ".attn2.to_v." in name
                     or ".attn2.processor." in name
+                    or name.startswith("pose_time_")
+                    or name == "time_embedding.cond_proj.weight"
                 ):
                     param.requires_grad = True
                 else:
@@ -285,7 +351,12 @@ class SatelliteConditionedSDModel(nn.Module):
             f"  Trainable attn2 processor params: "
             f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and '.attn2.processor.' in n)}"
         )
+        logger.info(
+            f"  Pose-time params: "
+            f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and (n.startswith('pose_time_') or n == 'time_embedding.cond_proj.weight'))}"
+        )
         logger.info(f"  Perspective PE enabled: {self.perspective_pe_enabled}")
+        logger.info(f"  Pose-time enabled: {bool(getattr(self.unet, 'pose_time_enabled', False))}")
         logger.info(f"  Query UV PE enabled: {bool(getattr(self.unet, 'query_uv_pe_enabled', False))}")
         logger.info(f"  Query geometry bias enabled: {bool(getattr(self.unet, 'query_geometry_bias_enabled', False))}")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
@@ -434,6 +505,7 @@ class SatelliteConditionedSDModel(nn.Module):
         guidance_scale: float = 7.5,
         generator: Optional[torch.Generator] = None,
         sat_condition_mode: str = "normal",
+        target_pose_ypr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, SatelliteMemoryState]:
         """Generate images from a precomputed satellite memory state."""
         B = sat_state.tokens.shape[0]
@@ -486,20 +558,32 @@ class SatelliteConditionedSDModel(nn.Module):
             )
             if use_cfg:
                 latent_model_input = torch.cat([latents, latents], dim=0)
+                pose_kwargs = {}
+                if target_pose_ypr is not None or bool(getattr(self.unet, "pose_time_enabled", False)):
+                    pose_kwargs["target_pose_ypr"] = (
+                        torch.cat([target_pose_ypr, target_pose_ypr], dim=0)
+                        if target_pose_ypr is not None
+                        else None
+                    )
                 noise_pred_both = self.unet(
                     latent_model_input,
                     t,
                     sat_tokens=sat_state_double.tokens,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    **pose_kwargs,
                 ).sample
                 noise_pred_cond, noise_pred_uncond = noise_pred_both.chunk(2, dim=0)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
+                pose_kwargs = {}
+                if target_pose_ypr is not None or bool(getattr(self.unet, "pose_time_enabled", False)):
+                    pose_kwargs["target_pose_ypr"] = target_pose_ypr
                 noise_pred = self.unet(
                     latents,
                     t,
                     sat_tokens=sat_state.tokens,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    **pose_kwargs,
                 ).sample
 
             if generator is not None:
@@ -535,6 +619,7 @@ class SatelliteConditionedSDModel(nn.Module):
         T_cam_to_world: Optional[torch.Tensor] = None,
         T_imu_to_world: Optional[torch.Tensor] = None,
         camera_height_m: Optional[torch.Tensor] = None,
+        target_pose_ypr: Optional[torch.Tensor] = None,
         target_size: Optional[Tuple[int, int]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
@@ -556,6 +641,7 @@ class SatelliteConditionedSDModel(nn.Module):
             guidance_scale=guidance_scale,
             generator=generator,
             sat_condition_mode=sat_condition_mode,
+            target_pose_ypr=target_pose_ypr,
         )
         return generated_images
 
@@ -568,6 +654,7 @@ class SatelliteConditionedSDModel(nn.Module):
         T_cam_to_world: Optional[torch.Tensor] = None,
         T_imu_to_world: Optional[torch.Tensor] = None,
         camera_height_m: Optional[torch.Tensor] = None,
+        target_pose_ypr: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if target_images.ndim != 4:
             raise ValueError(
@@ -603,11 +690,15 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
         cross_attention_kwargs = self._build_cross_attention_kwargs(noisy_latents, conditioned_sat_state)
+        pose_kwargs = {}
+        if target_pose_ypr is not None or bool(getattr(self.unet, "pose_time_enabled", False)):
+            pose_kwargs["target_pose_ypr"] = target_pose_ypr
         model_pred = self.unet(
             noisy_latents,
             timesteps,
             sat_tokens=conditioned_sat_state.tokens,
             cross_attention_kwargs=cross_attention_kwargs,
+            **pose_kwargs,
         ).sample
 
         if self.noise_scheduler.config.prediction_type == "epsilon":
@@ -639,6 +730,9 @@ def create_sd_model(
     query_geometry_bias_scale: float = 2.0,
     query_geometry_invalid_penalty: float = -1e4,
     query_uv_gate_init: float = 0.0,
+    pose_time_enabled: bool = False,
+    pose_time_dim: int = 128,
+    pose_time_gate_init: float = 0.1,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> SatelliteConditionedSDModel:
     """Create a satellite-conditioned Stable Diffusion model."""
@@ -686,6 +780,9 @@ def create_sd_model(
         query_geometry_bias_scale=query_geometry_bias_scale,
         query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
+        pose_time_enabled=pose_time_enabled,
+        pose_time_dim=pose_time_dim,
+        pose_time_gate_init=pose_time_gate_init,
         **base_unet.config,
     )
     unet.load_state_dict(base_unet.state_dict(), strict=False)
