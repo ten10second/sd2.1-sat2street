@@ -229,7 +229,7 @@ def _resolve_query_uv_config(config: Dict[str, Any]) -> Tuple[bool, float]:
 
 def _resolve_query_geometry_bias_config(config: Dict[str, Any]) -> Tuple[bool, float, float]:
     geometry_config = dict(_config_get(config, ("model", "query_geometry_bias"), {}) or {})
-    geometry_enabled = bool(geometry_config.get("enable", True))
+    geometry_enabled = bool(geometry_config.get("enable", False))
     geometry_scale = geometry_config.get("distance_scale", 2.0)
     if geometry_scale is None:
         geometry_scale = 2.0

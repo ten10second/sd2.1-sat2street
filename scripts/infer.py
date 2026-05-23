@@ -297,7 +297,7 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
         args.satellite_encoder_config = {}
         args.perspective_pe_enabled = True
         args.query_uv_pe_enabled = False
-        args.query_geometry_bias_enabled = True
+        args.query_geometry_bias_enabled = False
         args.query_geometry_bias_scale = 2.0
         args.query_geometry_invalid_penalty = -1e4
         return
@@ -337,7 +337,7 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
     args.query_uv_pe_enabled = bool(query_pe_config.get("enable", False))
     geometry_config = dict(_config_get(config, ("model", "query_geometry_bias"), {}) or {})
-    args.query_geometry_bias_enabled = bool(geometry_config.get("enable", True))
+    args.query_geometry_bias_enabled = bool(geometry_config.get("enable", False))
     geometry_scale = geometry_config.get("distance_scale", 2.0)
     if geometry_scale is None:
         geometry_scale = 2.0
@@ -840,7 +840,7 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         cond_drop_prob=0.0,
         perspective_pe_enabled=getattr(args, "perspective_pe_enabled", True),
         query_uv_pe_enabled=getattr(args, "query_uv_pe_enabled", False),
-        query_geometry_bias_enabled=getattr(args, "query_geometry_bias_enabled", True),
+        query_geometry_bias_enabled=getattr(args, "query_geometry_bias_enabled", False),
         query_geometry_bias_scale=getattr(args, "query_geometry_bias_scale", 2.0),
         query_geometry_invalid_penalty=getattr(args, "query_geometry_invalid_penalty", -1e4),
         satellite_encoder_config=getattr(args, "satellite_encoder_config", None),

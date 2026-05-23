@@ -22,9 +22,9 @@ def main():
 
     device = args.device
 
-    # 1. Check LayerNorm weights in checkpoint
+    # 1. Check perspective PE weights in checkpoint
     print("=" * 60)
-    print("1. Checking checkpoint LayerNorm weights in perspective_pos_encoder")
+    print("1. Checking checkpoint perspective_pos_encoder weights")
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     state_dict = ckpt.get("model_state_dict", ckpt)
 
@@ -33,8 +33,8 @@ def main():
         print("  NO perspective_pos_encoder keys found in checkpoint!")
     for k in sorted(pe_keys):
         w = state_dict[k]
-        is_layer_norm_weight = "mlp.1.weight" in k or "mlp.4.weight" in k
-        is_layer_norm_bias = "mlp.1.bias" in k or "mlp.4.bias" in k
+        is_layer_norm_weight = "fourier_norm.weight" in k or "mlp.1.weight" in k or "mlp.4.weight" in k
+        is_layer_norm_bias = "fourier_norm.bias" in k or "mlp.1.bias" in k or "mlp.4.bias" in k
         marker = ""
         if is_layer_norm_weight:
             diff_from_ones = (w - 1.0).abs().max().item()
@@ -42,13 +42,19 @@ def main():
         elif is_layer_norm_bias:
             diff_from_zero = w.abs().max().item()
             marker = f"  ← LayerNorm bias, max|b|={diff_from_zero:.8f}"
+        elif "fourier_linear.weight" in k:
+            marker = "  <- Fourier Linear"
+        elif "ooi_token" in k:
+            marker = "  <- out-of-image token"
         print(f"  {k}: shape={tuple(w.shape)}, mean={w.float().mean():.6f}, std={w.float().std():.6f}{marker}")
 
     # Also check other MLP layers
     print()
     for k in sorted(pe_keys):
         w = state_dict[k]
-        if "mlp.0.weight" in k:
+        if "fourier_linear.weight" in k:
+            print(f"  {k}: mean={w.float().mean():.6f}, std={w.float().std():.6f}  <- Linear(Fourier->D)")
+        elif "mlp.0.weight" in k:
             print(f"  {k}: mean={w.float().mean():.6f}, std={w.float().std():.6f}  ← Linear(2→D)")
         elif "mlp.3.weight" in k:
             print(f"  {k}: mean={w.float().mean():.6f}, std={w.float().std():.6f}  ← Linear(D→D)")

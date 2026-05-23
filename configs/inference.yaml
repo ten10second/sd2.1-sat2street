@@ -31,6 +31,8 @@ model:
     patch_size: 16
     sat_resolution: 0.2
     sat_size: 512
+    perspective_num_freqs: 6
+    perspective_pe_gate_init: 0.1
 
   # Perspective position encoding for satellite tokens
   perspective_position_encoding:
@@ -42,7 +44,7 @@ model:
 
   # Direct geometry bias on cross-attention scores
   query_geometry_bias:
-    enable: true
+    enable: false
     distance_scale: 2.0
     invalid_penalty: -10000.0
 

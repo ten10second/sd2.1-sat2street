@@ -43,7 +43,7 @@ def check_gate_values(state_dict: dict) -> None:
 
 
 def check_perspective_pe(state_dict: dict) -> None:
-    """Check perspective_pos_encoder MLP weights."""
+    """Check perspective_pos_encoder weights."""
     _section("2. Perspective Position Encoder weights")
 
     pe_keys = sorted([k for k in state_dict if "perspective_pos_encoder" in k])
@@ -54,7 +54,17 @@ def check_perspective_pe(state_dict: dict) -> None:
     for k in pe_keys:
         w = state_dict[k]
         tag = ""
-        if "mlp.1.weight" in k or "mlp.4.weight" in k:
+        if "fourier_norm.weight" in k:
+            d = (w - 1.0).abs().max().item()
+            tag = f"<- Fourier LN weight, max|w-1|={d:.6f} {'NOT LEARNING' if d < 1e-6 else 'ok'}"
+        elif "fourier_norm.bias" in k:
+            d = w.abs().max().item()
+            tag = f"<- Fourier LN bias, max|b|={d:.6f} {'NOT LEARNING' if d < 1e-6 else 'ok'}"
+        elif "fourier_linear.weight" in k:
+            tag = f"<- Fourier Linear, mean={w.float().mean():.4f} std={w.float().std():.4f}"
+        elif "ooi_token" in k:
+            tag = f"<- OOI token, max_abs={w.abs().max().item():.6f}"
+        elif "mlp.1.weight" in k or "mlp.4.weight" in k:
             d = (w - 1.0).abs().max().item()
             tag = f"← LN weight, max|w-1|={d:.6f} {'⚠️ NOT LEARNING' if d < 1e-6 else '✓'}"
         elif "mlp.1.bias" in k or "mlp.4.bias" in k:
@@ -66,13 +76,18 @@ def check_perspective_pe(state_dict: dict) -> None:
 
 
 def check_self_attn(state_dict: dict) -> None:
-    """Check satellite encoder self-attention out_proj (zero-init)."""
-    _section("3. Satellite Encoder Self-Attention out_proj (zero-init → should grow)")
+    """Check satellite encoder 2D-RoPE self-attention weights."""
+    _section("3. Satellite Encoder 2D-RoPE Self-Attention weights")
 
     out_proj_keys = sorted([
         k for k in state_dict
         if "satellite_encoder.self_attn.layers" in k
-        and ("out_proj" in k or "linear2" in k)
+        and (
+            "self_attn.qkv" in k
+            or "self_attn.out_proj" in k
+            or "mlp.3" in k
+            or "linear2" in k
+        )
     ])
     if not out_proj_keys:
         print("  No self_attn out_proj keys found.")
@@ -91,13 +106,17 @@ def check_self_attn(state_dict: dict) -> None:
         print("  ⚠️  Self-attention is effectively identity — sat patches don't share info.")
 
 
-def check_grid_pos_embed(state_dict: dict) -> None:
-    """Check if learnable grid position embedding has changed from init."""
-    _section("4. Grid Position Embedding")
+def check_satellite_spatial_encoding(state_dict: dict) -> None:
+    """Check satellite spatial encoding state."""
+    _section("4. Satellite Spatial Encoding")
 
     key = "satellite_encoder.grid_pos_embed"
     if key not in state_dict:
-        print(f"  Key '{key}' not found.")
+        print("  No learned grid_pos_embed found. This is expected for the 2D-RoPE encoder.")
+        gate_key = "satellite_encoder.perspective_pe_gate"
+        if gate_key in state_dict:
+            gate_val = float(state_dict[gate_key].detach().cpu())
+            print(f"  {gate_key}: {gate_val:.6f}")
         return
 
     w = state_dict[key]
@@ -139,7 +158,6 @@ def check_sat_tokens_on_data(checkpoint_path: str, data_dir: str, device: str) -
     print("  Loading model...")
     model = create_sd_model(
         query_uv_pe_enabled=False,
-        query_geometry_bias_enabled=True,
         query_uv_gate_init=0.0,
     )
     load_model_checkpoint(model, Path(checkpoint_path), device)
@@ -225,7 +243,7 @@ def main():
     check_gate_values(state_dict)
     check_perspective_pe(state_dict)
     check_self_attn(state_dict)
-    check_grid_pos_embed(state_dict)
+    check_satellite_spatial_encoding(state_dict)
     check_attn2_kv(state_dict)
 
     # 6: Runtime checks (need model + data)

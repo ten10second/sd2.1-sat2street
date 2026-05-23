@@ -156,10 +156,10 @@ class PerspectivePositionEncoder(nn.Module):
     Args:
         dim: output embedding dimension (default 768).
         num_freqs: number of octave frequency bands per coordinate
-                   (default 12 → fourier_dim = 2 coords × (sin+cos) × 12 = 48).
+                   (default 6 -> fourier_dim = 2 coords x (sin+cos) x 6 = 24).
     """
 
-    def __init__(self, dim: int = 768, num_freqs: int = 12):
+    def __init__(self, dim: int = 768, num_freqs: int = 6):
         super().__init__()
         self.num_freqs = int(num_freqs)
         fourier_dim = 4 * self.num_freqs  # 2 coords × (sin + cos) per freq
@@ -176,7 +176,7 @@ class PerspectivePositionEncoder(nn.Module):
             num_freqs: number of octave frequency bands.
 
         Returns:
-            (…, 4·num_freqs) where the last dim is
+            (..., 4 * num_freqs) where the last dim is
             [sin(u·f), cos(u·f), sin(v·f), cos(v·f), …]
             with f ∈ {2⁰π, 2¹π, …, 2^(num_freqs-1)·π}.
         """

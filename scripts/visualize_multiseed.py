@@ -398,7 +398,6 @@ def main() -> None:
         cond_drop_prob=0.0,
         perspective_pe_enabled=True,
         query_uv_pe_enabled=False,
-        query_geometry_bias_enabled=True,
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")

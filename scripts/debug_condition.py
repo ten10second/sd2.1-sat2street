@@ -33,7 +33,6 @@ def main():
         torch_dtype=torch.float32,
         perspective_pe_enabled=True,
         query_uv_pe_enabled=False,
-        query_geometry_bias_enabled=True,
     )
     model = model.to(device)
 

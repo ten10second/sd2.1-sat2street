@@ -28,8 +28,8 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(gate_init, 0.25)
 
-    def test_geometry_bias_defaults_to_enabled(self) -> None:
+    def test_geometry_bias_defaults_to_disabled(self) -> None:
         enabled, scale, invalid_penalty = _resolve_query_geometry_bias_config({})
-        self.assertTrue(enabled)
+        self.assertFalse(enabled)
         self.assertEqual(scale, 2.0)
         self.assertEqual(invalid_penalty, -1e4)

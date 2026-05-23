@@ -65,7 +65,7 @@ def create_sd_model(
     cond_drop_prob: float = 0.1,
     perspective_pe_enabled: bool = True,
     query_uv_pe_enabled: bool = False,
-    query_geometry_bias_enabled: bool = True,
+    query_geometry_bias_enabled: bool = False,
     query_geometry_bias_scale: float = 2.0,
     query_geometry_invalid_penalty: float = -1e4,
     query_uv_gate_init: float = 0.0,

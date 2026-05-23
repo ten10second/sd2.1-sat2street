@@ -1,4 +1,4 @@
-"""Satellite image condition encoder with ground-plane perspective PE."""
+"""Satellite image condition encoder with 2D RoPE self-attention and perspective PE."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.conditioning import SatelliteMemoryState
 
@@ -15,8 +16,152 @@ from .perspective_position_encoder import (
 )
 
 
+def _apply_1d_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embedding to the last dim of ``x`` using per-token positions."""
+    dim = x.shape[-1]
+    if dim % 2 != 0:
+        raise ValueError(f"RoPE dimension must be even, got {dim}")
+
+    half_dim = dim // 2
+    inv_freq = 1.0 / (
+        10000.0
+        ** (torch.arange(0, half_dim, device=x.device, dtype=torch.float32) / max(half_dim, 1))
+    )
+    angles = positions.to(device=x.device, dtype=torch.float32).unsqueeze(-1) * inv_freq
+    cos = angles.cos().to(dtype=x.dtype).view(1, 1, -1, half_dim)
+    sin = angles.sin().to(dtype=x.dtype).view(1, 1, -1, half_dim)
+
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    return torch.stack(
+        (
+            x_even * cos - x_odd * sin,
+            x_even * sin + x_odd * cos,
+        ),
+        dim=-1,
+    ).flatten(-2)
+
+
+def apply_2d_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    grid_hw: Tuple[int, int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply separable 2D RoPE to query/key tensors shaped [B, heads, N, head_dim]."""
+    head_dim = query.shape[-1]
+    if head_dim % 4 != 0:
+        raise ValueError(
+            "2D RoPE requires attention head_dim divisible by 4, "
+            f"got head_dim={head_dim}"
+        )
+
+    grid_h, grid_w = int(grid_hw[0]), int(grid_hw[1])
+    expected_tokens = grid_h * grid_w
+    if query.shape[2] != expected_tokens:
+        raise ValueError(
+            f"2D RoPE token count mismatch: got {query.shape[2]}, expected {expected_tokens}"
+        )
+
+    rows = torch.arange(grid_h, device=query.device, dtype=torch.float32)
+    cols = torch.arange(grid_w, device=query.device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(rows, cols, indexing="ij")
+    row_pos = yy.reshape(-1)
+    col_pos = xx.reshape(-1)
+
+    split = head_dim // 2
+    q_x, q_y = query[..., :split], query[..., split:]
+    k_x, k_y = key[..., :split], key[..., split:]
+    return (
+        torch.cat([_apply_1d_rope(q_x, col_pos), _apply_1d_rope(q_y, row_pos)], dim=-1),
+        torch.cat([_apply_1d_rope(k_x, col_pos), _apply_1d_rope(k_y, row_pos)], dim=-1),
+    )
+
+
+class RoPESelfAttention(nn.Module):
+    """Multi-head satellite self-attention with 2D RoPE applied to q/k."""
+
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        if self.dim % self.num_heads != 0:
+            raise ValueError(f"embed_dim={self.dim} must be divisible by num_heads={self.num_heads}")
+        self.head_dim = self.dim // self.num_heads
+        if self.head_dim % 4 != 0:
+            raise ValueError(
+                "2D RoPE requires embed_dim / num_heads divisible by 4, "
+                f"got {self.head_dim}"
+            )
+
+        self.qkv = nn.Linear(self.dim, 3 * self.dim)
+        self.out_proj = nn.Linear(self.dim, self.dim)
+        self.dropout = float(dropout)
+
+    def forward(self, hidden_states: torch.Tensor, *, grid_hw: Tuple[int, int]) -> torch.Tensor:
+        batch_size, num_tokens, _ = hidden_states.shape
+        qkv = self.qkv(hidden_states)
+        qkv = qkv.view(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        query, key, value = qkv.unbind(dim=0)
+        query, key = apply_2d_rope(query, key, grid_hw=grid_hw)
+
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        attended = attended.transpose(1, 2).reshape(batch_size, num_tokens, self.dim)
+        return self.out_proj(attended)
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """Norm-first transformer encoder layer using 2D RoPE self-attention."""
+
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.self_attn = RoPESelfAttention(dim=dim, num_heads=num_heads, dropout=dropout)
+        self.dropout1 = nn.Dropout(float(dropout))
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(4 * dim, dim),
+        )
+        self.dropout2 = nn.Dropout(float(dropout))
+
+    def forward(self, hidden_states: torch.Tensor, *, grid_hw: Tuple[int, int]) -> torch.Tensor:
+        hidden_states = hidden_states + self.dropout1(
+            self.self_attn(self.norm1(hidden_states), grid_hw=grid_hw)
+        )
+        hidden_states = hidden_states + self.dropout2(self.mlp(self.norm2(hidden_states)))
+        return hidden_states
+
+
+class RoPETransformerEncoder(nn.Module):
+    """Stack of satellite self-attention layers with 2D RoPE spatial structure."""
+
+    def __init__(self, dim: int, num_heads: int, num_layers: int, dropout: float = 0.0):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                RoPETransformerEncoderLayer(dim=dim, num_heads=num_heads, dropout=dropout)
+                for _ in range(int(num_layers))
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor, *, grid_hw: Tuple[int, int]) -> torch.Tensor:
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, grid_hw=grid_hw)
+        return hidden_states
+
+
 class SatelliteConditionEncoder(nn.Module):
-    """Encode satellite patches with grid PE, perspective PE, and self-attention."""
+    """Encode satellite patches with 2D RoPE self-attention and gated perspective PE."""
 
     def __init__(
         self,
@@ -25,6 +170,8 @@ class SatelliteConditionEncoder(nn.Module):
         sat_resolution: float = 0.2,
         sat_size: int = 512,
         perspective_pe_enabled: bool = True,
+        perspective_num_freqs: int = 6,
+        perspective_pe_gate_init: float = 0.1,
         num_heads: int = 12,
         num_layers: int = 4,
         attn_dropout: float = 0.1,
@@ -35,11 +182,9 @@ class SatelliteConditionEncoder(nn.Module):
         self.sat_resolution = float(sat_resolution)
         self.sat_size = int(sat_size)
         self.perspective_pe_enabled = bool(perspective_pe_enabled)
+        self.perspective_num_freqs = int(perspective_num_freqs)
         self.num_heads = int(num_heads)
         self.num_layers = int(num_layers)
-
-        self.grid_size = self.sat_size // self.patch_size
-        self.grid_num_patches = self.grid_size ** 2
 
         self.patch_embed = nn.Conv2d(
             in_channels=3,
@@ -49,27 +194,18 @@ class SatelliteConditionEncoder(nn.Module):
             padding=0,
         )
 
-        # Learnable grid position embedding (row-major order)
-        self.grid_pos_embed = nn.Parameter(
-            torch.zeros(1, self.grid_num_patches, self.embed_dim)
+        self.perspective_pos_encoder = PerspectivePositionEncoder(
+            dim=self.embed_dim,
+            num_freqs=self.perspective_num_freqs,
         )
-        nn.init.trunc_normal_(self.grid_pos_embed, std=0.02)
-
-        self.perspective_pos_encoder = PerspectivePositionEncoder(dim=self.embed_dim)
+        self.perspective_pe_gate = nn.Parameter(torch.tensor(float(perspective_pe_gate_init)))
         self.token_norm = nn.LayerNorm(self.embed_dim)
 
-        # Self-attention layers
-        self.self_attn = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=self.embed_dim,
-                nhead=self.num_heads,
-                dim_feedforward=4 * self.embed_dim,
-                dropout=float(attn_dropout),
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            ),
+        self.self_attn = RoPETransformerEncoder(
+            dim=self.embed_dim,
+            num_heads=self.num_heads,
             num_layers=self.num_layers,
+            dropout=float(attn_dropout),
         )
         self.attn_norm = nn.LayerNorm(self.embed_dim)
 
@@ -141,18 +277,19 @@ class SatelliteConditionEncoder(nn.Module):
         device = sat_images.device
 
         patches = self.patch_embed(sat_images)
+        patch_h, patch_w = int(patches.shape[2]), int(patches.shape[3])
         tokens = patches.permute(0, 2, 3, 1).reshape(B, -1, self.embed_dim)
         tokens = self.token_norm(tokens)
-
-        # Add learnable grid position embedding
-        grid_pe = self.grid_pos_embed[:, : tokens.shape[1], :].to(device=device, dtype=tokens.dtype)
-        tokens = tokens + grid_pe
 
         bev_coords = self._compute_patch_bev_coords(B, H, W).to(device=device, dtype=sat_images.dtype)
         sat_xy = self._compute_patch_normalized_coords(B, H, W).to(device=device, dtype=sat_images.dtype)
 
         perspective_uv = None
         perspective_valid = None
+
+        tokens = self.self_attn(tokens, grid_hw=(patch_h, patch_w))
+        tokens = self.attn_norm(tokens)
+
         if self.perspective_pe_enabled:
             self._validate_geometry(K, T_cam_to_world, T_imu_to_world, camera_height_m, image_size)
             image_h, image_w = int(image_size[0]), int(image_size[1])
@@ -168,7 +305,8 @@ class SatelliteConditionEncoder(nn.Module):
                 image_w=image_w,
                 image_h=image_h,
             )
-            tokens = tokens + self.perspective_pos_encoder(perspective_uv, perspective_valid)
+            perspective_pe = self.perspective_pos_encoder(perspective_uv, perspective_valid)
+            tokens = tokens + self.perspective_pe_gate.to(dtype=tokens.dtype) * perspective_pe
         elif (
             K is not None
             and T_cam_to_world is not None
@@ -186,10 +324,6 @@ class SatelliteConditionEncoder(nn.Module):
                 image_w=image_w,
                 image_h=image_h,
             )
-
-        # Self-attention among satellite patches
-        tokens = tokens + self.self_attn(tokens)
-        tokens = self.attn_norm(tokens)
 
         return SatelliteMemoryState(
             tokens=tokens,

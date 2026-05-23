@@ -358,7 +358,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertIsNone(processor.query_uv_encoder)
         self.assertIsNone(processor.query_uv_gate)
 
-    def test_query_uv_attn_processor_uses_two_layer_coord_mlp(self) -> None:
+    def test_query_uv_attn_processor_uses_fourier_coord_encoder(self) -> None:
         from models.encoders.perspective_position_encoder import PerspectivePositionEncoder
         from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
 
@@ -369,14 +369,14 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         )
 
         self.assertIsInstance(processor.query_uv_encoder, PerspectivePositionEncoder)
-        self.assertEqual(len(processor.query_uv_encoder.mlp), 5)
-        self.assertIsInstance(processor.query_uv_encoder.mlp[0], nn.Linear)
-        self.assertIsInstance(processor.query_uv_encoder.mlp[1], nn.LayerNorm)
-        self.assertIsInstance(processor.query_uv_encoder.mlp[2], nn.GELU)
-        self.assertIsInstance(processor.query_uv_encoder.mlp[3], nn.Linear)
-        self.assertIsInstance(processor.query_uv_encoder.mlp[4], nn.LayerNorm)
+        self.assertEqual(processor.query_uv_encoder.num_freqs, 6)
+        self.assertIsInstance(processor.query_uv_encoder.fourier_linear, nn.Linear)
+        self.assertEqual(processor.query_uv_encoder.fourier_linear.in_features, 24)
+        self.assertEqual(processor.query_uv_encoder.fourier_linear.out_features, 16)
+        self.assertIsInstance(processor.query_uv_encoder.fourier_norm, nn.LayerNorm)
+        self.assertEqual(processor.query_uv_encoder.ooi_token.shape, (16,))
 
-    def test_satellite_condition_encoder_self_attention_is_not_zero_initialized(self) -> None:
+    def test_satellite_condition_encoder_uses_rope_self_attention(self) -> None:
         encoder = SatelliteConditionEncoder(
             embed_dim=32,
             patch_size=4,
@@ -388,9 +388,12 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             attn_dropout=0.0,
         )
 
+        self.assertFalse(hasattr(encoder, "grid_pos_embed"))
         layer0 = encoder.self_attn.layers[0]
+        self.assertEqual(layer0.self_attn.head_dim, 8)
+        self.assertGreater(layer0.self_attn.qkv.weight.abs().max().item(), 0.0)
         self.assertGreater(layer0.self_attn.out_proj.weight.abs().max().item(), 0.0)
-        self.assertGreater(layer0.linear2.weight.abs().max().item(), 0.0)
+        self.assertGreater(layer0.mlp[3].weight.abs().max().item(), 0.0)
 
     def test_query_uv_sliced_attn_processor_preserves_query_base_hw(self) -> None:
         torch.manual_seed(0)
