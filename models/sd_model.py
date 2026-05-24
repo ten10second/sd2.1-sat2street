@@ -170,25 +170,11 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         )
 
 
-def _is_query_uv_processor_state_key(key: str) -> bool:
-    return ".attn2.processor.query_uv_" in str(key)
-
-
 def load_model_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
-    *,
-    allow_missing_query_uv_processor: bool = False,
 ) -> Tuple[Sequence[str], Sequence[str]]:
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if allow_missing_query_uv_processor:
-        allowed_missing = [key for key in missing_keys if _is_query_uv_processor_state_key(key)]
-        missing_keys = [key for key in missing_keys if not _is_query_uv_processor_state_key(key)]
-        if allowed_missing:
-            logger.info(
-                "Initialized %d query-UV processor parameter(s) from current config because they are absent in checkpoint",
-                len(allowed_missing),
-            )
     if missing_keys:
         raise RuntimeError(f"Missing keys when loading checkpoint: {missing_keys}")
     if unexpected_keys:
@@ -200,16 +186,10 @@ def load_model_checkpoint(
     model: nn.Module,
     checkpoint_path: Path,
     device: str,
-    *,
-    allow_missing_query_uv_processor: bool = False,
 ) -> Dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-    load_model_state_dict(
-        model,
-        state_dict,
-        allow_missing_query_uv_processor=allow_missing_query_uv_processor,
-    )
+    load_model_state_dict(model, state_dict)
     return checkpoint if isinstance(checkpoint, dict) else {}
 
 

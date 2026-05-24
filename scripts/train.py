@@ -797,7 +797,6 @@ def main():
             trainer.unwrapped_model,
             Path(args.init_checkpoint),
             args.device,
-            allow_missing_query_uv_processor=True,
         )
 
     # Start training
