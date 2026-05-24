@@ -13,7 +13,7 @@ from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
 from models.conditioning import SatelliteMemoryState
 from models.encoders.perspective_position_encoder import compute_sat_patch_perspective_uv
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
-from models.sd_model import SatelliteConditionedSDModel, SatelliteConditionedUNet
+from models.sd_model import SatelliteConditionedSDModel, SatelliteConditionedUNet, load_model_state_dict
 from models.sd_trainer import SDTrainer
 from models.unet.query_uv_attn_processor import (
     QueryUVSlicedAttnProcessor,
@@ -452,6 +452,44 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         ).sample
 
         self.assertEqual(output.shape, latents.shape)
+
+    def test_query_uv_init_checkpoint_can_omit_new_processor_params(self) -> None:
+        torch.manual_seed(0)
+        model = SatelliteConditionedUNet(
+            sample_size=8,
+            in_channels=4,
+            out_channels=4,
+            center_input_sample=False,
+            flip_sin_to_cos=True,
+            freq_shift=0,
+            down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(16, 32),
+            layers_per_block=1,
+            cross_attention_dim=16,
+            attention_head_dim=8,
+            norm_num_groups=8,
+            query_uv_pe_enabled=True,
+            query_uv_gate_init=0.05,
+            query_geometry_bias_enabled=False,
+        )
+        checkpoint_state = {
+            key: value.clone()
+            for key, value in model.state_dict().items()
+            if ".attn2.processor.query_uv_" not in key
+        }
+
+        missing, unexpected = load_model_state_dict(
+            model,
+            checkpoint_state,
+            allow_missing_query_uv_processor=True,
+        )
+
+        self.assertEqual(missing, [])
+        self.assertEqual(unexpected, [])
+        self.assertTrue(
+            any(".attn2.processor.query_uv_gate" in key for key in model.state_dict())
+        )
 
     def test_unet_geometry_bias_runs_without_query_uv_pe_under_attention_slicing(self) -> None:
         torch.manual_seed(0)

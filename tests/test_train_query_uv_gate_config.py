@@ -13,7 +13,7 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
     def test_defaults_to_disabled_query_uv_gate(self) -> None:
         enabled, gate_init = _resolve_query_uv_config({})
         self.assertFalse(enabled)
-        self.assertEqual(gate_init, 1.0)
+        self.assertEqual(gate_init, 0.05)
 
     def test_reads_explicit_gate_init(self) -> None:
         enabled, gate_init = _resolve_query_uv_config(

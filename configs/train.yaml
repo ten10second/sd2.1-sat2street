@@ -52,8 +52,8 @@ model:
 
   # Query-side UV positional encoding for UNet cross-attention
   query_position_encoding:
-    enable: false
-    gate_init: 1.0
+    enable: true
+    gate_init: 0.05
 
   # Direct geometry bias on cross-attention scores
   query_geometry_bias:

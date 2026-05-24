@@ -221,9 +221,9 @@ def _configure_logging(log_dir: Path) -> None:
 def _resolve_query_uv_config(config: Dict[str, Any]) -> Tuple[bool, float]:
     query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
     query_uv_pe_enabled = bool(query_pe_config.get("enable", False))
-    query_uv_gate_init = query_pe_config.get("gate_init", 1.0)
+    query_uv_gate_init = query_pe_config.get("gate_init", 0.05)
     if query_uv_gate_init is None:
-        query_uv_gate_init = 1.0
+        query_uv_gate_init = 0.05
     return query_uv_pe_enabled, float(query_uv_gate_init)
 
 
@@ -797,6 +797,7 @@ def main():
             trainer.unwrapped_model,
             Path(args.init_checkpoint),
             args.device,
+            allow_missing_query_uv_processor=True,
         )
 
     # Start training
