@@ -371,6 +371,11 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertEqual(len(attention_alignment["losses"]), 1)
         self.assertEqual(len(attention_alignment["metrics"]), 1)
         self.assertTrue(torch.is_tensor(attention_alignment["losses"][0]))
+        metric = attention_alignment["metrics"][0]
+        self.assertIn("target_attention_mass", metric)
+        self.assertIn("target_token_fraction", metric)
+        self.assertIn("nearest_attention_mass", metric)
+        self.assertIn("target_logit_gap", metric)
         self.assertIn(layer_name, attention_alignment["debug_storage"])
         payload = attention_alignment["debug_storage"][layer_name]
         self.assertEqual(payload["attention"].shape, (1, 4, 4))

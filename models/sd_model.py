@@ -499,7 +499,21 @@ class SatelliteConditionedSDModel(nn.Module):
             for entry in attention_alignment.get("metrics", [])
             if isinstance(entry, dict)
         ]
-        for metric_name in ("mean_error", "valid_query_ratio", "valid_attention_mass"):
+        for metric_name in (
+            "mean_error",
+            "valid_query_ratio",
+            "valid_attention_mass",
+            "target_attention_mass",
+            "target_token_fraction",
+            "target_attention_lift",
+            "nearest_attention_mass",
+            "target_logit_gap",
+            "query_content_norm",
+            "query_pe_norm",
+            "query_pe_ratio",
+            "query_uv_gate",
+            "key_content_norm",
+        ):
             values = [
                 entry[metric_name].to(device=reference.device).float()
                 for entry in metric_entries

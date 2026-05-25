@@ -233,14 +233,14 @@ class _QueryUVAttnProcessorBase(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         scores = torch.matmul(query.float(), key.float().transpose(-1, -2))
         scores = scores * (1.0 / math.sqrt(float(query.shape[-1])))
         if attention_mask is not None:
             scores = scores + attention_mask.float()
         attention_probs = torch.softmax(scores, dim=-1)
         hidden_states = torch.matmul(attention_probs.to(dtype=value.dtype), value)
-        return hidden_states, attention_probs
+        return hidden_states, attention_probs, scores
 
     @staticmethod
     def _reshape_sliced_attention_mask(
@@ -275,11 +275,13 @@ class _QueryUVAttnProcessorBase(nn.Module):
         self,
         *,
         attention_probs: torch.Tensor,
+        attention_scores: Optional[torch.Tensor],
         query_uv: torch.Tensor,
         sat_perspective_uv: Optional[torch.Tensor],
         sat_perspective_valid: Optional[torch.Tensor],
         query_base_hw: Optional[Tuple[int, int]],
         attention_alignment: Optional[Dict[str, Any]],
+        query_pe_metrics: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
         if not isinstance(attention_alignment, dict) or sat_perspective_uv is None:
             return
@@ -305,10 +307,16 @@ class _QueryUVAttnProcessorBase(nn.Module):
         nearest_dist2 = dist2.min(dim=-1).values
         has_valid_sat = sat_valid.any(dim=1, keepdim=True)
         query_mask = has_valid_sat & (nearest_dist2 <= valid_radius * valid_radius)
+        target_mask = sat_valid[:, None, :] & (dist2 <= valid_radius * valid_radius)
 
         attention_mean = attention_probs.float().mean(dim=1)
         valid_weights = attention_mean * sat_valid.to(dtype=attention_mean.dtype).unsqueeze(1)
         valid_mass = valid_weights.sum(dim=-1)
+        target_mass = (attention_mean * target_mask.to(dtype=attention_mean.dtype)).sum(dim=-1)
+        target_token_fraction = target_mask.to(dtype=attention_mean.dtype).sum(dim=-1) / float(attention_mean.shape[-1])
+        target_lift = target_mass / target_token_fraction.clamp_min(1e-6)
+        nearest_indices = dist2.argmin(dim=-1)
+        nearest_mass = torch.gather(attention_mean, dim=-1, index=nearest_indices.unsqueeze(-1)).squeeze(-1)
         predicted_uv = torch.matmul(valid_weights, sat_uv) / valid_mass.clamp_min(1e-6).unsqueeze(-1)
         error2 = (predicted_uv - query_uv_f).pow(2).sum(dim=-1)
         loss_map = error2 + invalid_attention_weight * (1.0 - valid_mass).clamp_min(0.0).pow(2)
@@ -316,17 +324,40 @@ class _QueryUVAttnProcessorBase(nn.Module):
         loss = self._masked_mean(loss_map, query_mask)
         mean_error = self._masked_mean(error2.sqrt(), query_mask)
         mean_valid_mass = self._masked_mean(valid_mass, query_mask)
+        mean_target_mass = self._masked_mean(target_mass, query_mask)
+        mean_target_fraction = self._masked_mean(target_token_fraction, query_mask)
+        mean_target_lift = self._masked_mean(target_lift, query_mask)
+        mean_nearest_mass = self._masked_mean(nearest_mass, query_mask)
+
+        metric_payload: Dict[str, Any] = {
+            "layer": self.layer_name or "unknown",
+            "loss": loss.detach(),
+            "mean_error": mean_error.detach(),
+            "valid_query_ratio": query_mask.float().mean().detach(),
+            "valid_attention_mass": mean_valid_mass.detach(),
+            "target_attention_mass": mean_target_mass.detach(),
+            "target_token_fraction": mean_target_fraction.detach(),
+            "target_attention_lift": mean_target_lift.detach(),
+            "nearest_attention_mass": mean_nearest_mass.detach(),
+        }
+
+        if attention_scores is not None:
+            scores_mean = attention_scores.float().mean(dim=1)
+            near_weights = target_mask.to(dtype=scores_mean.dtype)
+            far_mask = sat_valid[:, None, :] & ~target_mask
+            far_weights = far_mask.to(dtype=scores_mean.dtype)
+            near_score = (scores_mean * near_weights).sum(dim=-1) / near_weights.sum(dim=-1).clamp_min(1.0)
+            far_score = (scores_mean * far_weights).sum(dim=-1) / far_weights.sum(dim=-1).clamp_min(1.0)
+            gap_mask = query_mask & far_mask.any(dim=-1)
+            metric_payload["target_logit_gap"] = self._masked_mean(near_score - far_score, gap_mask).detach()
+
+        if query_pe_metrics:
+            for name, value in query_pe_metrics.items():
+                if torch.is_tensor(value):
+                    metric_payload[name] = value.detach()
 
         losses.append(loss)
-        metrics.append(
-            {
-                "layer": self.layer_name or "unknown",
-                "loss": loss.detach(),
-                "mean_error": mean_error.detach(),
-                "valid_query_ratio": query_mask.float().mean().detach(),
-                "valid_attention_mass": mean_valid_mass.detach(),
-            }
-        )
+        metrics.append(metric_payload)
 
         if isinstance(debug_storage, dict) and self.layer_name is not None:
             query_hw = (
@@ -438,6 +469,10 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
             is_cross_attention=is_cross_attention,
         )
         query = attn.to_q(hidden_states)
+        query_pe_metrics: Dict[str, torch.Tensor] = {}
+        if collect_alignment:
+            query_norm = query.float().norm(dim=-1).mean()
+            query_pe_metrics["query_content_norm"] = query_norm
         query_uv_tensor = None
         if is_cross_attention and (self.query_uv_enabled or self.geometry_bias_enabled or collect_alignment):
             query_uv_tensor = self._resolve_query_uv(
@@ -449,7 +484,15 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
         if self.query_uv_enabled and query_uv_tensor is not None:
             uv = query_uv_tensor
             query_pe = self.query_uv_encoder(uv)
-            query = query + self.query_uv_gate.to(dtype=query.dtype) * query_pe
+            scaled_query_pe = self.query_uv_gate.to(dtype=query.dtype) * query_pe
+            if collect_alignment:
+                query_pe_norm = scaled_query_pe.float().norm(dim=-1).mean()
+                query_pe_metrics["query_pe_norm"] = query_pe_norm
+                query_pe_metrics["query_pe_ratio"] = query_pe_norm / query_pe_metrics[
+                    "query_content_norm"
+                ].clamp_min(1e-6)
+                query_pe_metrics["query_uv_gate"] = self.query_uv_gate.float()
+            query = query + scaled_query_pe
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -458,6 +501,8 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
 
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
+        if collect_alignment:
+            query_pe_metrics["key_content_norm"] = key.float().norm(dim=-1).mean()
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
@@ -499,7 +544,7 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
                 attention_mask = geometry_bias if attention_mask is None else attention_mask + geometry_bias
 
         if collect_alignment:
-            hidden_states, attention_probs = self._manual_scaled_dot_product_attention(
+            hidden_states, attention_probs, attention_scores = self._manual_scaled_dot_product_attention(
                 query,
                 key,
                 value,
@@ -508,11 +553,13 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
             if query_uv_tensor is not None:
                 self._record_attention_alignment(
                     attention_probs=attention_probs,
+                    attention_scores=attention_scores,
                     query_uv=query_uv_tensor,
                     sat_perspective_uv=sat_uv,
                     sat_perspective_valid=sat_valid,
                     query_base_hw=query_base_hw,
                     attention_alignment=attention_alignment,
+                    query_pe_metrics=query_pe_metrics,
                 )
         else:
             hidden_states = F.scaled_dot_product_attention(
@@ -614,6 +661,10 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
             is_cross_attention=is_cross_attention,
         )
         query = attn.to_q(hidden_states)
+        query_pe_metrics: Dict[str, torch.Tensor] = {}
+        if collect_alignment:
+            query_norm = query.float().norm(dim=-1).mean()
+            query_pe_metrics["query_content_norm"] = query_norm
         query_uv_tensor = None
         if is_cross_attention and (self.query_uv_enabled or self.geometry_bias_enabled or collect_alignment):
             query_uv_tensor = self._resolve_query_uv(
@@ -625,7 +676,15 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
         if self.query_uv_enabled and query_uv_tensor is not None:
             uv = query_uv_tensor
             query_pe = self.query_uv_encoder(uv)
-            query = query + self.query_uv_gate.to(dtype=query.dtype) * query_pe
+            scaled_query_pe = self.query_uv_gate.to(dtype=query.dtype) * query_pe
+            if collect_alignment:
+                query_pe_norm = scaled_query_pe.float().norm(dim=-1).mean()
+                query_pe_metrics["query_pe_norm"] = query_pe_norm
+                query_pe_metrics["query_pe_ratio"] = query_pe_norm / query_pe_metrics[
+                    "query_content_norm"
+                ].clamp_min(1e-6)
+                query_pe_metrics["query_uv_gate"] = self.query_uv_gate.float()
+            query = query + scaled_query_pe
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -634,6 +693,8 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
 
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
+        if collect_alignment:
+            query_pe_metrics["key_content_norm"] = key.float().norm(dim=-1).mean()
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
@@ -683,7 +744,7 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
                 query_tokens=query_tokens,
                 key_tokens=key.shape[1],
             )
-            hidden_4d, attention_probs = self._manual_scaled_dot_product_attention(
+            hidden_4d, attention_probs, attention_scores = self._manual_scaled_dot_product_attention(
                 query_4d,
                 key_4d,
                 value_4d,
@@ -693,11 +754,13 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
             if query_uv_tensor is not None:
                 self._record_attention_alignment(
                     attention_probs=attention_probs,
+                    attention_scores=attention_scores,
                     query_uv=query_uv_tensor,
                     sat_perspective_uv=sat_uv,
                     sat_perspective_valid=sat_valid,
                     query_base_hw=query_base_hw,
                     attention_alignment=attention_alignment,
+                    query_pe_metrics=query_pe_metrics,
                 )
         else:
             hidden_states = torch.zeros(
