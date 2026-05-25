@@ -282,6 +282,12 @@ def _resolve_unet_attention_slicing_config(config: Dict[str, Any]) -> bool:
     return bool(_config_get(config, ("attention_slicing",), False))
 
 
+def _resolve_gradient_checkpointing_config(config: Dict[str, Any], cli_value: bool | None) -> bool:
+    if cli_value is not None:
+        return bool(cli_value)
+    return bool(_config_get(config, ("gradient_checkpointing",), True))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Stable Diffusion for satellite-to-frontview generation"
@@ -341,6 +347,15 @@ def main():
     parser.add_argument(
         "--max_grad_norm", type=float, default=1.0,
         help="Gradient clipping threshold. Set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable or disable UNet gradient checkpointing. Defaults to the config value. "
+            "Use --no-gradient_checkpointing for auxiliary attention-alignment loss runs."
+        ),
     )
     parser.add_argument(
         "--base_model", type=str, default=DEFAULT_SD21_BASE_REPO,
@@ -614,7 +629,8 @@ def main():
     )
 
     freeze_base = bool(_config_get(config, ("model", "freeze_base"), True))
-    gradient_checkpointing = bool(_config_get(config, ("gradient_checkpointing",), True))
+    gradient_checkpointing = _resolve_gradient_checkpointing_config(config, args.gradient_checkpointing)
+    args.gradient_checkpointing = gradient_checkpointing
     unet_attention_slicing = _resolve_unet_attention_slicing_config(config)
     weight_decay = float(_config_get(config, ("training", "weight_decay"), 1e-4))
     lr_scheduler_type = str(_config_get(config, ("training", "scheduler"), "cosine"))
@@ -677,10 +693,11 @@ def main():
     if is_main_process:
         logger.info(f"Training configuration: {args}")
         if attention_alignment_config["enabled"] and attention_alignment_config["loss_weight"] > 0.0 and gradient_checkpointing:
-            logger.warning(
-                "training.attention_alignment.loss_weight > 0 with gradient_checkpointing=true. "
-                "The alignment value will be logged, but the auxiliary loss may not be differentiable; "
-                "disable gradient_checkpointing or reduce batch size for an alignment-loss run."
+            raise ValueError(
+                "training.attention_alignment.loss_weight > 0 requires gradient_checkpointing=false. "
+                "With UNet gradient checkpointing the captured attention tensors are non-differentiable, "
+                "so the auxiliary alignment loss would be logged but not trained. "
+                "Use --no-gradient_checkpointing and reduce --batch_size if needed."
             )
 
     # Load data

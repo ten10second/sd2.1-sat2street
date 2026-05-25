@@ -7,6 +7,7 @@ _TRAIN_MODULE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "script
 _resolve_query_uv_config = _TRAIN_MODULE["_resolve_query_uv_config"]
 _resolve_query_geometry_bias_config = _TRAIN_MODULE["_resolve_query_geometry_bias_config"]
 _resolve_unet_attention_slicing_config = _TRAIN_MODULE["_resolve_unet_attention_slicing_config"]
+_resolve_gradient_checkpointing_config = _TRAIN_MODULE["_resolve_gradient_checkpointing_config"]
 _collect_cli_options = _TRAIN_MODULE["_collect_cli_options"]
 _prefer_config = _TRAIN_MODULE["_prefer_config"]
 
@@ -40,6 +41,11 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
     def test_unet_attention_slicing_defaults_to_disabled(self) -> None:
         self.assertFalse(_resolve_unet_attention_slicing_config({}))
         self.assertTrue(_resolve_unet_attention_slicing_config({"attention_slicing": True}))
+
+    def test_gradient_checkpointing_cli_override_wins(self) -> None:
+        self.assertFalse(_resolve_gradient_checkpointing_config({"gradient_checkpointing": True}, False))
+        self.assertTrue(_resolve_gradient_checkpointing_config({"gradient_checkpointing": False}, True))
+        self.assertFalse(_resolve_gradient_checkpointing_config({"gradient_checkpointing": False}, None))
 
     def test_explicit_cli_option_wins_even_when_value_equals_parser_default(self) -> None:
         cli_options = _collect_cli_options(["--gradient_accumulation", "2"])
