@@ -831,12 +831,18 @@ class SatelliteConditionedSDModel(nn.Module):
             if isinstance(attention_alignment, dict)
             else []
         )
+        alignment_requested = (
+            isinstance(attention_alignment, dict)
+            and bool(attention_alignment.get("enabled", False))
+        )
         alignment_loss_is_differentiable = any(
             torch.is_tensor(loss_value) and bool(loss_value.requires_grad)
             for loss_value in captured_alignment_losses
         )
         effective_alignment_weight = float(getattr(self, "attention_alignment_loss_weight", 0.0))
-        if effective_alignment_weight > 0.0 and not alignment_loss_is_differentiable:
+        if not alignment_requested:
+            effective_alignment_weight = 0.0
+        elif effective_alignment_weight > 0.0 and not alignment_loss_is_differentiable:
             effective_alignment_weight = 0.0
             if not getattr(self, "_logged_nondifferentiable_alignment_loss", False):
                 logger.warning(
