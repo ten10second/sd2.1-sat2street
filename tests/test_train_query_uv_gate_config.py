@@ -9,6 +9,7 @@ _resolve_query_uv_config = _TRAIN_MODULE["_resolve_query_uv_config"]
 _resolve_query_geometry_bias_config = _TRAIN_MODULE["_resolve_query_geometry_bias_config"]
 _resolve_query_geometry_score_config = _TRAIN_MODULE["_resolve_query_geometry_score_config"]
 _attach_query_geometry_score_args = _TRAIN_MODULE["_attach_query_geometry_score_args"]
+_verify_query_geometry_score_model_config = _TRAIN_MODULE["_verify_query_geometry_score_model_config"]
 _resolve_unet_attention_slicing_config = _TRAIN_MODULE["_resolve_unet_attention_slicing_config"]
 _resolve_gradient_checkpointing_config = _TRAIN_MODULE["_resolve_gradient_checkpointing_config"]
 _collect_cli_options = _TRAIN_MODULE["_collect_cli_options"]
@@ -87,6 +88,51 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
         self.assertEqual(args.query_geometry_score_gate_init, 0.75)
         self.assertEqual(args.query_geometry_score_layers, ["down.attn2", "mid.attn2"])
         self.assertEqual(args.query_geometry_score_max_query_tokens, 128)
+
+    def test_geometry_score_model_config_verifier_rejects_unwired_model(self) -> None:
+        config = {
+            "enabled": True,
+            "dim": 64,
+            "num_freqs": 6,
+            "gate_init": 1.0,
+            "layers": ["mid.attn2"],
+            "max_query_tokens": 256,
+        }
+        model = Namespace(
+            unet=Namespace(
+                query_geometry_score_enabled=False,
+                query_geometry_score_dim=64,
+                query_geometry_score_num_freqs=6,
+                query_geometry_score_gate_init=1.0,
+                query_geometry_score_layers=("mid.attn2",),
+                query_geometry_score_max_query_tokens=256,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "query_geometry_score config was not applied"):
+            _verify_query_geometry_score_model_config(model, config)
+
+    def test_geometry_score_model_config_verifier_accepts_wired_model(self) -> None:
+        config = {
+            "enabled": True,
+            "dim": 64,
+            "num_freqs": 6,
+            "gate_init": 1.0,
+            "layers": ["mid.attn2"],
+            "max_query_tokens": 256,
+        }
+        model = Namespace(
+            unet=Namespace(
+                query_geometry_score_enabled=True,
+                query_geometry_score_dim=64,
+                query_geometry_score_num_freqs=6,
+                query_geometry_score_gate_init=1.0,
+                query_geometry_score_layers=("mid.attn2",),
+                query_geometry_score_max_query_tokens=256,
+            )
+        )
+
+        _verify_query_geometry_score_model_config(model, config)
 
     def test_unet_attention_slicing_defaults_to_disabled(self) -> None:
         self.assertFalse(_resolve_unet_attention_slicing_config({}))

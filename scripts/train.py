@@ -285,6 +285,49 @@ def _attach_query_geometry_score_args(args: argparse.Namespace, config: Dict[str
     return score_config
 
 
+def _verify_query_geometry_score_model_config(model: Any, score_config: Dict[str, Any]) -> None:
+    if not bool(score_config.get("enabled", False)):
+        return
+
+    unet = getattr(model, "unet", None)
+    if unet is None:
+        raise RuntimeError("query_geometry_score is enabled, but the created model has no UNet")
+
+    expected_layers = score_config.get("layers")
+    actual_layers = getattr(unet, "query_geometry_score_layers", None)
+    actual_layers_list = None if actual_layers is None else [str(layer) for layer in actual_layers]
+    expected_layers_list = None if expected_layers is None else [str(layer) for layer in expected_layers]
+    checks = {
+        "query_geometry_score_enabled": bool(score_config["enabled"]),
+        "query_geometry_score_dim": int(score_config["dim"]),
+        "query_geometry_score_num_freqs": int(score_config["num_freqs"]),
+        "query_geometry_score_gate_init": float(score_config["gate_init"]),
+        "query_geometry_score_layers": expected_layers_list,
+        "query_geometry_score_max_query_tokens": score_config["max_query_tokens"],
+    }
+    actual = {
+        "query_geometry_score_enabled": bool(getattr(unet, "query_geometry_score_enabled", False)),
+        "query_geometry_score_dim": int(getattr(unet, "query_geometry_score_dim", -1)),
+        "query_geometry_score_num_freqs": int(getattr(unet, "query_geometry_score_num_freqs", -1)),
+        "query_geometry_score_gate_init": float(getattr(unet, "query_geometry_score_gate_init", float("nan"))),
+        "query_geometry_score_layers": actual_layers_list,
+        "query_geometry_score_max_query_tokens": getattr(unet, "query_geometry_score_max_query_tokens", None),
+    }
+    mismatches = {
+        name: (expected, actual[name])
+        for name, expected in checks.items()
+        if actual[name] != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            "query_geometry_score config was not applied to the created UNet: "
+            + ", ".join(
+                f"{name} expected {expected!r}, got {got!r}"
+                for name, (expected, got) in mismatches.items()
+            )
+        )
+
+
 def _resolve_attention_alignment_config(config: Dict[str, Any]) -> Dict[str, Any]:
     alignment_config = dict(_config_get(config, ("training", "attention_alignment"), {}) or {})
     layers = alignment_config.get("layers")
@@ -859,6 +902,7 @@ def main():
         attention_alignment_invalid_attention_weight=attention_alignment_config["invalid_attention_weight"],
         satellite_encoder_config=satellite_encoder_config,
     )
+    _verify_query_geometry_score_model_config(model, query_geometry_score_config)
     if args.device.startswith("cuda") and args.mixed_precision != "no":
         if is_main_process:
             logger.info(
