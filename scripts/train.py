@@ -166,7 +166,24 @@ def _config_get(config: Dict[str, Any], path: Tuple[str, ...], default: Any = No
     return default if node is None else node
 
 
-def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
+def _collect_cli_options(argv: List[str]) -> set[str]:
+    options: set[str] = set()
+    for arg in argv:
+        if arg.startswith("--"):
+            options.add(arg.split("=", 1)[0])
+    return options
+
+
+def _prefer_config(
+    current: Any,
+    cli_default: Any,
+    config_value: Any,
+    *,
+    cli_option: str | None = None,
+    cli_options: set[str] | None = None,
+) -> Any:
+    if cli_option is not None and cli_options is not None and cli_option in cli_options:
+        return current
     if current == cli_default and config_value is not None:
         return config_value
     return current
@@ -445,6 +462,7 @@ def main():
     )
 
     args = parser.parse_args()
+    cli_options = _collect_cli_options(sys.argv[1:])
     config = _load_runtime_config(Path(args.config))
 
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
@@ -471,6 +489,8 @@ def main():
             args.gradient_accumulation,
             2,
             _config_get(config, ("training", "gradient_accumulation_steps")),
+            cli_option="--gradient_accumulation",
+            cli_options=cli_options,
         )
     )
     args.max_grad_norm = float(
@@ -586,10 +606,21 @@ def main():
     perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
     query_uv_pe_enabled, query_uv_gate_init = _resolve_query_uv_config(config)
     query_geometry_bias_enabled, query_geometry_bias_scale, query_geometry_invalid_penalty = _resolve_query_geometry_bias_config(config)
+    args.perspective_pe_enabled = perspective_pe_enabled
+    args.query_uv_pe_enabled = query_uv_pe_enabled
+    args.query_uv_gate_init = query_uv_gate_init
+    args.query_geometry_bias_enabled = query_geometry_bias_enabled
+    args.query_geometry_bias_scale = query_geometry_bias_scale
+    args.query_geometry_invalid_penalty = query_geometry_invalid_penalty
 
     _configure_logging(log_dir)
 
     distributed, rank, local_rank, world_size = _init_distributed(args)
+    args.distributed = distributed
+    args.rank = rank
+    args.local_rank = local_rank
+    args.world_size = world_size
+    args.effective_batch_size = int(args.batch_size) * int(world_size) * int(args.gradient_accumulation)
     is_main_process = rank == 0
 
     os.environ["HF_ENDPOINT"] = args.hf_endpoint

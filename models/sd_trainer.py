@@ -250,8 +250,18 @@ class SDTrainer:
             logger.info(f"  Learning rate: {learning_rate}")
             logger.info(f"  Num epochs: {num_train_epochs}")
             logger.info(f"  Batch size per process: {train_dataloader.batch_size}")
+            logger.info(
+                "  Effective batch size: %d",
+                int(train_dataloader.batch_size or 0) * self.world_size * self.gradient_accumulation_steps,
+            )
             logger.info(f"  Mixed precision: {self.mixed_precision or 'disabled'}")
             logger.info(f"  Max grad norm: {self.max_grad_norm}")
+            unwrapped = self.unwrapped_model
+            unet = getattr(unwrapped, "unet", None)
+            logger.info(f"  Perspective PE enabled: {bool(getattr(unwrapped, 'perspective_pe_enabled', False))}")
+            logger.info(f"  Query UV PE enabled: {bool(getattr(unet, 'query_uv_pe_enabled', False))}")
+            logger.info(f"  Query UV gate init: {float(getattr(unet, 'query_uv_gate_init', 0.0))}")
+            logger.info(f"  Query geometry bias enabled: {bool(getattr(unet, 'query_geometry_bias_enabled', False))}")
             if self.use_wandb:
                 logger.info(
                     f"  W&B logging: project={self.project_name}, "
