@@ -256,6 +256,28 @@ def _resolve_query_geometry_bias_config(config: Dict[str, Any]) -> Tuple[bool, f
     return geometry_enabled, float(geometry_scale), float(invalid_penalty)
 
 
+def _resolve_attention_alignment_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    alignment_config = dict(_config_get(config, ("training", "attention_alignment"), {}) or {})
+    layers = alignment_config.get("layers")
+    if layers is not None:
+        layers = [str(layer) for layer in layers]
+
+    max_query_tokens = alignment_config.get("max_query_tokens", 256)
+    if max_query_tokens is not None:
+        max_query_tokens = int(max_query_tokens)
+
+    return {
+        "enabled": bool(alignment_config.get("enable", False)),
+        "loss_weight": float(alignment_config.get("loss_weight", 0.0) or 0.0),
+        "layers": layers,
+        "max_query_tokens": max_query_tokens,
+        "valid_radius": float(alignment_config.get("valid_radius", 0.25) or 0.25),
+        "invalid_attention_weight": float(
+            alignment_config.get("invalid_attention_weight", 0.1) or 0.0
+        ),
+    }
+
+
 def _resolve_unet_attention_slicing_config(config: Dict[str, Any]) -> bool:
     return bool(_config_get(config, ("attention_slicing",), False))
 
@@ -606,12 +628,19 @@ def main():
     perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
     query_uv_pe_enabled, query_uv_gate_init = _resolve_query_uv_config(config)
     query_geometry_bias_enabled, query_geometry_bias_scale, query_geometry_invalid_penalty = _resolve_query_geometry_bias_config(config)
+    attention_alignment_config = _resolve_attention_alignment_config(config)
     args.perspective_pe_enabled = perspective_pe_enabled
     args.query_uv_pe_enabled = query_uv_pe_enabled
     args.query_uv_gate_init = query_uv_gate_init
     args.query_geometry_bias_enabled = query_geometry_bias_enabled
     args.query_geometry_bias_scale = query_geometry_bias_scale
     args.query_geometry_invalid_penalty = query_geometry_invalid_penalty
+    args.attention_alignment_enabled = attention_alignment_config["enabled"]
+    args.attention_alignment_loss_weight = attention_alignment_config["loss_weight"]
+    args.attention_alignment_layers = attention_alignment_config["layers"]
+    args.attention_alignment_max_query_tokens = attention_alignment_config["max_query_tokens"]
+    args.attention_alignment_valid_radius = attention_alignment_config["valid_radius"]
+    args.attention_alignment_invalid_attention_weight = attention_alignment_config["invalid_attention_weight"]
 
     _configure_logging(log_dir)
 
@@ -647,6 +676,12 @@ def main():
 
     if is_main_process:
         logger.info(f"Training configuration: {args}")
+        if attention_alignment_config["enabled"] and attention_alignment_config["loss_weight"] > 0.0 and gradient_checkpointing:
+            logger.warning(
+                "training.attention_alignment.loss_weight > 0 with gradient_checkpointing=true. "
+                "The alignment value will be logged, but the auxiliary loss may not be differentiable; "
+                "disable gradient_checkpointing or reduce batch size for an alignment-loss run."
+            )
 
     # Load data
     if is_main_process:
@@ -763,6 +798,12 @@ def main():
         query_geometry_bias_scale=query_geometry_bias_scale,
         query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
+        attention_alignment_enabled=attention_alignment_config["enabled"],
+        attention_alignment_loss_weight=attention_alignment_config["loss_weight"],
+        attention_alignment_layers=attention_alignment_config["layers"],
+        attention_alignment_max_query_tokens=attention_alignment_config["max_query_tokens"],
+        attention_alignment_valid_radius=attention_alignment_config["valid_radius"],
+        attention_alignment_invalid_attention_weight=attention_alignment_config["invalid_attention_weight"],
         satellite_encoder_config=satellite_encoder_config,
     )
     if args.device.startswith("cuda") and args.mixed_precision != "no":

@@ -26,6 +26,11 @@ from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0, QueryUV
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_ATTENTION_ALIGNMENT_LAYERS = (
+    "mid_block.attentions.0.transformer_blocks.0.attn2",
+)
+
+
 def _resolve_module_path(root: nn.Module, path: str) -> nn.Module:
     module: nn.Module = root
     for part in path.split("."):
@@ -48,6 +53,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         query_geometry_bias_scale: float = 2.0,
         query_geometry_invalid_penalty: float = -1e4,
         query_uv_gate_init: float = 0.0,
+        attention_alignment_enabled: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -56,17 +62,21 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.query_geometry_bias_scale = float(query_geometry_bias_scale)
         self.query_geometry_invalid_penalty = float(query_geometry_invalid_penalty)
         self.query_uv_gate_init = float(query_uv_gate_init)
+        self.attention_alignment_enabled = bool(attention_alignment_enabled)
+        self._attention_debug_layers: Optional[Sequence[str]] = None
+        self._attention_debug_storage: Optional[Dict[str, Any]] = None
         self._install_query_uv_attention_processors()
 
     def _build_attention_processors(self):
-        if not self.query_uv_pe_enabled and not self.query_geometry_bias_enabled:
+        if not self.query_uv_pe_enabled and not self.query_geometry_bias_enabled and not self.attention_alignment_enabled:
             return AttnProcessor2_0()
         return self._build_query_uv_attention_processors()
 
     def _build_query_uv_attention_processors(self):
         processors = {}
         for name in self.attn_processors.keys():
-            attn_module = _resolve_module_path(self, name.removesuffix(".processor"))
+            layer_name = name.removesuffix(".processor")
+            attn_module = _resolve_module_path(self, layer_name)
             query_dim = int(attn_module.to_q.out_features)
             processors[name] = QueryUVAttnProcessor2_0(
                 query_dim=query_dim,
@@ -75,6 +85,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 geometry_bias_scale=self.query_geometry_bias_scale,
                 geometry_invalid_penalty=self.query_geometry_invalid_penalty,
                 gate_init=self.query_uv_gate_init,
+                layer_name=layer_name,
             )
         return processors
 
@@ -82,7 +93,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         self.set_attn_processor(self._build_attention_processors())
 
     def set_attention_slice(self, slice_size="auto"):
-        if not self.query_uv_pe_enabled and not self.query_geometry_bias_enabled:
+        if not self.query_uv_pe_enabled and not self.query_geometry_bias_enabled and not self.attention_alignment_enabled:
             return super().set_attention_slice(slice_size)
 
         if slice_size is None:
@@ -98,7 +109,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                     f"Unable to preserve query UV attention slicing for {name}: "
                     f"{type(processor).__name__} has no slice_size"
                 )
-            attn_module = _resolve_module_path(self, name.removesuffix(".processor"))
+            layer_name = name.removesuffix(".processor")
+            attn_module = _resolve_module_path(self, layer_name)
             query_dim = int(attn_module.to_q.out_features)
             sliced_processors[name] = QueryUVSlicedAttnProcessor(
                 query_dim=query_dim,
@@ -108,8 +120,25 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 geometry_bias_scale=self.query_geometry_bias_scale,
                 geometry_invalid_penalty=self.query_geometry_invalid_penalty,
                 gate_init=self.query_uv_gate_init,
+                layer_name=layer_name,
             )
         self.set_attn_processor(sliced_processors)
+
+    def enable_attention_debug(
+        self,
+        *,
+        layers: Sequence[str],
+        storage: Dict[str, Any],
+    ) -> None:
+        self._attention_debug_layers = tuple(str(layer) for layer in layers)
+        self._attention_debug_storage = storage
+
+    def disable_attention_debug(self) -> None:
+        self._attention_debug_layers = None
+        self._attention_debug_storage = None
+
+    def is_attention_debug_enabled(self) -> bool:
+        return self._attention_debug_layers is not None and self._attention_debug_storage is not None
 
     @staticmethod
     def _normalize_query_base_hw(cross_attention_kwargs):
@@ -138,7 +167,11 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             encoder_hidden_states = sat_tokens
         if encoder_hidden_states is None:
             raise ValueError("SatelliteConditionedUNet requires sat_tokens or encoder_hidden_states")
-        if self.query_uv_pe_enabled or self.query_geometry_bias_enabled:
+        attention_alignment_requested = (
+            isinstance(cross_attention_kwargs, dict)
+            and isinstance(cross_attention_kwargs.get("attention_alignment"), dict)
+        )
+        if self.query_uv_pe_enabled or self.query_geometry_bias_enabled or attention_alignment_requested or self.is_attention_debug_enabled():
             if self._normalize_query_base_hw(cross_attention_kwargs) is None:
                 raise ValueError(
                     "query-based geometry features require cross_attention_kwargs['query_base_hw'] "
@@ -149,6 +182,23 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                 raise ValueError(
                     "query_geometry_bias_enabled requires cross_attention_kwargs['sat_perspective_uv']"
                 )
+        if self.is_attention_debug_enabled():
+            if not isinstance(cross_attention_kwargs, dict) or cross_attention_kwargs.get("sat_perspective_uv") is None:
+                raise ValueError(
+                    "attention debug requires cross_attention_kwargs['sat_perspective_uv']"
+                )
+            cross_attention_kwargs = dict(cross_attention_kwargs)
+            cross_attention_kwargs["attention_alignment"] = {
+                "enabled": True,
+                "layers": self._attention_debug_layers,
+                "max_query_tokens": None,
+                "valid_radius": 0.35,
+                "invalid_attention_weight": 0.0,
+                "losses": [],
+                "metrics": [],
+                "debug_storage": self._attention_debug_storage,
+            }
+            kwargs["cross_attention_kwargs"] = cross_attention_kwargs
 
         # Diagnostic log (once per process)
         if not SatelliteConditionedUNet._logged_diag:
@@ -240,6 +290,12 @@ class SatelliteConditionedSDModel(nn.Module):
         freeze_base: bool = True,
         cond_drop_prob: float = 0.1,
         perspective_pe_enabled: bool = True,
+        attention_alignment_enabled: bool = False,
+        attention_alignment_loss_weight: float = 0.0,
+        attention_alignment_layers: Optional[Sequence[str]] = None,
+        attention_alignment_max_query_tokens: Optional[int] = 256,
+        attention_alignment_valid_radius: float = 0.25,
+        attention_alignment_invalid_attention_weight: float = 0.1,
     ):
         super().__init__()
 
@@ -248,6 +304,23 @@ class SatelliteConditionedSDModel(nn.Module):
         self.noise_scheduler = noise_scheduler
         self.cond_drop_prob = float(cond_drop_prob)
         self.perspective_pe_enabled = bool(perspective_pe_enabled)
+        self.attention_alignment_enabled = bool(attention_alignment_enabled)
+        self.attention_alignment_loss_weight = float(attention_alignment_loss_weight)
+        self.attention_alignment_layers = tuple(
+            str(layer) for layer in (
+                attention_alignment_layers
+                if attention_alignment_layers is not None
+                else DEFAULT_ATTENTION_ALIGNMENT_LAYERS
+            )
+        )
+        self.attention_alignment_max_query_tokens = (
+            None
+            if attention_alignment_max_query_tokens is None
+            else int(attention_alignment_max_query_tokens)
+        )
+        self.attention_alignment_valid_radius = float(attention_alignment_valid_radius)
+        self.attention_alignment_invalid_attention_weight = float(attention_alignment_invalid_attention_weight)
+        self._logged_nondifferentiable_alignment_loss = False
 
         if satellite_encoder is None:
             sat_embed_dim = int(getattr(unet.config, "cross_attention_dim", 768) or 768)
@@ -288,6 +361,8 @@ class SatelliteConditionedSDModel(nn.Module):
         logger.info(f"  Perspective PE enabled: {self.perspective_pe_enabled}")
         logger.info(f"  Query UV PE enabled: {bool(getattr(self.unet, 'query_uv_pe_enabled', False))}")
         logger.info(f"  Query geometry bias enabled: {bool(getattr(self.unet, 'query_geometry_bias_enabled', False))}")
+        logger.info(f"  Attention alignment enabled: {self.attention_alignment_enabled}")
+        logger.info(f"  Attention alignment loss weight: {self.attention_alignment_loss_weight:g}")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
 
     def encode_satellite(
@@ -363,20 +438,77 @@ class SatelliteConditionedSDModel(nn.Module):
         reference: torch.Tensor,
         sat_state: SatelliteMemoryState,
     ):
+        alignment_active = bool(getattr(self, "attention_alignment_enabled", False)) and self.training
+        attention_debug_active = bool(
+            hasattr(self.unet, "is_attention_debug_enabled") and self.unet.is_attention_debug_enabled()
+        )
         if not bool(getattr(self.unet, "query_uv_pe_enabled", False)) and not bool(
             getattr(self.unet, "query_geometry_bias_enabled", False)
-        ):
+        ) and not alignment_active and not attention_debug_active:
             return None
         if reference.ndim != 4:
             raise ValueError(f"reference tensor must be [B,C,H,W], got {list(reference.shape)}")
         kwargs: Dict[str, Any] = {"query_base_hw": tuple(int(x) for x in reference.shape[-2:])}
-        if bool(getattr(self.unet, "query_geometry_bias_enabled", False)):
+        needs_sat_geometry = (
+            bool(getattr(self.unet, "query_geometry_bias_enabled", False))
+            or alignment_active
+            or attention_debug_active
+        )
+        if needs_sat_geometry:
             if sat_state.perspective_uv is None:
-                raise ValueError("query_geometry_bias_enabled requires sat_state.perspective_uv")
+                raise ValueError("attention geometry features require sat_state.perspective_uv")
             kwargs["sat_perspective_uv"] = sat_state.perspective_uv
             if sat_state.perspective_valid is not None:
                 kwargs["sat_perspective_valid"] = sat_state.perspective_valid
+        if alignment_active:
+            kwargs["attention_alignment"] = {
+                "enabled": True,
+                "layers": getattr(self, "attention_alignment_layers", DEFAULT_ATTENTION_ALIGNMENT_LAYERS),
+                "max_query_tokens": getattr(self, "attention_alignment_max_query_tokens", 256),
+                "valid_radius": getattr(self, "attention_alignment_valid_radius", 0.25),
+                "invalid_attention_weight": getattr(self, "attention_alignment_invalid_attention_weight", 0.1),
+                "losses": [],
+                "metrics": [],
+            }
         return kwargs
+
+    def _aggregate_attention_alignment(
+        self,
+        attention_alignment: Optional[Dict[str, Any]],
+        *,
+        reference: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = reference.sum() * 0.0
+        if not isinstance(attention_alignment, dict):
+            return zero, {}
+
+        losses = [
+            loss
+            for loss in attention_alignment.get("losses", [])
+            if torch.is_tensor(loss)
+        ]
+        if losses:
+            alignment_loss = torch.stack([loss.to(device=reference.device).float() for loss in losses]).mean()
+            alignment_loss = alignment_loss.to(dtype=reference.dtype)
+        else:
+            alignment_loss = zero
+
+        metrics: Dict[str, torch.Tensor] = {}
+        metric_entries = [
+            entry
+            for entry in attention_alignment.get("metrics", [])
+            if isinstance(entry, dict)
+        ]
+        for metric_name in ("mean_error", "valid_query_ratio", "valid_attention_mass"):
+            values = [
+                entry[metric_name].to(device=reference.device).float()
+                for entry in metric_entries
+                if torch.is_tensor(entry.get(metric_name))
+            ]
+            if values:
+                metrics[metric_name] = torch.stack(values).mean().to(dtype=reference.dtype)
+
+        return alignment_loss, metrics
 
     @staticmethod
     def _zero_sat_geometry(sat_state: SatelliteMemoryState) -> SatelliteMemoryState:
@@ -603,6 +735,11 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
         cross_attention_kwargs = self._build_cross_attention_kwargs(noisy_latents, conditioned_sat_state)
+        attention_alignment = (
+            cross_attention_kwargs.get("attention_alignment")
+            if isinstance(cross_attention_kwargs, dict)
+            else None
+        )
         model_pred = self.unet(
             noisy_latents,
             timesteps,
@@ -617,14 +754,53 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
-        loss = F.mse_loss(model_pred, target, reduction="mean")
-        return {
+        denoise_loss = F.mse_loss(model_pred, target, reduction="mean")
+        alignment_loss, alignment_metrics = self._aggregate_attention_alignment(
+            attention_alignment,
+            reference=denoise_loss,
+        )
+        captured_alignment_losses = (
+            attention_alignment.get("losses", [])
+            if isinstance(attention_alignment, dict)
+            else []
+        )
+        alignment_loss_is_differentiable = any(
+            torch.is_tensor(loss_value) and bool(loss_value.requires_grad)
+            for loss_value in captured_alignment_losses
+        )
+        effective_alignment_weight = float(getattr(self, "attention_alignment_loss_weight", 0.0))
+        if effective_alignment_weight > 0.0 and not alignment_loss_is_differentiable:
+            effective_alignment_weight = 0.0
+            if not getattr(self, "_logged_nondifferentiable_alignment_loss", False):
+                logger.warning(
+                    "Attention alignment loss is being logged but not added to the objective because "
+                    "the captured tensors are non-differentiable. This usually happens with UNet gradient "
+                    "checkpointing; disable gradient_checkpointing or use a smaller batch to train with this loss."
+                )
+                self._logged_nondifferentiable_alignment_loss = True
+        loss = denoise_loss + float(effective_alignment_weight) * alignment_loss
+        result = {
             "loss": loss,
+            "denoise_loss": denoise_loss,
+            "attention_alignment_loss": alignment_loss,
+            "attention_alignment_loss_weight": torch.tensor(
+                float(effective_alignment_weight),
+                device=loss.device,
+                dtype=loss.dtype,
+            ),
+            "attention_alignment_loss_is_differentiable": torch.tensor(
+                float(alignment_loss_is_differentiable),
+                device=loss.device,
+                dtype=loss.dtype,
+            ),
             "model_pred": model_pred,
             "target": target,
             "sat_state": conditioned_sat_state,
             "condition_mask": condition_mask,
         }
+        for key, value in alignment_metrics.items():
+            result[f"attention_alignment_{key}"] = value
+        return result
 
 
 def create_sd_model(
@@ -639,6 +815,12 @@ def create_sd_model(
     query_geometry_bias_scale: float = 2.0,
     query_geometry_invalid_penalty: float = -1e4,
     query_uv_gate_init: float = 0.0,
+    attention_alignment_enabled: bool = False,
+    attention_alignment_loss_weight: float = 0.0,
+    attention_alignment_layers: Optional[Sequence[str]] = None,
+    attention_alignment_max_query_tokens: Optional[int] = 256,
+    attention_alignment_valid_radius: float = 0.25,
+    attention_alignment_invalid_attention_weight: float = 0.1,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> SatelliteConditionedSDModel:
     """Create a satellite-conditioned Stable Diffusion model."""
@@ -686,6 +868,7 @@ def create_sd_model(
         query_geometry_bias_scale=query_geometry_bias_scale,
         query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
+        attention_alignment_enabled=attention_alignment_enabled,
         **base_unet.config,
     )
     unet.load_state_dict(base_unet.state_dict(), strict=False)
@@ -712,5 +895,11 @@ def create_sd_model(
         freeze_base=freeze_base,
         cond_drop_prob=cond_drop_prob,
         perspective_pe_enabled=perspective_pe_enabled,
+        attention_alignment_enabled=attention_alignment_enabled,
+        attention_alignment_loss_weight=attention_alignment_loss_weight,
+        attention_alignment_layers=attention_alignment_layers,
+        attention_alignment_max_query_tokens=attention_alignment_max_query_tokens,
+        attention_alignment_valid_radius=attention_alignment_valid_radius,
+        attention_alignment_invalid_attention_weight=attention_alignment_invalid_attention_weight,
     )
     return model

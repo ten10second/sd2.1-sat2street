@@ -69,6 +69,12 @@ def create_sd_model(
     query_geometry_bias_scale: float = 2.0,
     query_geometry_invalid_penalty: float = -1e4,
     query_uv_gate_init: float = 0.0,
+    attention_alignment_enabled: bool = False,
+    attention_alignment_loss_weight: float = 0.0,
+    attention_alignment_layers: Optional[Sequence[str]] = None,
+    attention_alignment_max_query_tokens: Optional[int] = 256,
+    attention_alignment_valid_radius: float = 0.25,
+    attention_alignment_invalid_attention_weight: float = 0.1,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
     """Backward-compatible import surface for the clean perspective-PE model."""
@@ -86,6 +92,12 @@ def create_sd_model(
         query_geometry_bias_scale=query_geometry_bias_scale,
         query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_uv_gate_init=query_uv_gate_init,
+        attention_alignment_enabled=attention_alignment_enabled,
+        attention_alignment_loss_weight=attention_alignment_loss_weight,
+        attention_alignment_layers=attention_alignment_layers,
+        attention_alignment_max_query_tokens=attention_alignment_max_query_tokens,
+        attention_alignment_valid_radius=attention_alignment_valid_radius,
+        attention_alignment_invalid_attention_weight=attention_alignment_invalid_attention_weight,
         satellite_encoder_config=satellite_encoder_config,
     )
 
@@ -262,6 +274,11 @@ class SDTrainer:
             logger.info(f"  Query UV PE enabled: {bool(getattr(unet, 'query_uv_pe_enabled', False))}")
             logger.info(f"  Query UV gate init: {float(getattr(unet, 'query_uv_gate_init', 0.0))}")
             logger.info(f"  Query geometry bias enabled: {bool(getattr(unet, 'query_geometry_bias_enabled', False))}")
+            logger.info(f"  Attention alignment enabled: {bool(getattr(unwrapped, 'attention_alignment_enabled', False))}")
+            logger.info(
+                "  Attention alignment loss weight: %.6g",
+                float(getattr(unwrapped, "attention_alignment_loss_weight", 0.0)),
+            )
             if self.use_wandb:
                 logger.info(
                     f"  W&B logging: project={self.project_name}, "
@@ -707,6 +724,8 @@ class SDTrainer:
             total_raw_loss += raw_loss.item()
             finite_loss_batches += 1
             postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
+            if torch.is_tensor(outputs.get("attention_alignment_mean_error")):
+                postfix["attn_err"] = f"{outputs['attention_alignment_mean_error'].detach().float().item():.3f}"
             if self.is_main_process:
                 progress_bar.set_postfix(postfix)
 
@@ -723,6 +742,19 @@ class SDTrainer:
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
                     'train/epoch': epoch + 1,
                 }
+                metric_name_map = {
+                    "denoise_loss": "train/denoise_loss",
+                    "attention_alignment_loss": "train/attention_alignment/loss",
+                    "attention_alignment_mean_error": "train/attention_alignment/mean_error",
+                    "attention_alignment_valid_query_ratio": "train/attention_alignment/valid_query_ratio",
+                    "attention_alignment_valid_attention_mass": "train/attention_alignment/valid_attention_mass",
+                    "attention_alignment_loss_weight": "train/attention_alignment/loss_weight",
+                    "attention_alignment_loss_is_differentiable": "train/attention_alignment/loss_is_differentiable",
+                }
+                for output_key, metric_key in metric_name_map.items():
+                    value = outputs.get(output_key)
+                    if torch.is_tensor(value):
+                        log_payload[metric_key] = float(value.detach().float().item())
                 if last_grad_norm is not None:
                     log_payload['train/grad_norm'] = last_grad_norm
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))

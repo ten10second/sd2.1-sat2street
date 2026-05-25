@@ -78,6 +78,19 @@ training:
     # 感知 loss 权重
     lambda_perceptual: 0.01
 
+  # Cross-attention alignment diagnostics for query UV -> satellite patch matching.
+  # Default is monitor-only. Set loss_weight > 0 only for runs without UNet
+  # gradient_checkpointing, otherwise the captured loss is logged but not
+  # a reliable differentiable training objective.
+  attention_alignment:
+    enable: true
+    loss_weight: 0.0
+    layers:
+      - 'mid_block.attentions.0.transformer_blocks.0.attn2'
+    max_query_tokens: 256
+    valid_radius: 0.25
+    invalid_attention_weight: 0.1
+
 # 保存配置
 checkpoint:
   save_dir: './checkpoints'

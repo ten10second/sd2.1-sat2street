@@ -326,6 +326,56 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
 
         self.assertEqual(output.shape, hidden_states.shape)
 
+    def test_query_uv_attn_processor_records_attention_alignment(self) -> None:
+        from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
+
+        torch.manual_seed(0)
+        layer_name = "test_block.attn2"
+        attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)
+        attn.set_processor(
+            QueryUVAttnProcessor2_0(
+                query_dim=int(attn.to_q.out_features),
+                query_uv_enabled=False,
+                geometry_bias_enabled=False,
+                layer_name=layer_name,
+            )
+        )
+        hidden_states = torch.randn(1, 4, 8)
+        encoder_hidden_states = torch.randn(1, 4, 8)
+        sat_perspective_uv = build_normalized_image_uv_grid(
+            2,
+            2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        attention_alignment = {
+            "enabled": True,
+            "layers": [layer_name],
+            "max_query_tokens": 4,
+            "valid_radius": 0.75,
+            "losses": [],
+            "metrics": [],
+            "debug_storage": {},
+        }
+
+        output = attn(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            query_base_hw=(2, 2),
+            sat_perspective_uv=sat_perspective_uv,
+            sat_perspective_valid=torch.ones((1, 4), dtype=torch.bool),
+            attention_alignment=attention_alignment,
+        )
+
+        self.assertEqual(output.shape, hidden_states.shape)
+        self.assertEqual(len(attention_alignment["losses"]), 1)
+        self.assertEqual(len(attention_alignment["metrics"]), 1)
+        self.assertTrue(torch.is_tensor(attention_alignment["losses"][0]))
+        self.assertIn(layer_name, attention_alignment["debug_storage"])
+        payload = attention_alignment["debug_storage"][layer_name]
+        self.assertEqual(payload["attention"].shape, (1, 4, 4))
+        self.assertEqual(payload["query_hw"], (2, 2))
+
     def test_query_geometry_bias_runs_without_query_uv_pe(self) -> None:
         from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
 
@@ -500,6 +550,57 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         ).sample
 
         self.assertEqual(output.shape, latents.shape)
+
+    def test_unet_attention_debug_captures_selected_cross_attention_layer(self) -> None:
+        torch.manual_seed(0)
+        model = SatelliteConditionedUNet(
+            sample_size=8,
+            in_channels=4,
+            out_channels=4,
+            center_input_sample=False,
+            flip_sin_to_cos=True,
+            freq_shift=0,
+            down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(16, 32),
+            layers_per_block=1,
+            cross_attention_dim=16,
+            attention_head_dim=8,
+            norm_num_groups=8,
+            query_uv_pe_enabled=True,
+            query_geometry_bias_enabled=False,
+        )
+        layer_name = next(
+            name.removesuffix(".processor")
+            for name in model.attn_processors
+            if name.endswith(".attn2.processor")
+        )
+        storage = {}
+        model.enable_attention_debug(layers=[layer_name], storage=storage)
+
+        latents = torch.randn(1, 4, 8, 8)
+        encoder_hidden_states = torch.randn(1, 4, 16)
+        sat_perspective_uv = build_normalized_image_uv_grid(
+            2,
+            2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        output = model(
+            latents,
+            torch.tensor([0], dtype=torch.long),
+            encoder_hidden_states=encoder_hidden_states,
+            cross_attention_kwargs={
+                "query_base_hw": (8, 8),
+                "sat_perspective_uv": sat_perspective_uv,
+                "sat_perspective_valid": torch.ones((1, 4), dtype=torch.bool),
+            },
+        ).sample
+        model.disable_attention_debug()
+
+        self.assertEqual(output.shape, latents.shape)
+        self.assertIn(layer_name, storage)
+        self.assertEqual(storage[layer_name]["attention"].shape[0], 1)
 
     def test_model_forward_stores_perspective_state_and_uses_only_sat_tokens(self) -> None:
         torch.manual_seed(0)
