@@ -274,6 +274,7 @@ class SDTrainer:
             logger.info(f"  Query UV PE enabled: {bool(getattr(unet, 'query_uv_pe_enabled', False))}")
             logger.info(f"  Query UV gate init: {float(getattr(unet, 'query_uv_gate_init', 0.0))}")
             logger.info(f"  Query geometry bias enabled: {bool(getattr(unet, 'query_geometry_bias_enabled', False))}")
+            logger.info(f"  Query geometry score enabled: {bool(getattr(unet, 'query_geometry_score_enabled', False))}")
             logger.info(f"  Attention alignment enabled: {bool(getattr(unwrapped, 'attention_alignment_enabled', False))}")
             logger.info(
                 "  Attention alignment loss weight: %.6g",
@@ -758,6 +759,9 @@ class SDTrainer:
                     "attention_alignment_query_pe_ratio": "train/attention_alignment/query_pe_ratio",
                     "attention_alignment_query_uv_gate": "train/attention_alignment/query_uv_gate",
                     "attention_alignment_key_content_norm": "train/attention_alignment/key_content_norm",
+                    "attention_alignment_geometry_score_gate": "train/attention_alignment/geometry_score_gate",
+                    "attention_alignment_geometry_score_raw_std": "train/attention_alignment/geometry_score_raw_std",
+                    "attention_alignment_geometry_score_bias_std": "train/attention_alignment/geometry_score_bias_std",
                     "attention_alignment_loss_weight": "train/attention_alignment/loss_weight",
                     "attention_alignment_loss_is_differentiable": "train/attention_alignment/loss_is_differentiable",
                 }

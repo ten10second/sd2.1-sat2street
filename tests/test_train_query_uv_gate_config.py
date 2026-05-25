@@ -6,6 +6,7 @@ from pathlib import Path
 _TRAIN_MODULE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "train.py"))
 _resolve_query_uv_config = _TRAIN_MODULE["_resolve_query_uv_config"]
 _resolve_query_geometry_bias_config = _TRAIN_MODULE["_resolve_query_geometry_bias_config"]
+_resolve_query_geometry_score_config = _TRAIN_MODULE["_resolve_query_geometry_score_config"]
 _resolve_unet_attention_slicing_config = _TRAIN_MODULE["_resolve_unet_attention_slicing_config"]
 _resolve_gradient_checkpointing_config = _TRAIN_MODULE["_resolve_gradient_checkpointing_config"]
 _collect_cli_options = _TRAIN_MODULE["_collect_cli_options"]
@@ -37,6 +38,28 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(scale, 2.0)
         self.assertEqual(invalid_penalty, -1e4)
+
+    def test_geometry_score_reads_layers_and_gate(self) -> None:
+        config = _resolve_query_geometry_score_config(
+            {
+                "model": {
+                    "query_geometry_score": {
+                        "enable": True,
+                        "dim": 32,
+                        "num_freqs": 4,
+                        "gate_init": 0.5,
+                        "layers": ["mid.attn2"],
+                        "max_query_tokens": None,
+                    }
+                }
+            }
+        )
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["dim"], 32)
+        self.assertEqual(config["num_freqs"], 4)
+        self.assertEqual(config["gate_init"], 0.5)
+        self.assertEqual(config["layers"], ["mid.attn2"])
+        self.assertIsNone(config["max_query_tokens"])
 
     def test_unet_attention_slicing_defaults_to_disabled(self) -> None:
         self.assertFalse(_resolve_unet_attention_slicing_config({}))

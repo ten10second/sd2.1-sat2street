@@ -52,8 +52,21 @@ model:
 
   # Query-side UV positional encoding for UNet cross-attention
   query_position_encoding:
-    enable: true
+    enable: false
     gate_init: 0.05
+
+  # Learned soft geometry score added to selected cross-attention logits.
+  # Unlike query_geometry_bias, this compares shared Fourier Q/K coordinates
+  # instead of directly writing a distance penalty into attention.
+  query_geometry_score:
+    enable: true
+    dim: 64
+    num_freqs: 6
+    gate_init: 1.0
+    layers:
+      - 'down_blocks.2.attentions.1.transformer_blocks.0.attn2'
+      - 'mid_block.attentions.0.transformer_blocks.0.attn2'
+    max_query_tokens: 256
 
   # Direct geometry bias on cross-attention scores
   query_geometry_bias:

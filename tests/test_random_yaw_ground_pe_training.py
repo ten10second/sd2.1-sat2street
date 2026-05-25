@@ -381,6 +381,55 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertEqual(payload["attention"].shape, (1, 4, 4))
         self.assertEqual(payload["query_hw"], (2, 2))
 
+    def test_query_geometry_score_lifts_matching_attention_targets(self) -> None:
+        from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
+
+        torch.manual_seed(0)
+        layer_name = "test_block.attn2"
+        attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)
+        attn.set_processor(
+            QueryUVAttnProcessor2_0(
+                query_dim=int(attn.to_q.out_features),
+                query_uv_enabled=False,
+                geometry_bias_enabled=False,
+                geometry_score_enabled=True,
+                geometry_score_dim=8,
+                geometry_score_gate_init=2.0,
+                geometry_score_layers=(layer_name,),
+                layer_name=layer_name,
+            )
+        )
+        hidden_states = torch.zeros(1, 4, 8)
+        encoder_hidden_states = torch.zeros(1, 4, 8)
+        sat_perspective_uv = build_normalized_image_uv_grid(
+            2,
+            2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        attention_alignment = {
+            "enabled": True,
+            "layers": [layer_name],
+            "max_query_tokens": 4,
+            "valid_radius": 0.2,
+            "losses": [],
+            "metrics": [],
+        }
+
+        _ = attn(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            query_base_hw=(2, 2),
+            sat_perspective_uv=sat_perspective_uv,
+            sat_perspective_valid=torch.ones((1, 4), dtype=torch.bool),
+            attention_alignment=attention_alignment,
+        )
+
+        metric = attention_alignment["metrics"][0]
+        self.assertGreater(float(metric["target_attention_lift"]), 1.0)
+        self.assertGreater(float(metric["target_logit_gap"]), 0.0)
+        self.assertIn("geometry_score_gate", metric)
+
     def test_query_geometry_bias_runs_without_query_uv_pe(self) -> None:
         from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
 

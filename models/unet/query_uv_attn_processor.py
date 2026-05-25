@@ -68,6 +68,12 @@ class _QueryUVAttnProcessorBase(nn.Module):
         *,
         query_uv_enabled: bool,
         geometry_bias_enabled: bool,
+        geometry_score_enabled: bool = False,
+        geometry_score_dim: int = 64,
+        geometry_score_num_freqs: int = 6,
+        geometry_score_gate_init: float = 1.0,
+        geometry_score_layers: Optional[Tuple[str, ...]] = None,
+        geometry_score_max_query_tokens: Optional[int] = 256,
         geometry_bias_scale: float = 2.0,
         geometry_invalid_penalty: float = -1e4,
         gate_init: float = 0.0,
@@ -77,6 +83,19 @@ class _QueryUVAttnProcessorBase(nn.Module):
         self.query_dim = int(query_dim)
         self.query_uv_enabled = bool(query_uv_enabled)
         self.geometry_bias_enabled = bool(geometry_bias_enabled)
+        self.geometry_score_enabled = bool(geometry_score_enabled)
+        self.geometry_score_dim = int(geometry_score_dim)
+        self.geometry_score_num_freqs = int(geometry_score_num_freqs)
+        self.geometry_score_layers = (
+            None
+            if geometry_score_layers is None
+            else tuple(str(layer) for layer in geometry_score_layers)
+        )
+        self.geometry_score_max_query_tokens = (
+            None
+            if geometry_score_max_query_tokens is None
+            else int(geometry_score_max_query_tokens)
+        )
         self.geometry_bias_scale = float(geometry_bias_scale)
         self.geometry_invalid_penalty = float(geometry_invalid_penalty)
         self.layer_name = layer_name
@@ -87,6 +106,15 @@ class _QueryUVAttnProcessorBase(nn.Module):
         else:
             self.query_uv_encoder = None
             self.register_parameter("query_uv_gate", None)
+
+        if self.geometry_score_enabled:
+            fourier_dim = 4 * self.geometry_score_num_freqs
+            self.geometry_score_proj = nn.Linear(fourier_dim, self.geometry_score_dim, bias=False)
+            nn.init.orthogonal_(self.geometry_score_proj.weight)
+            self.geometry_score_gate = nn.Parameter(torch.tensor(float(geometry_score_gate_init)))
+        else:
+            self.geometry_score_proj = None
+            self.register_parameter("geometry_score_gate", None)
 
     def __call__(
         self,
@@ -219,6 +247,70 @@ class _QueryUVAttnProcessorBase(nn.Module):
         if max_query_tokens is not None and int(query_tokens) > int(max_query_tokens):
             return False
         return True
+
+    def _should_apply_geometry_score(
+        self,
+        *,
+        query_tokens: int,
+        is_cross_attention: bool,
+    ) -> bool:
+        if not is_cross_attention or not self.geometry_score_enabled:
+            return False
+        if self.layer_name is None:
+            return False
+        if self.geometry_score_layers is not None and self.layer_name not in self.geometry_score_layers:
+            return False
+        if (
+            self.geometry_score_max_query_tokens is not None
+            and int(query_tokens) > int(self.geometry_score_max_query_tokens)
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _fourier_encode_geometry(uv: torch.Tensor, num_freqs: int) -> torch.Tensor:
+        freqs = (2.0 ** torch.arange(num_freqs, dtype=uv.dtype, device=uv.device)) * torch.pi
+        uv_exp = uv.unsqueeze(-1) * freqs
+        enc = torch.cat([torch.sin(uv_exp), torch.cos(uv_exp)], dim=-1)
+        return enc.flatten(-2)
+
+    def _build_geometry_score_bias(
+        self,
+        query_uv: torch.Tensor,
+        sat_perspective_uv: Optional[torch.Tensor],
+        sat_perspective_valid: Optional[torch.Tensor],
+        *,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if self.geometry_score_proj is None or self.geometry_score_gate is None or sat_perspective_uv is None:
+            return None, {}
+
+        query_features = self._fourier_encode_geometry(
+            query_uv.float(),
+            self.geometry_score_num_freqs,
+        )
+        sat_features = self._fourier_encode_geometry(
+            sat_perspective_uv.float(),
+            self.geometry_score_num_freqs,
+        )
+        query_geo = self.geometry_score_proj(query_features.to(dtype=self.geometry_score_proj.weight.dtype))
+        sat_geo = self.geometry_score_proj(sat_features.to(dtype=self.geometry_score_proj.weight.dtype))
+        query_geo = F.normalize(query_geo.float(), dim=-1)
+        sat_geo = F.normalize(sat_geo.float(), dim=-1)
+
+        if sat_perspective_valid is not None:
+            sat_valid = sat_perspective_valid.to(device=sat_geo.device, dtype=torch.bool)
+            sat_geo = sat_geo * sat_valid.unsqueeze(-1).to(dtype=sat_geo.dtype)
+
+        raw_score = torch.matmul(query_geo, sat_geo.transpose(-1, -2))
+        gate = self.geometry_score_gate.float()
+        score = (gate * raw_score).to(dtype=dtype)
+        metrics = {
+            "geometry_score_gate": gate.detach(),
+            "geometry_score_raw_std": raw_score.detach().float().std(),
+            "geometry_score_bias_std": score.detach().float().std(),
+        }
+        return score, metrics
 
     @staticmethod
     def _infer_square_hw(token_count: int) -> Optional[Tuple[int, int]]:
@@ -468,13 +560,22 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
             query_tokens=hidden_states.shape[1],
             is_cross_attention=is_cross_attention,
         )
+        apply_geometry_score = self._should_apply_geometry_score(
+            query_tokens=hidden_states.shape[1],
+            is_cross_attention=is_cross_attention,
+        )
         query = attn.to_q(hidden_states)
         query_pe_metrics: Dict[str, torch.Tensor] = {}
         if collect_alignment:
             query_norm = query.float().norm(dim=-1).mean()
             query_pe_metrics["query_content_norm"] = query_norm
         query_uv_tensor = None
-        if is_cross_attention and (self.query_uv_enabled or self.geometry_bias_enabled or collect_alignment):
+        if is_cross_attention and (
+            self.query_uv_enabled
+            or self.geometry_bias_enabled
+            or apply_geometry_score
+            or collect_alignment
+        ):
             query_uv_tensor = self._resolve_query_uv(
                 hidden_states,
                 batch_size=hidden_states.shape[0],
@@ -518,7 +619,7 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
 
         sat_uv = None
         sat_valid = None
-        if (self.geometry_bias_enabled or collect_alignment) and is_cross_attention:
+        if (self.geometry_bias_enabled or apply_geometry_score or collect_alignment) and is_cross_attention:
             sat_uv, sat_valid = self._resolve_sat_perspective_uv(
                 hidden_states,
                 batch_size=hidden_states.shape[0],
@@ -526,6 +627,22 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
                 sat_perspective_uv=sat_perspective_uv,
                 sat_perspective_valid=sat_perspective_valid,
             )
+        if apply_geometry_score and query_uv_tensor is not None:
+            geometry_score_bias, geometry_score_metrics = self._build_geometry_score_bias(
+                query_uv_tensor,
+                sat_uv,
+                sat_valid,
+                dtype=query.dtype,
+            )
+            if collect_alignment:
+                query_pe_metrics.update(geometry_score_metrics)
+            if geometry_score_bias is not None:
+                geometry_score_bias = geometry_score_bias.unsqueeze(1)
+                attention_mask = (
+                    geometry_score_bias
+                    if attention_mask is None
+                    else attention_mask + geometry_score_bias
+                )
         if self.geometry_bias_enabled and is_cross_attention:
             if query_uv_tensor is None:
                 query_uv_tensor = self._resolve_query_uv(
@@ -597,6 +714,12 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
         slice_size: int,
         query_uv_enabled: bool,
         geometry_bias_enabled: bool,
+        geometry_score_enabled: bool = False,
+        geometry_score_dim: int = 64,
+        geometry_score_num_freqs: int = 6,
+        geometry_score_gate_init: float = 1.0,
+        geometry_score_layers: Optional[Tuple[str, ...]] = None,
+        geometry_score_max_query_tokens: Optional[int] = 256,
         geometry_bias_scale: float = 2.0,
         geometry_invalid_penalty: float = -1e4,
         gate_init: float = 0.0,
@@ -606,6 +729,12 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
             query_dim=query_dim,
             query_uv_enabled=query_uv_enabled,
             geometry_bias_enabled=geometry_bias_enabled,
+            geometry_score_enabled=geometry_score_enabled,
+            geometry_score_dim=geometry_score_dim,
+            geometry_score_num_freqs=geometry_score_num_freqs,
+            geometry_score_gate_init=geometry_score_gate_init,
+            geometry_score_layers=geometry_score_layers,
+            geometry_score_max_query_tokens=geometry_score_max_query_tokens,
             geometry_bias_scale=geometry_bias_scale,
             geometry_invalid_penalty=geometry_invalid_penalty,
             gate_init=gate_init,
@@ -660,13 +789,22 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
             query_tokens=hidden_states.shape[1],
             is_cross_attention=is_cross_attention,
         )
+        apply_geometry_score = self._should_apply_geometry_score(
+            query_tokens=hidden_states.shape[1],
+            is_cross_attention=is_cross_attention,
+        )
         query = attn.to_q(hidden_states)
         query_pe_metrics: Dict[str, torch.Tensor] = {}
         if collect_alignment:
             query_norm = query.float().norm(dim=-1).mean()
             query_pe_metrics["query_content_norm"] = query_norm
         query_uv_tensor = None
-        if is_cross_attention and (self.query_uv_enabled or self.geometry_bias_enabled or collect_alignment):
+        if is_cross_attention and (
+            self.query_uv_enabled
+            or self.geometry_bias_enabled
+            or apply_geometry_score
+            or collect_alignment
+        ):
             query_uv_tensor = self._resolve_query_uv(
                 hidden_states,
                 batch_size=hidden_states.shape[0],
@@ -707,7 +845,7 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
 
         sat_uv = None
         sat_valid = None
-        if (self.geometry_bias_enabled or collect_alignment) and is_cross_attention:
+        if (self.geometry_bias_enabled or apply_geometry_score or collect_alignment) and is_cross_attention:
             sat_uv, sat_valid = self._resolve_sat_perspective_uv(
                 hidden_states,
                 batch_size=batch_size,
@@ -715,6 +853,22 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
                 sat_perspective_uv=sat_perspective_uv,
                 sat_perspective_valid=sat_perspective_valid,
             )
+        if apply_geometry_score and query_uv_tensor is not None:
+            geometry_score_bias, geometry_score_metrics = self._build_geometry_score_bias(
+                query_uv_tensor,
+                sat_uv,
+                sat_valid,
+                dtype=query.dtype,
+            )
+            if collect_alignment:
+                query_pe_metrics.update(geometry_score_metrics)
+            if geometry_score_bias is not None:
+                geometry_score_bias = geometry_score_bias.repeat_interleave(attn.heads, dim=0)
+                attention_mask = (
+                    geometry_score_bias
+                    if attention_mask is None
+                    else attention_mask + geometry_score_bias
+                )
         if self.geometry_bias_enabled and is_cross_attention:
             if query_uv_tensor is None:
                 query_uv_tensor = self._resolve_query_uv(
