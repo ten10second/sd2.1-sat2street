@@ -1,5 +1,6 @@
 import runpy
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 
@@ -7,6 +8,7 @@ _TRAIN_MODULE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "script
 _resolve_query_uv_config = _TRAIN_MODULE["_resolve_query_uv_config"]
 _resolve_query_geometry_bias_config = _TRAIN_MODULE["_resolve_query_geometry_bias_config"]
 _resolve_query_geometry_score_config = _TRAIN_MODULE["_resolve_query_geometry_score_config"]
+_attach_query_geometry_score_args = _TRAIN_MODULE["_attach_query_geometry_score_args"]
 _resolve_unet_attention_slicing_config = _TRAIN_MODULE["_resolve_unet_attention_slicing_config"]
 _resolve_gradient_checkpointing_config = _TRAIN_MODULE["_resolve_gradient_checkpointing_config"]
 _collect_cli_options = _TRAIN_MODULE["_collect_cli_options"]
@@ -60,6 +62,31 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
         self.assertEqual(config["gate_init"], 0.5)
         self.assertEqual(config["layers"], ["mid.attn2"])
         self.assertIsNone(config["max_query_tokens"])
+
+    def test_geometry_score_config_is_attached_to_training_args(self) -> None:
+        args = Namespace()
+        config = {
+            "model": {
+                "query_geometry_score": {
+                    "enable": True,
+                    "dim": 96,
+                    "num_freqs": 5,
+                    "gate_init": 0.75,
+                    "layers": ["down.attn2", "mid.attn2"],
+                    "max_query_tokens": 128,
+                }
+            }
+        }
+
+        resolved = _attach_query_geometry_score_args(args, config)
+
+        self.assertTrue(resolved["enabled"])
+        self.assertTrue(args.query_geometry_score_enabled)
+        self.assertEqual(args.query_geometry_score_dim, 96)
+        self.assertEqual(args.query_geometry_score_num_freqs, 5)
+        self.assertEqual(args.query_geometry_score_gate_init, 0.75)
+        self.assertEqual(args.query_geometry_score_layers, ["down.attn2", "mid.attn2"])
+        self.assertEqual(args.query_geometry_score_max_query_tokens, 128)
 
     def test_unet_attention_slicing_defaults_to_disabled(self) -> None:
         self.assertFalse(_resolve_unet_attention_slicing_config({}))

@@ -274,6 +274,17 @@ def _resolve_query_geometry_score_config(config: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def _attach_query_geometry_score_args(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
+    score_config = _resolve_query_geometry_score_config(config)
+    args.query_geometry_score_enabled = score_config["enabled"]
+    args.query_geometry_score_dim = score_config["dim"]
+    args.query_geometry_score_num_freqs = score_config["num_freqs"]
+    args.query_geometry_score_gate_init = score_config["gate_init"]
+    args.query_geometry_score_layers = score_config["layers"]
+    args.query_geometry_score_max_query_tokens = score_config["max_query_tokens"]
+    return score_config
+
+
 def _resolve_attention_alignment_config(config: Dict[str, Any]) -> Dict[str, Any]:
     alignment_config = dict(_config_get(config, ("training", "attention_alignment"), {}) or {})
     layers = alignment_config.get("layers")
@@ -662,6 +673,7 @@ def main():
     perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
     query_uv_pe_enabled, query_uv_gate_init = _resolve_query_uv_config(config)
     query_geometry_bias_enabled, query_geometry_bias_scale, query_geometry_invalid_penalty = _resolve_query_geometry_bias_config(config)
+    query_geometry_score_config = _attach_query_geometry_score_args(args, config)
     attention_alignment_config = _resolve_attention_alignment_config(config)
     args.perspective_pe_enabled = perspective_pe_enabled
     args.query_uv_pe_enabled = query_uv_pe_enabled
@@ -832,6 +844,12 @@ def main():
         query_geometry_bias_enabled=query_geometry_bias_enabled,
         query_geometry_bias_scale=query_geometry_bias_scale,
         query_geometry_invalid_penalty=query_geometry_invalid_penalty,
+        query_geometry_score_enabled=query_geometry_score_config["enabled"],
+        query_geometry_score_dim=query_geometry_score_config["dim"],
+        query_geometry_score_num_freqs=query_geometry_score_config["num_freqs"],
+        query_geometry_score_gate_init=query_geometry_score_config["gate_init"],
+        query_geometry_score_layers=query_geometry_score_config["layers"],
+        query_geometry_score_max_query_tokens=query_geometry_score_config["max_query_tokens"],
         query_uv_gate_init=query_uv_gate_init,
         attention_alignment_enabled=attention_alignment_config["enabled"],
         attention_alignment_loss_weight=attention_alignment_config["loss_weight"],
