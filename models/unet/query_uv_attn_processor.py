@@ -462,6 +462,8 @@ class _QueryUVAttnProcessorBase(nn.Module):
                 "front_xy": query_uv_f.detach().cpu(),
                 "sat_xy": sat_uv.detach().cpu(),
                 "query_mask": query_mask.detach().cpu(),
+                "target_mask": target_mask.detach().cpu(),
+                "valid_radius": valid_radius,
                 "query_hw": query_hw,
                 "sat_hw": self._infer_square_hw(sat_uv.shape[1]),
             }

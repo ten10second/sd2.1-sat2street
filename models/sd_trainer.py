@@ -1126,6 +1126,78 @@ class SDTrainer:
         draw.line((x, y - radius * 1.6, x, y + radius * 1.6), fill=color + (255,), width=2)
 
     @staticmethod
+    def _draw_query_position_inset(
+        image: Image.Image,
+        *,
+        query_index: int,
+        query_hw: Tuple[int, int],
+    ) -> None:
+        draw = ImageDraw.Draw(image, "RGBA")
+        width, height = image.size
+        query_h, query_w = int(query_hw[0]), int(query_hw[1])
+        if query_h <= 0 or query_w <= 0:
+            return
+
+        inset_w = max(72, min(128, width // 4))
+        inset_h = max(44, min(80, height // 6))
+        margin = 8
+        left = width - inset_w - margin
+        top = height - inset_h - margin
+        right = width - margin
+        bottom = height - margin
+        draw.rectangle((left, top, right, bottom), fill=(0, 0, 0, 150), outline=(255, 255, 255, 170), width=1)
+
+        grid_left = left + 8
+        grid_top = top + 8
+        grid_right = right - 8
+        grid_bottom = bottom - 8
+        draw.rectangle((grid_left, grid_top, grid_right, grid_bottom), outline=(180, 180, 180, 170), width=1)
+
+        row = int(query_index) // query_w
+        col = int(query_index) % query_w
+        x = grid_left + (float(col) + 0.5) / float(query_w) * float(max(1, grid_right - grid_left))
+        y = grid_top + (float(row) + 0.5) / float(query_h) * float(max(1, grid_bottom - grid_top))
+        radius = 4
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 0, 255, 240))
+        draw.line((x - radius * 2, y, x + radius * 2, y), fill=(255, 0, 255, 240), width=1)
+        draw.line((x, y - radius * 2, x, y + radius * 2), fill=(255, 0, 255, 240), width=1)
+
+    @staticmethod
+    def _draw_target_patch_mask(
+        image: Image.Image,
+        target_mask: Optional[torch.Tensor],
+        *,
+        sat_hw: Tuple[int, int],
+    ) -> None:
+        if target_mask is None or not torch.is_tensor(target_mask):
+            return
+
+        mask = target_mask.detach().cpu().reshape(-1).bool()
+        sat_h, sat_w = int(sat_hw[0]), int(sat_hw[1])
+        if sat_h <= 0 or sat_w <= 0 or mask.numel() != sat_h * sat_w:
+            return
+
+        draw = ImageDraw.Draw(image, "RGBA")
+        width, height = image.size
+        true_indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+        if not true_indices:
+            return
+
+        for token_index in true_indices:
+            row = int(token_index) // sat_w
+            col = int(token_index) % sat_w
+            left = col / float(sat_w) * width
+            right = (col + 1) / float(sat_w) * width
+            top = row / float(sat_h) * height
+            bottom = (row + 1) / float(sat_h) * height
+            draw.rectangle(
+                (left, top, right, bottom),
+                fill=(0, 255, 210, 45),
+                outline=(0, 255, 255, 185),
+                width=1,
+            )
+
+    @staticmethod
     def _select_attention_query_indices(
         query_mask: Optional[torch.Tensor],
         query_hw: Tuple[int, int],
@@ -1196,6 +1268,9 @@ class SDTrainer:
             query_mask = payload.get("query_mask")
             if torch.is_tensor(query_mask):
                 query_mask = query_mask[0]
+            target_mask = payload.get("target_mask")
+            if torch.is_tensor(target_mask):
+                target_mask = target_mask[0]
 
             if sat_hw is None:
                 side = int(math.isqrt(attention.shape[-1]))
@@ -1210,12 +1285,25 @@ class SDTrainer:
                 heat = attention[query_index].reshape(int(sat_hw[0]), int(sat_hw[1]))
                 heat_pil = self._heatmap_to_pil(heat, size=(sat_width, sat_height))
                 overlay = Image.blend(sat_base, heat_pil, alpha=0.55)
-                self._draw_target_marker(overlay, front_xy[query_index], color=(0, 255, 255))
+                query_target_mask = (
+                    target_mask[query_index]
+                    if torch.is_tensor(target_mask)
+                    and target_mask.ndim == 2
+                    and int(query_index) < int(target_mask.shape[0])
+                    else None
+                )
+                self._draw_target_patch_mask(overlay, query_target_mask, sat_hw=sat_hw)
                 draw = ImageDraw.Draw(overlay, "RGBA")
                 row = int(query_index) // int(query_hw[1])
                 col = int(query_index) % int(query_hw[1])
-                draw.rectangle((4, 4, 150, 25), fill=(0, 0, 0, 150))
-                draw.text((8, 8), f"q=({row},{col})", fill=(255, 255, 255, 255))
+                draw.rectangle((4, 4, 260, 42), fill=(0, 0, 0, 150))
+                draw.text((8, 8), f"q=({row},{col}) magenta=image query", fill=(255, 255, 255, 255))
+                draw.text((8, 24), "red/yellow=attention  cyan=target sat patches", fill=(255, 255, 255, 255))
+                self._draw_query_position_inset(
+                    overlay,
+                    query_index=int(query_index),
+                    query_hw=(int(query_hw[0]), int(query_hw[1])),
+                )
                 heatmaps.append(overlay)
                 overlay.save(output_dir / f"{prefix}_{layer_token}_q{query_index:04d}_sat_heatmap.png")
 
