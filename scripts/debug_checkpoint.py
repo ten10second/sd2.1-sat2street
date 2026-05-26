@@ -42,9 +42,62 @@ def check_gate_values(state_dict: dict) -> None:
         print("  ✓ Gates are non-zero, Q UV PE is active.")
 
 
+def check_geometry_score_branch(state_dict: dict) -> None:
+    """Check the soft query/satellite geometry-score attention branch."""
+    _section("2. Query Geometry Score branch")
+
+    geometry_keys = sorted([k for k in state_dict if "geometry_score" in k])
+    if not geometry_keys:
+        print("  No geometry_score keys found.")
+        print("  ⚠️  This checkpoint was not trained with query_geometry_score enabled,")
+        print("      or the training entrypoint did not wire the YAML config into the model.")
+        return
+
+    gate_keys = [k for k in geometry_keys if k.endswith("geometry_score_gate")]
+    proj_keys = [k for k in geometry_keys if k.endswith("geometry_score_proj.weight")]
+    print(f"  geometry_score keys: {len(geometry_keys)}")
+    print(f"  gates: {len(gate_keys)}, projections: {len(proj_keys)}")
+
+    for k in gate_keys:
+        gate = float(state_dict[k].detach().cpu())
+        print(f"  {k}: {gate:.6f}")
+
+    if gate_keys:
+        gates = torch.stack([state_dict[k].detach().float().cpu().reshape(()) for k in gate_keys])
+        print(
+            "  gate summary: "
+            f"mean={float(gates.mean()):.6f} "
+            f"min={float(gates.min()):.6f} "
+            f"max={float(gates.max()):.6f} "
+            f"max|gate-1|={float((gates - 1.0).abs().max()):.6f}"
+        )
+
+    for k in proj_keys[:12]:
+        w = state_dict[k].detach().float().cpu()
+        print(
+            f"  {k}: shape={tuple(w.shape)} "
+            f"mean={float(w.mean()):.6f} std={float(w.std()):.6f} "
+            f"max_abs={float(w.abs().max()):.6f}"
+        )
+    if len(proj_keys) > 12:
+        print(f"  ... ({len(proj_keys)} total projection weights)")
+
+    selected = [
+        k for k in gate_keys
+        if (
+            "down_blocks.2.attentions.1.transformer_blocks.0.attn2" in k
+            or "mid_block.attentions.0.transformer_blocks.0.attn2" in k
+        )
+    ]
+    if not selected:
+        print("  ⚠️  No geometry_score_gate found for the configured diagnostic layers.")
+    else:
+        print(f"  ✓ Configured diagnostic layers have geometry score gates: {len(selected)}")
+
+
 def check_perspective_pe(state_dict: dict) -> None:
     """Check perspective_pos_encoder weights."""
-    _section("2. Perspective Position Encoder weights")
+    _section("3. Perspective Position Encoder weights")
 
     pe_keys = sorted([k for k in state_dict if "perspective_pos_encoder" in k])
     if not pe_keys:
@@ -77,7 +130,7 @@ def check_perspective_pe(state_dict: dict) -> None:
 
 def check_self_attn(state_dict: dict) -> None:
     """Check satellite encoder 2D-RoPE self-attention weights."""
-    _section("3. Satellite Encoder 2D-RoPE Self-Attention weights")
+    _section("4. Satellite Encoder 2D-RoPE Self-Attention weights")
 
     out_proj_keys = sorted([
         k for k in state_dict
@@ -108,7 +161,7 @@ def check_self_attn(state_dict: dict) -> None:
 
 def check_satellite_spatial_encoding(state_dict: dict) -> None:
     """Check satellite spatial encoding state."""
-    _section("4. Satellite Spatial Encoding")
+    _section("5. Satellite Spatial Encoding")
 
     key = "satellite_encoder.grid_pos_embed"
     if key not in state_dict:
@@ -131,7 +184,7 @@ def check_satellite_spatial_encoding(state_dict: dict) -> None:
 
 def check_attn2_kv(state_dict: dict) -> None:
     """Check attn2 to_k / to_v weight statistics."""
-    _section("5. attn2 to_k / to_v (trainable projections)")
+    _section("6. attn2 to_k / to_v (trainable projections)")
 
     kv_keys = sorted([
         k for k in state_dict
@@ -150,7 +203,7 @@ def check_attn2_kv(state_dict: dict) -> None:
 
 def check_sat_tokens_on_data(checkpoint_path: str, data_dir: str, device: str) -> None:
     """Run forward pass on a few samples and check sat token stats + valid ratio."""
-    _section("6. Runtime checks: perspective_valid ratio & sat token stats")
+    _section("7. Runtime checks: perspective_valid ratio & sat token stats")
 
     from models.sd_model import create_sd_model, load_model_checkpoint
     from data.kitti360d_dataset import Kitti360dDataset
@@ -239,21 +292,22 @@ def main():
     state_dict = ckpt.get("model_state_dict", ckpt)
     print(f"State dict keys: {len(state_dict)}")
 
-    # 1-5: Pure weight inspection (no model/data needed)
+    # 1-6: Pure weight inspection (no model/data needed)
     check_gate_values(state_dict)
+    check_geometry_score_branch(state_dict)
     check_perspective_pe(state_dict)
     check_self_attn(state_dict)
     check_satellite_spatial_encoding(state_dict)
     check_attn2_kv(state_dict)
 
-    # 6: Runtime checks (need model + data)
+    # 7: Runtime checks (need model + data)
     if not args.weights_only:
         try:
             check_sat_tokens_on_data(args.checkpoint, args.data_dir, args.device)
         except Exception as e:
             print(f"\n  ⚠️  Runtime checks failed: {e}")
     else:
-        _section("6. Skipped (--weights_only)")
+        _section("7. Skipped (--weights_only)")
 
     print()
     print("=" * 70)
