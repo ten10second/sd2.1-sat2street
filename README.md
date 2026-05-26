@@ -36,8 +36,7 @@
 ├── scripts/              # 训练和推理脚本
 │   ├── train.py          # 主要训练脚本
 │   ├── infer.py          # 推理脚本
-│   ├── visualize_multiseed.py
-│   └── visualize_yaw_sweep.py
+│   └── verify_*.py / debug_*.py
 ├── requirements.txt      # 依赖包
 ├── README.md            # 项目说明
 └── .gitignore           # Git 忽略文件
