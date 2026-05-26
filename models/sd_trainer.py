@@ -463,6 +463,15 @@ class SDTrainer:
     def _global_step(self, epoch: int, step: int) -> int:
         return epoch * max(1, len(self.train_dataloader)) + step + 1
 
+    @staticmethod
+    def _should_log_train_step(step: int, num_batches: int, log_every: int) -> bool:
+        current_step = int(step) + 1
+        if current_step <= 0 or int(num_batches) <= 0:
+            return False
+        if current_step == int(num_batches):
+            return True
+        return int(log_every) > 0 and current_step % int(log_every) == 0
+
     def _log_scalars(self, metrics: Dict[str, float], step: int) -> None:
         scalar_metrics = {
             key: float(value)
@@ -731,7 +740,7 @@ class SDTrainer:
                 progress_bar.set_postfix(postfix)
 
             # Log
-            if self.is_main_process and (step + 1) % self.log_every == 0:
+            if self.is_main_process and self._should_log_train_step(step, num_batches, self.log_every):
                 logger.info(
                     "Train step %d/%d: raw_loss=%.6f",
                     step + 1,

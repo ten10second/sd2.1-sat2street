@@ -765,6 +765,11 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             self.assertTrue(torch.allclose(model.trainable_weight.detach(), before))
             self.assertEqual(trainer.optimizer.state_dict()["state"], {})
 
+    def test_train_step_logging_always_includes_epoch_tail(self) -> None:
+        self.assertTrue(SDTrainer._should_log_train_step(step=52, num_batches=53, log_every=100))
+        self.assertTrue(SDTrainer._should_log_train_step(step=99, num_batches=153, log_every=100))
+        self.assertFalse(SDTrainer._should_log_train_step(step=51, num_batches=53, log_every=100))
+
     def test_visualization_generation_uses_single_view_batch(self) -> None:
         model = _VisualizationModel()
         dataloader = DataLoader(_SingleSampleDataset(), batch_size=1, shuffle=False)
