@@ -154,11 +154,15 @@ def check_sat_tokens_on_data(checkpoint_path: str, data_dir: str, device: str) -
 
     from models.sd_model import create_sd_model, load_model_checkpoint
     from data.kitti360d_dataset import Kitti360dDataset
+    from utils.yaw_specs import stage1_fixed_yaw_list
 
     print("  Loading model...")
     model = create_sd_model(
         query_uv_pe_enabled=False,
         query_uv_gate_init=0.0,
+        pose_time_enabled=True,
+        pose_time_dim=128,
+        pose_time_gate_init=0.1,
     )
     load_model_checkpoint(model, Path(checkpoint_path), device)
     model = model.to(device)
@@ -171,7 +175,7 @@ def check_sat_tokens_on_data(checkpoint_path: str, data_dir: str, device: str) -
         mode="fisheye_virtual",
         yaw_mode="vehicle_relative",
         vehicle_yaw_sampling="fixed_list",
-        vehicle_yaw_fixed_list=["front", 60.0, 90.0, 120.0, -60.0, -90.0, -120.0],
+        vehicle_yaw_fixed_list=stage1_fixed_yaw_list(),
         view_set="single",
         seed=42,
     )

@@ -15,6 +15,7 @@ from models.encoders.perspective_position_encoder import compute_sat_patch_persp
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
 from models.sd_model import SatelliteConditionedSDModel, SatelliteConditionedUNet
 from models.sd_trainer import SDTrainer
+from utils.yaw_specs import stage1_fixed_yaw_list
 from models.unet.query_uv_attn_processor import (
     QueryUVSlicedAttnProcessor,
     build_normalized_image_uv_grid,
@@ -213,29 +214,29 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         self.assertEqual(dataset._resolve_effective_sample_mode(base_sample, rng, idx=0), "front")
         self.assertEqual(dataset._resolve_effective_sample_mode(override_sample, rng, idx=0), "fisheye_virtual")
 
-    def test_fixed_vehicle_yaw_sampler_uses_front_and_discrete_yaws(self) -> None:
+    def test_fixed_vehicle_yaw_sampler_uses_stage1_discrete_yaws_without_front(self) -> None:
         dataset = Kitti360dDataset.__new__(Kitti360dDataset)
         dataset.mode = "fisheye_virtual"
         dataset.yaw_mode = "vehicle_relative"
         dataset.vehicle_yaw_sampling = "fixed_list"
         dataset.vehicle_yaw_fixed_list = Kitti360dDataset._normalize_vehicle_yaw_fixed_list(
-            ["front", -120.0, -90.0, -60.0, 60.0, 90.0, 120.0]
+            stage1_fixed_yaw_list()
         )
         dataset.front_sample_prob = 0.0
-        dataset.samples = [SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=i, meta=None) for i in range(7)]
+        dataset.samples = [SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=i, meta=None) for i in range(6)]
         dataset.epoch = 0
 
         rng = np.random.RandomState(0)
-        self.assertEqual(dataset._resolve_effective_sample_mode(dataset.samples[0], rng, idx=0), "front")
+        self.assertEqual(dataset._resolve_effective_sample_mode(dataset.samples[0], rng, idx=0), "fisheye_virtual")
         self.assertEqual(dataset._resolve_effective_sample_mode(dataset.samples[1], rng, idx=1), "fisheye_virtual")
-        self.assertIsNone(dataset._choose_fixed_vehicle_yaw(0))
-        self.assertEqual(dataset._choose_fixed_vehicle_yaw(1), -120.0)
-        self.assertEqual(dataset._choose_fixed_vehicle_yaw(6), 120.0)
+        self.assertEqual(dataset._choose_fixed_vehicle_yaw(0), -120.0)
+        self.assertEqual(dataset._choose_fixed_vehicle_yaw(1), -90.0)
+        self.assertEqual(dataset._choose_fixed_vehicle_yaw(5), 120.0)
 
-    def test_fixed_vehicle_yaw_sampler_expands_each_frame_to_all_fixed_views(self) -> None:
+    def test_fixed_vehicle_yaw_sampler_expands_each_frame_to_stage1_yaw_views(self) -> None:
         dataset = Kitti360dDataset.__new__(Kitti360dDataset)
         dataset.vehicle_yaw_fixed_list = Kitti360dDataset._normalize_vehicle_yaw_fixed_list(
-            ["front", -120.0, -90.0, -60.0, 60.0, 90.0, 120.0]
+            stage1_fixed_yaw_list()
         )
         base_samples = [
             SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=10, meta=None),
@@ -244,17 +245,14 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
 
         expanded = dataset._expand_samples_for_fixed_vehicle_yaws(base_samples)
 
-        self.assertEqual(len(expanded), 14)
-        self.assertEqual([sample.frame_id for sample in expanded[:7]], [10] * 7)
-        self.assertEqual([sample.frame_id for sample in expanded[7:]], [11] * 7)
-        self.assertEqual(expanded[0].meta["mode_override"], "front")
-        self.assertEqual(expanded[0].meta["view_name"], "front")
-        self.assertNotIn("vehicle_relative_yaw_deg_override", expanded[0].meta)
-        self.assertEqual(expanded[1].meta["mode_override"], "fisheye_virtual")
-        self.assertEqual(expanded[1].meta["vehicle_relative_yaw_deg_override"], -120.0)
-        self.assertEqual(expanded[1].meta["view_name"], "yaw_m120")
-        self.assertEqual(expanded[6].meta["vehicle_relative_yaw_deg_override"], 120.0)
-        self.assertEqual(expanded[6].meta["view_name"], "yaw_p120")
+        self.assertEqual(len(expanded), 12)
+        self.assertEqual([sample.frame_id for sample in expanded[:6]], [10] * 6)
+        self.assertEqual([sample.frame_id for sample in expanded[6:]], [11] * 6)
+        self.assertTrue(all(sample.meta["mode_override"] == "fisheye_virtual" for sample in expanded))
+        self.assertEqual(expanded[0].meta["vehicle_relative_yaw_deg_override"], -120.0)
+        self.assertEqual(expanded[0].meta["view_name"], "yaw_m120")
+        self.assertEqual(expanded[5].meta["vehicle_relative_yaw_deg_override"], 120.0)
+        self.assertEqual(expanded[5].meta["view_name"], "yaw_p120")
 
     def test_fixed_vehicle_yaw_expands_pitch_roll_only_for_virtual_views(self) -> None:
         dataset = Kitti360dDataset.__new__(Kitti360dDataset)
@@ -558,6 +556,40 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
 
         self.assertEqual(output.shape, latents.shape)
 
+    def test_unet_pose_time_conditioning_changes_with_yaw(self) -> None:
+        torch.manual_seed(0)
+        model = SatelliteConditionedUNet(
+            sample_size=8,
+            in_channels=4,
+            out_channels=4,
+            center_input_sample=False,
+            flip_sin_to_cos=True,
+            freq_shift=0,
+            down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(16, 32),
+            layers_per_block=1,
+            cross_attention_dim=16,
+            attention_head_dim=8,
+            norm_num_groups=8,
+            pose_time_enabled=True,
+            pose_time_dim=8,
+            pose_time_gate_init=0.1,
+        )
+        latents = torch.randn(1, 4, 8, 8)
+
+        cond_left = model._build_pose_time_condition(
+            latents,
+            torch.tensor([[-90.0, 0.0, 0.0]], dtype=torch.float32),
+        )
+        cond_right = model._build_pose_time_condition(
+            latents,
+            torch.tensor([[90.0, 0.0, 0.0]], dtype=torch.float32),
+        )
+
+        self.assertEqual(cond_left.shape, cond_right.shape)
+        self.assertFalse(torch.allclose(cond_left, cond_right))
+
     def test_model_forward_stores_perspective_state_and_uses_only_sat_tokens(self) -> None:
         torch.manual_seed(0)
         model = _SmallPerspectiveModel()
@@ -694,12 +726,11 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             self.assertEqual(model.generate_sat_token_means, [0.0])
             self.assertTrue((trainer.visualization_dir / "epoch_0001" / "sample_00_frame_0000000007.png").is_file())
 
-    def test_visualization_view_specs_include_front_and_yaw_sweep(self) -> None:
+    def test_visualization_view_specs_use_stage1_yaw_sweep_without_front(self) -> None:
         specs = SDTrainer._visualization_view_specs()
         self.assertEqual(
             specs,
             [
-                ("front", None),
                 ("yaw_m120", -120.0),
                 ("yaw_m90", -90.0),
                 ("yaw_m60", -60.0),
@@ -710,11 +741,8 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         )
 
         base_sample = SampleIndex(drive_dir=Path("/tmp/drive"), frame_id=7, meta=None)
-        front_sample = SDTrainer._sample_with_visualization_view(base_sample, "front", None)
         yaw_sample = SDTrainer._sample_with_visualization_view(base_sample, "yaw_m90", -90.0)
 
-        self.assertEqual(front_sample.meta["mode_override"], "front")
-        self.assertNotIn("vehicle_relative_yaw_deg_override", front_sample.meta)
         self.assertEqual(yaw_sample.meta["mode_override"], "fisheye_virtual")
         self.assertEqual(yaw_sample.meta["vehicle_relative_yaw_deg_override"], -90.0)
 

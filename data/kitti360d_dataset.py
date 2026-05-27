@@ -37,6 +37,8 @@ import torch
 from torch.utils.data import Dataset
 import yaml
 
+from utils.yaw_specs import yaw_view_name
+
 try:
     cv2.setNumThreads(0)
     cv2.ocl.setUseOpenCL(False)
@@ -287,8 +289,7 @@ def _choose_nearest_fisheye_camera(vehicle_relative_yaw_deg: float) -> str:
 
 
 def _vehicle_yaw_view_name(yaw_deg: float) -> str:
-    prefix = "p" if yaw_deg > 0 else "m" if yaw_deg < 0 else ""
-    return f"yaw_{prefix}{abs(float(yaw_deg)):g}".replace(".", "p")
+    return yaw_view_name(yaw_deg)
 
 
 def _pose_angle_view_name(name: str, angle_deg: float) -> str:

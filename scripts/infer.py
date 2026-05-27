@@ -29,6 +29,12 @@ if str(_project_root) not in sys.path:
 
 from data.kitti360d_dataset import Kitti360dDataset, SampleIndex
 from models.sd_model import create_sd_model, load_model_checkpoint
+from utils.yaw_specs import (
+    TRAIN_FIXED_YAW_SWEEP_SPECS,
+    YAW_SWEEP_PRESETS,
+    maybe_front_view_spec,
+    yaw_view_name,
+)
 
 
 logging.basicConfig(
@@ -41,45 +47,25 @@ logger = logging.getLogger(__name__)
 DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
-
-FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = (
-    ("front", None),
-    ("left_forward_45", -45.0),
-    ("left_side", -90.0),
-    ("right_forward_45", 45.0),
-    ("right_side", 90.0),
-)
-
-DEFAULT_YAW_SWEEP_SPECS: Sequence[Tuple[str, Optional[float]]] = (
-    ("front", None),
-    ("yaw_m120", -120.0),
-    ("yaw_m90", -90.0),
-    ("yaw_m60", -60.0),
-    ("yaw_m30", -30.0),
-    ("yaw_p30", 30.0),
-    ("yaw_p60", 60.0),
-    ("yaw_p90", 90.0),
-    ("yaw_p120", 120.0),
-)
-
-TRAIN_FIXED_YAW_SWEEP_SPECS: Sequence[Tuple[str, Optional[float]]] = (
-    ("front", None),
-    ("yaw_m120", -120.0),
-    ("yaw_m90", -90.0),
-    ("yaw_m60", -60.0),
-    ("yaw_p60", 60.0),
-    ("yaw_p90", 90.0),
-    ("yaw_p120", 120.0),
-)
-
-YAW_SWEEP_PRESETS: Dict[str, Sequence[Tuple[str, Optional[float]]]] = {
-    "diagnostic": DEFAULT_YAW_SWEEP_SPECS,
-    "train_fixed": TRAIN_FIXED_YAW_SWEEP_SPECS,
+DEFAULT_SATELLITE_ENCODER_CONFIG: Dict[str, Any] = {
+    "name": "satellite_condition_encoder",
+    "embed_dim": 1024,
+    "patch_size": 16,
+    "sat_resolution": 0.2,
+    "sat_size": 512,
+    "num_heads": 8,
+    "perspective_num_freqs": 6,
+    "perspective_pe_gate_init": 0.1,
 }
 
-ABLATION_MODE_CONFIGS: Dict[str, str] = {
-    "normal": "normal",
-    "sat_zero": "zero",
+FIXED_VIEW_SPECS: Sequence[Tuple[str, Optional[float]]] = tuple(
+    (name, yaw) for name, yaw in TRAIN_FIXED_YAW_SWEEP_SPECS
+)
+
+ABLATION_MODE_CONFIGS: Dict[str, Tuple[str, str]] = {
+    "normal": ("normal", "normal"),
+    "sat_zero": ("zero", "normal"),
+    "pose_zero": ("normal", "zero"),
 }
 
 
@@ -182,25 +168,25 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         help=(
-            "Yaw values for single_yaw_sweep. When omitted, uses the default "
-            "front/-120/-90/-60/-30/+30/+60/+90/+120 diagnostic sweep. "
-            "Front is included by default; pass --no_include_front to omit it."
+            "Yaw values for single_yaw_sweep. When omitted, uses the selected "
+            "yaw preset. Real front is omitted by default for Stage 1 yaw-only; "
+            "pass --include_front only for explicit diagnostics."
         ),
     )
     parser.add_argument(
         "--yaw_sweep_preset",
         type=str,
-        default="diagnostic",
+        default="train_fixed",
         choices=sorted(YAW_SWEEP_PRESETS.keys()),
         help=(
             "Preset yaw list for single_yaw_sweep when --vehicle_yaws is omitted. "
-            "diagnostic includes +/-30; train_fixed uses front/-120/-90/-60/+60/+90/+120."
+            "train_fixed uses Stage 1 fixed yaw views; diagnostic adds +/-30 interpolation checks."
         ),
     )
     front_group = parser.add_mutually_exclusive_group()
     front_group.add_argument("--include_front", dest="include_front", action="store_true")
     front_group.add_argument("--no_include_front", dest="include_front", action="store_false")
-    parser.set_defaults(include_front=True)
+    parser.set_defaults(include_front=False)
     parser.add_argument("--output_dir", type=str, default="./inference_results")
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
@@ -262,6 +248,8 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     config = _load_runtime_config(Path(args.config)) if args.config is not None else {}
     _apply_config_defaults(args, config)
+    if args.yaw_sweep_preset not in YAW_SWEEP_PRESETS:
+        raise ValueError(f"Unknown yaw_sweep_preset: {args.yaw_sweep_preset}")
     return args
 
 
@@ -294,13 +282,13 @@ def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
 
 def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     if not config:
-        args.satellite_encoder_config = {}
+        args.satellite_encoder_config = dict(DEFAULT_SATELLITE_ENCODER_CONFIG)
         args.perspective_pe_enabled = True
         args.query_uv_pe_enabled = False
         args.query_geometry_bias_enabled = False
         args.query_geometry_bias_scale = 2.0
         args.query_geometry_invalid_penalty = -1e4
-        args.pose_time_enabled = False
+        args.pose_time_enabled = True
         args.pose_time_dim = 128
         args.pose_time_gate_init = 0.1
         return
@@ -326,6 +314,12 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.checkpoint = None if checkpoint_path is None else str(checkpoint_path)
     args.num_inference_steps = int(
         _prefer_config(args.num_inference_steps, 30, _config_get(config, ("inference", "num_inference_steps")))
+    )
+    args.yaw_sweep_preset = str(
+        _prefer_config(args.yaw_sweep_preset, "train_fixed", _config_get(config, ("inference", "yaw_sweep_preset")))
+    )
+    args.include_front = bool(
+        _prefer_config(args.include_front, False, _config_get(config, ("inference", "include_front")))
     )
     args.guidance_scale = float(
         _prefer_config(args.guidance_scale, 1.0, _config_get(config, ("inference", "guidance_scale")))
@@ -358,33 +352,28 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
     if yaw is None:
         return view_name
-    prefix = "p" if yaw > 0 else "m" if yaw < 0 else ""
-    token = f"yaw_{prefix}{abs(float(yaw)):g}".replace(".", "p")
-    return token
+    return yaw_view_name(float(yaw))
 
 
 def _single_yaw_sweep_view_specs(args: argparse.Namespace) -> List[Tuple[str, Optional[float]]]:
+    specs = maybe_front_view_spec(bool(args.include_front))
     if args.vehicle_yaws is None:
-        specs = list(YAW_SWEEP_PRESETS[args.yaw_sweep_preset])
-        if not args.include_front:
-            specs = [(name, yaw) for name, yaw in specs if yaw is not None]
+        specs.extend((name, yaw) for name, yaw in YAW_SWEEP_PRESETS[args.yaw_sweep_preset])
         return specs
 
-    specs: List[Tuple[str, Optional[float]]] = []
-    if args.include_front:
-        specs.append(("front", None))
     specs.extend((_view_token("yaw", yaw), float(yaw)) for yaw in args.vehicle_yaws)
     return specs
 
 
-def _resolve_ablation_runs(args: argparse.Namespace) -> List[Tuple[Optional[str], str]]:
-    """Return (output_subdir, sat_condition_mode)."""
+def _resolve_ablation_runs(args: argparse.Namespace) -> List[Tuple[Optional[str], str, str]]:
+    """Return (output_subdir, sat_condition_mode, pose_condition_mode)."""
     if args.ablation_modes is None:
-        return [(None, args.sat_condition_mode)]
+        return [(None, args.sat_condition_mode, "normal")]
 
-    runs: List[Tuple[Optional[str], str]] = []
+    runs: List[Tuple[Optional[str], str, str]] = []
     for mode_name in args.ablation_modes:
-        runs.append((mode_name, ABLATION_MODE_CONFIGS[mode_name]))
+        sat_mode, pose_mode = ABLATION_MODE_CONFIGS[mode_name]
+        runs.append((mode_name, sat_mode, pose_mode))
     return runs
 
 
@@ -889,6 +878,7 @@ def _generate_one(
     sample: Dict,
     args: argparse.Namespace,
     sat_condition_mode: str,
+    pose_condition_mode: str = "normal",
 ) -> torch.Tensor:
     sat_image = sample["sat"].unsqueeze(0).to(args.device)
     target_size = tuple(int(x) for x in sample["image"].shape[-2:])
@@ -901,6 +891,14 @@ def _generate_one(
     T_imu_to_world = T_imu_to_world.unsqueeze(0).to(args.device) if T_imu_to_world is not None else None
     camera_height_m = _batched_camera_height(sample, args.device)
     target_pose_ypr = _batched_target_pose_ypr(sample, args.device)
+    if pose_condition_mode == "zero":
+        target_pose_ypr = (
+            torch.zeros_like(target_pose_ypr)
+            if torch.is_tensor(target_pose_ypr)
+            else torch.zeros((1, 3), device=args.device, dtype=torch.float32)
+        )
+    elif pose_condition_mode != "normal":
+        raise ValueError(f"Unknown pose_condition_mode: {pose_condition_mode}")
 
     generator_device = args.device if args.device.startswith("cuda") else "cpu"
     generator = torch.Generator(device=generator_device)
@@ -935,6 +933,7 @@ def _save_view_outputs(
     yaw: Optional[float],
     ablation_mode: Optional[str],
     sat_condition_mode: str,
+    pose_condition_mode: str,
     gt_override: Optional[torch.Tensor] = None,
 ) -> Image.Image:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -965,6 +964,12 @@ def _save_view_outputs(
     ])
     comparison.save(output_dir / "comparison.png")
 
+    target_pose_ypr = sample.get("target_pose_ypr")
+    if torch.is_tensor(target_pose_ypr):
+        target_pose_ypr_meta = [float(value) for value in target_pose_ypr.detach().cpu().reshape(-1).tolist()]
+    else:
+        target_pose_ypr_meta = None
+    sample_meta = sample.get("meta", {})
     metadata = {
         "drive": str(sample["drive"]),
         "frame_id": int(sample["frame_id"]),
@@ -972,8 +977,16 @@ def _save_view_outputs(
         "vehicle_yaw_deg": None if yaw is None else float(yaw),
         "ablation_mode": ablation_mode,
         "sat_condition_mode": sat_condition_mode,
+        "pose_condition_mode": pose_condition_mode,
+        "target_pose_ypr": target_pose_ypr_meta,
+        "fisheye_camera_used": sample_meta.get("fisheye_camera_used") if isinstance(sample_meta, dict) else None,
+        "fisheye_relative_yaw_deg_used": (
+            sample_meta.get("fisheye_relative_yaw_deg_used") if isinstance(sample_meta, dict) else None
+        ),
+        "virtual_pitch_deg": sample_meta.get("virtual_pitch_deg") if isinstance(sample_meta, dict) else None,
+        "virtual_roll_deg": sample_meta.get("virtual_roll_deg") if isinstance(sample_meta, dict) else None,
         "gt_override": gt_override is not None,
-        "meta": sample.get("meta", {}),
+        "meta": sample_meta,
     }
     with open(output_dir / "metadata.yaml", "w") as f:
         yaml.safe_dump(metadata, f, sort_keys=False)
@@ -1033,7 +1046,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
     base_sample = dataset.samples[sample_index]
     ablation_runs = _resolve_ablation_runs(args)
 
-    for ablation_name, sat_mode in ablation_runs:
+    for ablation_name, sat_mode, pose_mode in ablation_runs:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_yaw_sweep"
         summary_rows: List[Image.Image] = []
@@ -1042,7 +1055,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
             for view_name, yaw in view_specs
         ]
         generated_views = [
-            _generate_one(model, sample, args, sat_mode)
+            _generate_one(model, sample, args, sat_mode, pose_mode)
             for sample in view_samples
         ]
 
@@ -1062,6 +1075,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                 yaw,
                 ablation_name,
                 sat_mode,
+                pose_mode,
             )
             summary_rows.append(comparison)
 
@@ -1074,6 +1088,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
                     "memory_mode": args.view_memory_mode,
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
+                    "pose_condition_mode": pose_mode,
                     "virtual_pitch_deg": float(args.pitch_deg),
                     "virtual_roll_deg": float(args.roll_deg),
                     "views": [{"view_name": name, "vehicle_yaw_deg": yaw} for name, yaw in view_specs],
@@ -1110,7 +1125,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
 
     output_root = Path(args.output_dir)
     ablation_runs = _resolve_ablation_runs(args)
-    for ablation_name, sat_mode in ablation_runs:
+    for ablation_name, sat_mode, pose_mode in ablation_runs:
         active_output_root = output_root / ablation_name if ablation_name is not None else output_root
         progress = tqdm(sample_indices, desc=f"Split fixed-view inference [{ablation_name or 'custom'}]")
         for sample_index in progress:
@@ -1122,7 +1137,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                 for view_name, yaw in FIXED_VIEW_SPECS
             ]
             generated_views = [
-                _generate_one(model, sample, args, sat_mode)
+                _generate_one(model, sample, args, sat_mode, pose_mode)
                 for sample in view_samples
             ]
 
@@ -1140,6 +1155,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     yaw,
                     ablation_name,
                     sat_mode,
+                    pose_mode,
                 )
                 summary_rows.append(comparison)
             if summary_rows:
@@ -1160,6 +1176,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                     "num_frames": len(sample_indices),
                     "ablation_mode": ablation_name,
                     "sat_condition_mode": sat_mode,
+                    "pose_condition_mode": pose_mode,
                     "virtual_pitch_deg": float(args.pitch_deg),
                     "virtual_roll_deg": float(args.roll_deg),
                     "fixed_views": [
@@ -1191,7 +1208,7 @@ def run_front_pitch_sweep(args: argparse.Namespace) -> None:
     ablation_runs = _resolve_ablation_runs(args)
 
     try:
-        for ablation_name, sat_mode in ablation_runs:
+        for ablation_name, sat_mode, pose_mode in ablation_runs:
             active_output_root = output_root / ablation_name if ablation_name is not None else output_root
             sample_dir = active_output_root / f"{base_sample.drive_dir.name}_frame_{base_sample.frame_id:010d}_front_pitch_sweep"
             summary_rows: List[Image.Image] = []
@@ -1201,7 +1218,7 @@ def run_front_pitch_sweep(args: argparse.Namespace) -> None:
                 dataset.roll_deg = float(args.roll_deg)
                 view_name = _view_token("pitch", pitch)
                 sample = _get_view_sample(dataset, sample_index, view_name, 0.0)
-                generated = _generate_one(model, sample, args, sat_mode)
+                generated = _generate_one(model, sample, args, sat_mode, pose_mode)
                 comparison = _save_view_outputs(
                     sample,
                     generated,
@@ -1210,6 +1227,7 @@ def run_front_pitch_sweep(args: argparse.Namespace) -> None:
                     0.0,
                     ablation_name,
                     sat_mode,
+                    pose_mode,
                     gt_override=front_sample["image"],
                 )
                 summary_rows.append(comparison)
@@ -1223,6 +1241,7 @@ def run_front_pitch_sweep(args: argparse.Namespace) -> None:
                         "memory_mode": args.view_memory_mode,
                         "ablation_mode": ablation_name,
                         "sat_condition_mode": sat_mode,
+                        "pose_condition_mode": pose_mode,
                         "vehicle_yaw_deg": 0.0,
                         "fixed_gt": "front",
                         "virtual_roll_deg": float(args.roll_deg),

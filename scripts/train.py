@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Tuple
 from models.sd_model import create_sd_model, load_model_checkpoint
 from models.sd_trainer import SDTrainer
 from data import Kitti360dDataset
+from utils.yaw_specs import stage1_fixed_yaw_list
 from torch.utils.data import DataLoader, default_collate
 from torch.utils.data.distributed import DistributedSampler
 
@@ -240,6 +241,7 @@ def _resolve_query_geometry_bias_config(config: Dict[str, Any]) -> Tuple[bool, f
 
 
 def main():
+    default_stage1_yaws = stage1_fixed_yaw_list()
     parser = argparse.ArgumentParser(
         description="Train Stable Diffusion for satellite-to-frontview generation"
     )
@@ -321,12 +323,12 @@ def main():
         help="Optional checkpoint used to initialize model weights before training.",
     )
     parser.add_argument(
-        "--dataset_mode", type=str, default="front",
+        "--dataset_mode", type=str, default="fisheye_virtual",
         choices=["front", "fisheye_virtual"],
         help="Dataset view mode used for training/validation.",
     )
     parser.add_argument(
-        "--yaw_mode", type=str, default="fisheye_relative",
+        "--yaw_mode", type=str, default="vehicle_relative",
         choices=["fisheye_relative", "vehicle_relative"],
         help="Yaw semantics for virtual fisheye views.",
     )
@@ -349,7 +351,7 @@ def main():
     parser.add_argument(
         "--vehicle_yaw_sampling",
         type=str,
-        default="random_range",
+        default="fixed_list",
         choices=["random_range", "fixed_list"],
         help="Vehicle-relative yaw sampler for fisheye_virtual training.",
     )
@@ -357,8 +359,8 @@ def main():
         "--vehicle_yaw_fixed_list",
         type=str,
         nargs="+",
-        default=None,
-        help="Fixed yaw list for vehicle_yaw_sampling=fixed_list. Use 'front' for image_00.",
+        default=default_stage1_yaws,
+        help="Fixed yaw list for vehicle_yaw_sampling=fixed_list. Stage 1 excludes real image_00/front.",
     )
     parser.add_argument(
         "--front_sample_prob", type=float, default=0.0,
@@ -519,8 +521,8 @@ def main():
         None,
         _config_get(config, ("logging", "tensorboard_log_dir")),
     )
-    args.dataset_mode = str(_prefer_config(args.dataset_mode, "front", _config_get(config, ("data", "mode"))))
-    args.yaw_mode = str(_prefer_config(args.yaw_mode, "fisheye_relative", _config_get(config, ("data", "yaw_mode"))))
+    args.dataset_mode = str(_prefer_config(args.dataset_mode, "fisheye_virtual", _config_get(config, ("data", "mode"))))
+    args.yaw_mode = str(_prefer_config(args.yaw_mode, "vehicle_relative", _config_get(config, ("data", "yaw_mode"))))
     args.view_set = str(_prefer_config(args.view_set, "single", _config_get(config, ("data", "view_set"))))
     args.vehicle_yaw_min_deg = float(
         _prefer_config(
@@ -539,13 +541,13 @@ def main():
     args.vehicle_yaw_sampling = str(
         _prefer_config(
             args.vehicle_yaw_sampling,
-            "random_range",
+            "fixed_list",
             _config_get(config, ("data", "vehicle_yaw_sampling")),
         )
     )
     args.vehicle_yaw_fixed_list = _prefer_config(
         args.vehicle_yaw_fixed_list,
-        None,
+        default_stage1_yaws,
         _config_get(config, ("data", "vehicle_yaw_fixed_list")),
     )
     args.front_sample_prob = float(
@@ -596,6 +598,8 @@ def main():
     weight_decay = float(_config_get(config, ("training", "weight_decay"), 1e-4))
     lr_scheduler_type = str(_config_get(config, ("training", "scheduler"), "cosine"))
     save_every = int(_config_get(config, ("checkpoint", "save_every"), 50))
+    max_checkpoints_config = _config_get(config, ("checkpoint", "max_checkpoints"))
+    max_checkpoints = None if max_checkpoints_config is None else int(max_checkpoints_config)
     log_every = int(_config_get(config, ("logging", "log_every"), 100))
     front_resize_cfg = _config_get(config, ("data", "front_resize"), [640, 256])
     front_resize = tuple(int(x) for x in front_resize_cfg)
@@ -795,6 +799,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation,
         output_dir=args.output_dir,
         save_every=save_every,
+        max_checkpoints=max_checkpoints,
         log_every=log_every,
         device=args.device,
         use_wandb=args.use_wandb,

@@ -5,6 +5,7 @@ This module provides a simplified training interface using diffusers library.
 """
 
 import math
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,9 +20,11 @@ from tqdm.auto import tqdm
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Sequence, Tuple
 import logging
+import time
 from PIL import Image, ImageDraw, ImageOps
 
 from models.conditioning import SatelliteMemoryState
+from utils.yaw_specs import TRAIN_FIXED_YAW_SWEEP_SPECS
 
 
 logger = logging.getLogger(__name__)
@@ -119,6 +122,7 @@ class SDTrainer:
         gradient_accumulation_steps: int = 1,
         output_dir: str = './output',
         save_every: int = 5,
+        max_checkpoints: Optional[int] = None,
         log_every: int = 100,
         device: str = 'cuda',
         use_wandb: bool = False,
@@ -156,6 +160,7 @@ class SDTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.output_dir = Path(output_dir)
         self.save_every = save_every
+        self.max_checkpoints = None if max_checkpoints is None else max(1, int(max_checkpoints))
         self.log_every = log_every
         self.device = device
         self.use_wandb = bool(use_wandb) and self.is_main_process
@@ -192,10 +197,12 @@ class SDTrainer:
         self.scaler = torch.cuda.amp.GradScaler(
             enabled=self.use_amp and self.amp_dtype == torch.float16
         )
+        self.run_config = dict(run_config or {})
 
         # Setup output dir
         if self.is_main_process:
             self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_jsonl_path = self.output_dir / "metrics.jsonl"
         self._barrier()
 
         self._materialize_lazy_condition_modules()
@@ -406,7 +413,7 @@ class SDTrainer:
 
         if outputs:
             output_tensors: List[Tuple[str, Optional[torch.Tensor]]] = []
-            for key in ("loss", "per_view_loss", "model_pred", "target"):
+            for key in ("loss", "per_sample_loss", "per_view_loss", "model_pred", "target"):
                 value = outputs.get(key)
                 if torch.is_tensor(value):
                     output_tensors.append((f"outputs.{key}", value))
@@ -457,6 +464,34 @@ class SDTrainer:
         if self.tb_writer is not None:
             for key, value in scalar_metrics.items():
                 self.tb_writer.add_scalar(key, value, global_step=step)
+
+        if self.is_main_process:
+            record = {
+                "time": time.time(),
+                "step": int(step),
+                "metrics": scalar_metrics,
+            }
+            with self.metrics_jsonl_path.open("a") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _pose_time_gate_scalar(self) -> Optional[float]:
+        gate = getattr(getattr(self.unwrapped_model, "unet", None), "pose_time_gate", None)
+        if torch.is_tensor(gate):
+            return float(gate.detach().float().item())
+        return None
+
+    @staticmethod
+    def _batch_pose_yaw_metrics(batch_tensors: Dict[str, torch.Tensor], prefix: str) -> Dict[str, float]:
+        target_pose_ypr = batch_tensors.get("target_pose_ypr")
+        if not torch.is_tensor(target_pose_ypr) or target_pose_ypr.numel() == 0:
+            return {}
+        yaw = target_pose_ypr.detach().float()[:, 0]
+        return {
+            f"{prefix}/pose_yaw_mean": float(yaw.mean().item()),
+            f"{prefix}/pose_yaw_std": float(yaw.std(unbiased=False).item()),
+            f"{prefix}/pose_yaw_min": float(yaw.min().item()),
+            f"{prefix}/pose_yaw_max": float(yaw.max().item()),
+        }
 
     @staticmethod
     def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
@@ -539,15 +574,17 @@ class SDTrainer:
 
                 # Validate
                 if self.val_dataloader is not None and self.is_main_process:
-                    val_loss = self._validate(epoch)
+                    val_loss, val_metrics = self._validate(epoch)
                     logger.info(f"  Val loss: {val_loss:.4f}")
-                    self._log_scalars(
-                        {
-                            "val/loss": val_loss,
-                            "train/epoch": epoch + 1,
-                        },
-                        step=epoch_step,
-                    )
+                    log_payload = {
+                        "val/loss": val_loss,
+                        "train/epoch": epoch + 1,
+                    }
+                    pose_time_gate = self._pose_time_gate_scalar()
+                    if pose_time_gate is not None:
+                        log_payload["train/pose_time_gate"] = pose_time_gate
+                    log_payload.update(val_metrics)
+                    self._log_scalars(log_payload, step=epoch_step)
                 self._barrier()
 
                 if self.is_main_process and self.visualize_every > 0 and self.num_visualizations > 0 and (epoch + 1) % self.visualize_every == 0:
@@ -719,6 +756,13 @@ class SDTrainer:
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
                     'train/epoch': epoch + 1,
                 }
+                condition_mask = outputs.get("condition_mask")
+                if torch.is_tensor(condition_mask):
+                    log_payload["train/condition_keep_frac"] = float(condition_mask.float().mean().item())
+                pose_time_gate = self._pose_time_gate_scalar()
+                if pose_time_gate is not None:
+                    log_payload["train/pose_time_gate"] = pose_time_gate
+                log_payload.update(self._batch_pose_yaw_metrics(geometry_kwargs, "train"))
                 if last_grad_norm is not None:
                     log_payload['train/grad_norm'] = last_grad_norm
                 self._log_scalars(log_payload, step=self._global_step(epoch, step))
@@ -727,12 +771,14 @@ class SDTrainer:
         return self._reduce_mean(local_mean, self.device)
 
     @torch.no_grad()
-    def _validate(self, epoch: int) -> float:
+    def _validate(self, epoch: int) -> Tuple[float, Dict[str, float]]:
         """Validate the model."""
         eval_model = self.unwrapped_model
         was_training = eval_model.training
         eval_model.eval()
         total_loss = 0.0
+        per_yaw_loss_sum: Dict[float, float] = {}
+        per_yaw_count: Dict[float, int] = {}
 
         for batch in tqdm(self.val_dataloader, desc=f"Val Epoch {epoch+1}"):
             sat_images = batch['sat'].to(self.device)
@@ -751,10 +797,29 @@ class SDTrainer:
                 )
                 loss = outputs['loss']
             total_loss += loss.item()
+            per_sample_loss = outputs.get("per_sample_loss")
+            target_pose_ypr = geometry_kwargs.get("target_pose_ypr")
+            if torch.is_tensor(per_sample_loss) and torch.is_tensor(target_pose_ypr):
+                losses = per_sample_loss.detach().float().cpu()
+                yaws = target_pose_ypr.detach().float().cpu()[:, 0]
+                for yaw_value, sample_loss in zip(yaws.tolist(), losses.tolist()):
+                    yaw_key = float(round(float(yaw_value), 3))
+                    per_yaw_loss_sum[yaw_key] = per_yaw_loss_sum.get(yaw_key, 0.0) + float(sample_loss)
+                    per_yaw_count[yaw_key] = per_yaw_count.get(yaw_key, 0) + 1
 
         if was_training:
             eval_model.train()
-        return total_loss / len(self.val_dataloader)
+        yaw_metrics = {
+            f"val/loss_yaw_{yaw:g}".replace("-", "m").replace(".", "p"): (
+                per_yaw_loss_sum[yaw] / max(1, per_yaw_count[yaw])
+            )
+            for yaw in sorted(per_yaw_loss_sum)
+        }
+        yaw_metrics.update({
+            f"val/count_yaw_{yaw:g}".replace("-", "m").replace(".", "p"): float(per_yaw_count[yaw])
+            for yaw in sorted(per_yaw_count)
+        })
+        return total_loss / len(self.val_dataloader), yaw_metrics
 
     def _save_checkpoint(self, epoch: int):
         """Save model checkpoint."""
@@ -766,10 +831,27 @@ class SDTrainer:
             'model_state_dict': self.unwrapped_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.lr_scheduler.state_dict(),
+            'config': self.run_config,
         }
 
-        torch.save(checkpoint, checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pt')
-        logger.info(f"Checkpoint saved: {checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pt'}")
+        checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pt'
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Checkpoint saved: {checkpoint_path}")
+        self._prune_checkpoints(checkpoint_dir)
+
+    def _prune_checkpoints(self, checkpoint_dir: Path) -> None:
+        if self.max_checkpoints is None:
+            return
+        checkpoints = sorted(
+            checkpoint_dir.glob("checkpoint_epoch_*.pt"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        excess = len(checkpoints) - self.max_checkpoints
+        if excess <= 0:
+            return
+        for checkpoint_path in checkpoints[:excess]:
+            checkpoint_path.unlink(missing_ok=True)
+            logger.info(f"Pruned old checkpoint: {checkpoint_path}")
 
     @staticmethod
     def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
@@ -1200,15 +1282,7 @@ class SDTrainer:
 
     @staticmethod
     def _visualization_view_specs() -> List[Tuple[str, Optional[float]]]:
-        return [
-            ("front", None),
-            ("yaw_m120", -120.0),
-            ("yaw_m90", -90.0),
-            ("yaw_m60", -60.0),
-            ("yaw_p60", 60.0),
-            ("yaw_p90", 90.0),
-            ("yaw_p120", 120.0),
-        ]
+        return [(name, yaw) for name, yaw in TRAIN_FIXED_YAW_SWEEP_SPECS]
 
     @staticmethod
     def _sample_with_visualization_view(base_sample: Any, view_label: str, yaw_deg: Optional[float]) -> Any:
@@ -1456,12 +1530,12 @@ class SDTrainer:
             camera_height_m=camera_height_m,
             image_size=target_size,
         )
-        generator = torch.Generator(device=generator_device)
-        generator.manual_seed(self.visualization_seed)
         generated_chunks = []
         attention_debug_by_sample: List[Dict[str, Any]] = []
         unet = getattr(eval_model, "unet", None)
         for idx in range(sat_images.shape[0]):
+            generator = torch.Generator(device=generator_device)
+            generator.manual_seed(self.visualization_seed)
             view_sat_state = SatelliteMemoryState(
                 tokens=sat_state.tokens[idx:idx + 1],
                 xy=sat_state.xy[idx:idx + 1],

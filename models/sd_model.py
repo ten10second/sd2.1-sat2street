@@ -708,9 +708,11 @@ class SatelliteConditionedSDModel(nn.Module):
         else:
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
-        loss = F.mse_loss(model_pred, target, reduction="mean")
+        per_sample_loss = F.mse_loss(model_pred, target, reduction="none").mean(dim=(1, 2, 3))
+        loss = per_sample_loss.mean()
         return {
             "loss": loss,
+            "per_sample_loss": per_sample_loss,
             "model_pred": model_pred,
             "target": target,
             "sat_state": conditioned_sat_state,

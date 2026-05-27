@@ -3,18 +3,18 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from scripts import infer
+from models.sd_trainer import SDTrainer
 
 
 class InferYawSweepTest(unittest.TestCase):
     def test_default_single_yaw_sweep_specs(self) -> None:
         specs = infer._single_yaw_sweep_view_specs(
-            SimpleNamespace(vehicle_yaws=None, include_front=True, yaw_sweep_preset="diagnostic")
+            SimpleNamespace(vehicle_yaws=None, include_front=False, yaw_sweep_preset="diagnostic")
         )
 
         self.assertEqual(
             specs,
             [
-                ("front", None),
                 ("yaw_m120", -120.0),
                 ("yaw_m90", -90.0),
                 ("yaw_m60", -60.0),
@@ -28,13 +28,12 @@ class InferYawSweepTest(unittest.TestCase):
 
     def test_train_fixed_single_yaw_sweep_specs(self) -> None:
         specs = infer._single_yaw_sweep_view_specs(
-            SimpleNamespace(vehicle_yaws=None, include_front=True, yaw_sweep_preset="train_fixed")
+            SimpleNamespace(vehicle_yaws=None, include_front=False, yaw_sweep_preset="train_fixed")
         )
 
         self.assertEqual(
             specs,
             [
-                ("front", None),
                 ("yaw_m120", -120.0),
                 ("yaw_m90", -90.0),
                 ("yaw_m60", -60.0),
@@ -44,14 +43,15 @@ class InferYawSweepTest(unittest.TestCase):
             ],
         )
 
-    def test_train_fixed_single_yaw_sweep_can_omit_front(self) -> None:
+    def test_train_fixed_single_yaw_sweep_can_explicitly_include_front_for_diagnostics(self) -> None:
         specs = infer._single_yaw_sweep_view_specs(
-            SimpleNamespace(vehicle_yaws=None, include_front=False, yaw_sweep_preset="train_fixed")
+            SimpleNamespace(vehicle_yaws=None, include_front=True, yaw_sweep_preset="train_fixed")
         )
 
         self.assertEqual(
             specs,
             [
+                ("front", None),
                 ("yaw_m120", -120.0),
                 ("yaw_m90", -90.0),
                 ("yaw_m60", -60.0),
@@ -91,6 +91,27 @@ class InferYawSweepTest(unittest.TestCase):
             args = infer._parse_args()
 
         self.assertEqual(args.view_memory_mode, "independent")
+
+    def test_train_fixed_preset_matches_trainer_visualization_specs(self) -> None:
+        specs = infer._single_yaw_sweep_view_specs(
+            SimpleNamespace(vehicle_yaws=None, include_front=False, yaw_sweep_preset="train_fixed")
+        )
+
+        self.assertEqual(specs, SDTrainer._visualization_view_specs())
+
+    def test_pose_zero_ablation_keeps_satellite_and_zeros_pose_only(self) -> None:
+        runs = infer._resolve_ablation_runs(
+            SimpleNamespace(ablation_modes=["normal", "sat_zero", "pose_zero"], sat_condition_mode="normal")
+        )
+
+        self.assertEqual(
+            runs,
+            [
+                ("normal", "normal", "normal"),
+                ("sat_zero", "zero", "normal"),
+                ("pose_zero", "normal", "zero"),
+            ],
+        )
 
 
 if __name__ == "__main__":

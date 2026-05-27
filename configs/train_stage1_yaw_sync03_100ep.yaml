@@ -1,12 +1,13 @@
-# Stable Diffusion 训练配置
+# Stage 1 yaw-only base training on splits/sync03_sync04_split.yaml.
+# No query geometry bias in this base stage; use this checkpoint before
+# optional geometry-bias finetuning.
 
-# 基本配置
 seed: 42
 device: 'cuda'
 mixed_precision: 'bf16'
 gradient_checkpointing: true
+output_dir: './output/stage1_yaw_sync03_100ep'
 
-# 数据配置
 data:
   dataset: 'kitti360'
   data_dir: '/mnt/shizhm/KITTI-360'
@@ -29,14 +30,9 @@ data:
   roll_fixed_list: [0.0]
   front_resize: [640, 256]
 
-# 模型配置
 model:
-  # Stable Diffusion 基础模型
   base_model: 'sd2-community/stable-diffusion-2-1-base'
-  # 是否冻结基础层
   freeze_base: true
-
-  # 卫星图编码器配置
   satellite_encoder:
     name: 'satellite_condition_encoder'
     embed_dim: 1024
@@ -46,29 +42,20 @@ model:
     num_heads: 8
     perspective_num_freqs: 6
     perspective_pe_gate_init: 0.1
-
-  # Perspective position encoding for satellite tokens
   perspective_position_encoding:
     enable: true
-
-  # Query-side UV positional encoding for UNet cross-attention
   query_position_encoding:
     enable: false
     gate_init: 1.0
-
-  # Direct geometry bias on cross-attention scores
   query_geometry_bias:
-    enable: true
+    enable: false
     distance_scale: 2.0
     invalid_penalty: -10000.0
-
-  # Global camera pose conditioning through UNet timestep embedding.
   pose_time_conditioning:
     enable: true
     dim: 128
     gate_init: 0.1
 
-# 训练配置
 training:
   epochs: 100
   warmup_epochs: 5
@@ -77,29 +64,28 @@ training:
   scheduler: 'cosine'
   gradient_accumulation_steps: 4
   gradient_clip_val: 0.5
+  cond_drop_prob: 0.0
 
-  # Loss 配置
-  loss:
-    # 原始 SD loss 权重
-    lambda_recon: 1.0
-    # 感知 loss 权重
-    lambda_perceptual: 0.01
-
-# 保存配置
 checkpoint:
-  save_dir: './checkpoints'
-  save_every: 50
+  save_dir: './output/stage1_yaw_sync03_100ep/checkpoints'
+  save_every: 20
   max_checkpoints: 5
   resume_from: null
 
-# 日志配置
 logging:
-  log_dir: './logs'
-  log_every: 100
-  use_wandb: true
+  log_dir: './output/stage1_yaw_sync03_100ep/logs'
+  log_every: 50
+  use_wandb: false
+  use_tensorboard: true
+  tensorboard_log_dir: './output/stage1_yaw_sync03_100ep/tensorboard'
   project_name: 'kitti360_sd'
+  run_name: 'stage1_yaw_sync03_100ep'
+  wandb_mode: 'offline'
 
-# 验证配置
 validation:
-  validate_every: 10
-  num_validation_samples: 4
+  validate_every: 1
+  visualize_every: 1
+  num_validation_samples: 1
+  visualization_inference_steps: 20
+  visualization_seed: 42
+  guidance_scale: 1.0

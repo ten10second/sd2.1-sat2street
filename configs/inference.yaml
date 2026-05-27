@@ -11,7 +11,7 @@ data:
   data_dir: '/mnt/shizhm/KITTI-360'
   batch_size: 1
   num_workers: 4
-  mode: 'front'
+  mode: 'fisheye_virtual'
   front_resize: [640, 256]
   pitch_deg: 0.0
   roll_deg: 0.0
@@ -31,6 +31,7 @@ model:
     patch_size: 16
     sat_resolution: 0.2
     sat_size: 512
+    num_heads: 8
     perspective_num_freqs: 6
     perspective_pe_gate_init: 0.1
 
@@ -44,7 +45,7 @@ model:
 
   # Direct geometry bias on cross-attention scores
   query_geometry_bias:
-    enable: false
+    enable: true
     distance_scale: 2.0
     invalid_penalty: -10000.0
 
@@ -63,6 +64,8 @@ inference:
   sampler: 'euler_a'  # euler, euler_a, dpm_solver++
   # 批处理大小
   batch_size: 1
+  yaw_sweep_preset: 'train_fixed'
+  include_front: false
 
 # 保存配置
 output:

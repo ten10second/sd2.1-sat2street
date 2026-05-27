@@ -10,6 +10,7 @@ import argparse
 import numpy as np
 from models.sd_model import create_sd_model, load_model_checkpoint
 from data.kitti360d_dataset import Kitti360dDataset
+from utils.yaw_specs import stage1_fixed_yaw_list
 from torch.utils.data import DataLoader
 
 
@@ -71,7 +72,7 @@ def main():
         mode="fisheye_virtual",
         yaw_mode="vehicle_relative",
         vehicle_yaw_sampling="fixed_list",
-        vehicle_yaw_fixed_list=["front", 60.0, 90.0, 120.0, -60.0, -90.0, -120.0],
+        vehicle_yaw_fixed_list=stage1_fixed_yaw_list(),
         view_set="single",
         seed=42,
     )
