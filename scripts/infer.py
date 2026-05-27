@@ -295,12 +295,19 @@ def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
 def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     if not config:
         args.satellite_encoder_config = {}
-        args.perspective_pe_enabled = True
         args.query_uv_pe_enabled = False
-        args.query_uv_gate_init = 0.05
-        args.query_geometry_bias_enabled = False
-        args.query_geometry_bias_scale = 2.0
-        args.query_geometry_invalid_penalty = -1e4
+        args.query_geometry_score_enabled = False
+        args.query_geometry_score_dim = 64
+        args.query_geometry_score_num_freqs = 6
+        args.query_geometry_score_gate_init = 1.0
+        args.query_geometry_score_layers = None
+        args.query_geometry_score_max_query_tokens = None
+        args.query_geometry_score_mode = "geometry_first_semantic_refine"
+        args.query_geometry_candidate_radius = 0.35
+        args.query_geometry_candidate_min_k = 16
+        args.query_geometry_candidate_invalid_penalty = -1e4
+        args.query_semantic_score_dim = 64
+        args.query_semantic_score_alpha = 0.25
         return
 
     args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
@@ -333,24 +340,26 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.output_dir = str(_prefer_config(args.output_dir, "./inference_results", _config_get(config, ("output", "output_dir"))))
 
     args.satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
-    perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
-    args.perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
-    query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
-    args.query_uv_pe_enabled = bool(query_pe_config.get("enable", False))
-    query_uv_gate_init = query_pe_config.get("gate_init", 0.05)
-    if query_uv_gate_init is None:
-        query_uv_gate_init = 0.05
-    args.query_uv_gate_init = float(query_uv_gate_init)
-    geometry_config = dict(_config_get(config, ("model", "query_geometry_bias"), {}) or {})
-    args.query_geometry_bias_enabled = bool(geometry_config.get("enable", False))
-    geometry_scale = geometry_config.get("distance_scale", 2.0)
-    if geometry_scale is None:
-        geometry_scale = 2.0
-    invalid_penalty = geometry_config.get("invalid_penalty", -1e4)
-    if invalid_penalty is None:
-        invalid_penalty = -1e4
-    args.query_geometry_bias_scale = float(geometry_scale)
-    args.query_geometry_invalid_penalty = float(invalid_penalty)
+    args.query_uv_pe_enabled = False
+    score_config = dict(_config_get(config, ("model", "query_geometry_score"), {}) or {})
+    score_layers = score_config.get("layers")
+    if score_layers is not None:
+        score_layers = [str(layer) for layer in score_layers]
+    score_max_query_tokens = score_config.get("max_query_tokens", None)
+    if score_max_query_tokens is not None:
+        score_max_query_tokens = int(score_max_query_tokens)
+    args.query_geometry_score_enabled = bool(score_config.get("enable", False))
+    args.query_geometry_score_dim = int(score_config.get("dim", 64) or 64)
+    args.query_geometry_score_num_freqs = int(score_config.get("num_freqs", 6) or 6)
+    args.query_geometry_score_gate_init = float(score_config.get("gate_init", 1.0) or 1.0)
+    args.query_geometry_score_layers = score_layers
+    args.query_geometry_score_max_query_tokens = score_max_query_tokens
+    args.query_geometry_score_mode = str(score_config.get("mode", "geometry_first_semantic_refine"))
+    args.query_geometry_candidate_radius = float(score_config.get("candidate_radius", 0.35) or 0.35)
+    args.query_geometry_candidate_min_k = int(score_config.get("candidate_min_k", 16) or 16)
+    args.query_geometry_candidate_invalid_penalty = float(score_config.get("candidate_invalid_penalty", -1e4) or -1e4)
+    args.query_semantic_score_dim = int(score_config.get("semantic_score_dim", 64) or 64)
+    args.query_semantic_score_alpha = float(score_config.get("semantic_alpha_max", 0.25) or 0.25)
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -843,12 +852,18 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
-        perspective_pe_enabled=getattr(args, "perspective_pe_enabled", True),
-        query_uv_pe_enabled=getattr(args, "query_uv_pe_enabled", False),
-        query_uv_gate_init=getattr(args, "query_uv_gate_init", 0.05),
-        query_geometry_bias_enabled=getattr(args, "query_geometry_bias_enabled", False),
-        query_geometry_bias_scale=getattr(args, "query_geometry_bias_scale", 2.0),
-        query_geometry_invalid_penalty=getattr(args, "query_geometry_invalid_penalty", -1e4),
+        query_geometry_score_enabled=getattr(args, "query_geometry_score_enabled", False),
+        query_geometry_score_dim=getattr(args, "query_geometry_score_dim", 64),
+        query_geometry_score_num_freqs=getattr(args, "query_geometry_score_num_freqs", 6),
+        query_geometry_score_gate_init=getattr(args, "query_geometry_score_gate_init", 1.0),
+        query_geometry_score_layers=getattr(args, "query_geometry_score_layers", None),
+        query_geometry_score_max_query_tokens=getattr(args, "query_geometry_score_max_query_tokens", None),
+        query_geometry_score_mode=getattr(args, "query_geometry_score_mode", "geometry_first_semantic_refine"),
+        query_geometry_candidate_radius=getattr(args, "query_geometry_candidate_radius", 0.35),
+        query_geometry_candidate_min_k=getattr(args, "query_geometry_candidate_min_k", 16),
+        query_geometry_candidate_invalid_penalty=getattr(args, "query_geometry_candidate_invalid_penalty", -1e4),
+        query_semantic_score_dim=getattr(args, "query_semantic_score_dim", 64),
+        query_semantic_score_alpha=getattr(args, "query_semantic_score_alpha", 0.25),
         satellite_encoder_config=getattr(args, "satellite_encoder_config", None),
     )
     if hasattr(model.unet, "set_attention_slice"):

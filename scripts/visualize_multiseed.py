@@ -104,6 +104,10 @@ def _parse_args() -> argparse.Namespace:
         description="Visualize one frame with multiple random seeds and guidance scales"
     )
     parser.add_argument(
+        "--config", type=str, default=str(_project_root / "configs" / "inference.yaml"),
+        help="Runtime config used for model conditioning options",
+    )
+    parser.add_argument(
         "--data_dir", type=str, default="/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
         help="Path to KITTI-360 data root",
     )
@@ -182,6 +186,47 @@ def _parse_args() -> argparse.Namespace:
         help="Local Hugging Face cache directory",
     )
     return parser.parse_args()
+
+
+def _load_runtime_config(path: Path) -> Dict:
+    if not path.is_file():
+        return {}
+    with open(path, "r") as f:
+        config = yaml.safe_load(f)
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Config must be a mapping: {path}")
+    return config
+
+
+def _resolve_model_conditioning_config(config: Dict) -> Dict:
+    model_cfg = dict(config.get("model", {}) or {})
+    satellite_encoder_config = dict(model_cfg.get("satellite_encoder", {}) or {})
+    query_geometry_score_config = dict(model_cfg.get("query_geometry_score", {}) or {})
+
+    score_layers = query_geometry_score_config.get("layers")
+    if score_layers is not None:
+        score_layers = [str(layer) for layer in score_layers]
+    score_max_query_tokens = query_geometry_score_config.get("max_query_tokens", None)
+    if score_max_query_tokens is not None:
+        score_max_query_tokens = int(score_max_query_tokens)
+
+    return {
+        "query_geometry_score_enabled": bool(query_geometry_score_config.get("enable", False)),
+        "query_geometry_score_dim": int(query_geometry_score_config.get("dim", 64) or 64),
+        "query_geometry_score_num_freqs": int(query_geometry_score_config.get("num_freqs", 6) or 6),
+        "query_geometry_score_gate_init": float(query_geometry_score_config.get("gate_init", 1.0) or 1.0),
+        "query_geometry_score_layers": score_layers,
+        "query_geometry_score_max_query_tokens": score_max_query_tokens,
+        "query_geometry_score_mode": str(query_geometry_score_config.get("mode", "geometry_first_semantic_refine")),
+        "query_geometry_candidate_radius": float(query_geometry_score_config.get("candidate_radius", 0.35) or 0.35),
+        "query_geometry_candidate_min_k": int(query_geometry_score_config.get("candidate_min_k", 16) or 16),
+        "query_geometry_candidate_invalid_penalty": float(query_geometry_score_config.get("candidate_invalid_penalty", -1e4) or -1e4),
+        "query_semantic_score_dim": int(query_geometry_score_config.get("semantic_score_dim", 64) or 64),
+        "query_semantic_score_alpha": float(query_geometry_score_config.get("semantic_alpha_max", 0.25) or 0.25),
+        "satellite_encoder_config": satellite_encoder_config,
+    }
 
 
 def _build_dataset(args: argparse.Namespace) -> Kitti360dDataset:
@@ -354,6 +399,8 @@ def _materialize_lazy_modules(
 
 def main() -> None:
     args = _parse_args()
+    config = _load_runtime_config(Path(args.config))
+    model_conditioning_config = _resolve_model_conditioning_config(config)
 
     os.environ["HF_ENDPOINT"] = args.hf_endpoint
     os.environ["HF_HOME"] = args.hf_home
@@ -396,8 +443,7 @@ def main() -> None:
         revision=args.base_model_revision,
         torch_dtype=model_torch_dtype,
         cond_drop_prob=0.0,
-        perspective_pe_enabled=True,
-        query_uv_pe_enabled=False,
+        **model_conditioning_config,
     )
     if hasattr(model.unet, "set_attention_slice"):
         model.unet.set_attention_slice("auto")

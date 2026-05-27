@@ -1,7 +1,8 @@
-"""Satellite image condition encoder with 2D RoPE self-attention and perspective PE."""
+"""Satellite image condition encoder with 2D RoPE self-attention and projected geometry."""
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -10,10 +11,10 @@ import torch.nn.functional as F
 
 from models.conditioning import SatelliteMemoryState
 
-from .perspective_position_encoder import (
-    PerspectivePositionEncoder,
-    compute_sat_patch_perspective_uv,
-)
+from .perspective_position_encoder import compute_sat_patch_perspective_uv
+
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_1d_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -161,7 +162,20 @@ class RoPETransformerEncoder(nn.Module):
 
 
 class SatelliteConditionEncoder(nn.Module):
-    """Encode satellite patches with 2D RoPE self-attention and gated perspective PE."""
+    """Encode satellite patches as pure content tokens and projected perspective UV."""
+
+    _DEPRECATED_PE_KWARGS = {
+        "perspective_pe_enabled",
+        "perspective_num_freqs",
+        "perspective_pe_gate_init",
+        "perspective_invalid_mode",
+        "perspective_use_validity_embedding",
+        "perspective_ooi_init_std",
+        "perspective_validity_embed_init_std",
+        "perspective_pe_injection",
+        "perspective_pe_scale_mode",
+        "perspective_pe_target_ratio",
+    }
 
     def __init__(
         self,
@@ -169,20 +183,25 @@ class SatelliteConditionEncoder(nn.Module):
         patch_size: int = 16,
         sat_resolution: float = 0.2,
         sat_size: int = 512,
-        perspective_pe_enabled: bool = True,
-        perspective_num_freqs: int = 6,
-        perspective_pe_gate_init: float = 0.1,
         num_heads: int = 12,
         num_layers: int = 4,
         attn_dropout: float = 0.1,
+        **deprecated_pe_kwargs,
     ):
         super().__init__()
+        unknown_kwargs = set(deprecated_pe_kwargs) - self._DEPRECATED_PE_KWARGS
+        if unknown_kwargs:
+            names = ", ".join(sorted(unknown_kwargs))
+            raise TypeError(f"Unexpected SatelliteConditionEncoder kwargs: {names}")
+        if deprecated_pe_kwargs:
+            logger.warning(
+                "Ignoring deprecated additive perspective PE satellite encoder kwargs: %s",
+                ", ".join(sorted(deprecated_pe_kwargs)),
+            )
         self.embed_dim = int(embed_dim)
         self.patch_size = int(patch_size)
         self.sat_resolution = float(sat_resolution)
         self.sat_size = int(sat_size)
-        self.perspective_pe_enabled = bool(perspective_pe_enabled)
-        self.perspective_num_freqs = int(perspective_num_freqs)
         self.num_heads = int(num_heads)
         self.num_layers = int(num_layers)
 
@@ -194,11 +213,6 @@ class SatelliteConditionEncoder(nn.Module):
             padding=0,
         )
 
-        self.perspective_pos_encoder = PerspectivePositionEncoder(
-            dim=self.embed_dim,
-            num_freqs=self.perspective_num_freqs,
-        )
-        self.perspective_pe_gate = nn.Parameter(torch.tensor(float(perspective_pe_gate_init)))
         self.token_norm = nn.LayerNorm(self.embed_dim)
 
         self.self_attn = RoPETransformerEncoder(
@@ -260,7 +274,7 @@ class SatelliteConditionEncoder(nn.Module):
             missing.append("image_size")
         if missing:
             raise ValueError(
-                "perspective PE is enabled but geometry inputs are missing: " + ", ".join(missing)
+                "projected satellite geometry inputs are missing: " + ", ".join(missing)
             )
 
     def forward(
@@ -287,10 +301,15 @@ class SatelliteConditionEncoder(nn.Module):
         perspective_uv = None
         perspective_valid = None
 
-        tokens = self.self_attn(tokens, grid_hw=(patch_h, patch_w))
-        tokens = self.attn_norm(tokens)
+        geometry_inputs = (
+            K is not None
+            or T_cam_to_world is not None
+            or T_imu_to_world is not None
+            or camera_height_m is not None
+            or image_size is not None
+        )
 
-        if self.perspective_pe_enabled:
+        if geometry_inputs:
             self._validate_geometry(K, T_cam_to_world, T_imu_to_world, camera_height_m, image_size)
             image_h, image_w = int(image_size[0]), int(image_size[1])
             # Keep T_cam_to_world / T_imu_to_world in their original dtype
@@ -305,25 +324,9 @@ class SatelliteConditionEncoder(nn.Module):
                 image_w=image_w,
                 image_h=image_h,
             )
-            perspective_pe = self.perspective_pos_encoder(perspective_uv, perspective_valid)
-            tokens = tokens + self.perspective_pe_gate.to(dtype=tokens.dtype) * perspective_pe
-        elif (
-            K is not None
-            and T_cam_to_world is not None
-            and T_imu_to_world is not None
-            and camera_height_m is not None
-            and image_size is not None
-        ):
-            image_h, image_w = int(image_size[0]), int(image_size[1])
-            perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
-                bev_coords=bev_coords,
-                K=K,
-                T_cam_to_world=T_cam_to_world,
-                T_imu_to_world=T_imu_to_world,
-                camera_height_m=camera_height_m,
-                image_w=image_w,
-                image_h=image_h,
-            )
+
+        tokens = self.self_attn(tokens, grid_hw=(patch_h, patch_w))
+        tokens = self.attn_norm(tokens)
 
         return SatelliteMemoryState(
             tokens=tokens,

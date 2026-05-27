@@ -42,7 +42,7 @@ def _resolve_module_path(root: nn.Module, path: str) -> nn.Module:
 
 
 class SatelliteConditionedUNet(UNet2DConditionModel):
-    """Thin UNet wrapper that routes satellite tokens into cross-attention."""
+    """Thin UNet wrapper that routes satellite tokens and geometry into cross-attention."""
 
     _logged_diag: bool = False
 
@@ -57,20 +57,32 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
         query_geometry_score_num_freqs: int = 6,
         query_geometry_score_gate_init: float = 1.0,
         query_geometry_score_layers: Optional[Sequence[str]] = None,
-        query_geometry_score_max_query_tokens: Optional[int] = 256,
+        query_geometry_score_max_query_tokens: Optional[int] = None,
+        query_geometry_score_mode: str = "geometry_first_semantic_refine",
+        query_geometry_candidate_radius: float = 0.35,
+        query_geometry_candidate_min_k: int = 16,
+        query_geometry_candidate_invalid_penalty: float = -1e4,
+        query_semantic_score_dim: int = 64,
+        query_semantic_score_alpha: float = 0.25,
         query_uv_gate_init: float = 0.0,
         attention_alignment_enabled: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.query_uv_pe_enabled = bool(query_uv_pe_enabled)
-        self.query_geometry_bias_enabled = bool(query_geometry_bias_enabled)
-        self.query_geometry_bias_scale = float(query_geometry_bias_scale)
-        self.query_geometry_invalid_penalty = float(query_geometry_invalid_penalty)
+        del query_uv_pe_enabled, query_geometry_bias_enabled, query_geometry_bias_scale
+        del query_geometry_invalid_penalty, query_uv_gate_init
+        self.query_uv_pe_enabled = False
+        self.query_geometry_bias_enabled = False
         self.query_geometry_score_enabled = bool(query_geometry_score_enabled)
         self.query_geometry_score_dim = int(query_geometry_score_dim)
         self.query_geometry_score_num_freqs = int(query_geometry_score_num_freqs)
         self.query_geometry_score_gate_init = float(query_geometry_score_gate_init)
+        self.query_geometry_score_mode = str(query_geometry_score_mode)
+        self.query_geometry_candidate_radius = float(query_geometry_candidate_radius)
+        self.query_geometry_candidate_min_k = int(query_geometry_candidate_min_k)
+        self.query_geometry_candidate_invalid_penalty = float(query_geometry_candidate_invalid_penalty)
+        self.query_semantic_score_dim = int(query_semantic_score_dim)
+        self.query_semantic_score_alpha = float(query_semantic_score_alpha)
         self.query_geometry_score_layers = (
             None
             if query_geometry_score_layers is None
@@ -81,7 +93,8 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             if query_geometry_score_max_query_tokens is None
             else int(query_geometry_score_max_query_tokens)
         )
-        self.query_uv_gate_init = float(query_uv_gate_init)
+        self.query_geometry_score_runtime_scale = 1.0
+        self.query_semantic_score_runtime_alpha = self.query_semantic_score_alpha
         self.attention_alignment_enabled = bool(attention_alignment_enabled)
         self._attention_debug_layers: Optional[Sequence[str]] = None
         self._attention_debug_storage: Optional[Dict[str, Any]] = None
@@ -89,9 +102,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
 
     def _build_attention_processors(self):
         if (
-            not self.query_uv_pe_enabled
-            and not self.query_geometry_bias_enabled
-            and not self.query_geometry_score_enabled
+            not self.query_geometry_score_enabled
             and not self.attention_alignment_enabled
         ):
             return AttnProcessor2_0()
@@ -105,29 +116,52 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             query_dim = int(attn_module.to_q.out_features)
             processors[name] = QueryUVAttnProcessor2_0(
                 query_dim=query_dim,
-                query_uv_enabled=bool(self.query_uv_pe_enabled and name.endswith(".attn2.processor")),
-                geometry_bias_enabled=bool(self.query_geometry_bias_enabled and name.endswith(".attn2.processor")),
                 geometry_score_enabled=bool(self.query_geometry_score_enabled and name.endswith(".attn2.processor")),
                 geometry_score_dim=self.query_geometry_score_dim,
                 geometry_score_num_freqs=self.query_geometry_score_num_freqs,
                 geometry_score_gate_init=self.query_geometry_score_gate_init,
                 geometry_score_layers=self.query_geometry_score_layers,
                 geometry_score_max_query_tokens=self.query_geometry_score_max_query_tokens,
-                geometry_bias_scale=self.query_geometry_bias_scale,
-                geometry_invalid_penalty=self.query_geometry_invalid_penalty,
-                gate_init=self.query_uv_gate_init,
+                geometry_score_mode=self.query_geometry_score_mode,
+                candidate_radius=self.query_geometry_candidate_radius,
+                candidate_min_k=self.query_geometry_candidate_min_k,
+                candidate_invalid_penalty=self.query_geometry_candidate_invalid_penalty,
+                semantic_score_dim=self.query_semantic_score_dim,
+                semantic_score_alpha=self.query_semantic_score_alpha,
                 layer_name=layer_name,
             )
         return processors
 
     def _install_query_uv_attention_processors(self) -> None:
         self.set_attn_processor(self._build_attention_processors())
+        self._sync_query_geometry_score_runtime_scale()
+        self._sync_query_semantic_score_runtime_alpha()
+
+    def _sync_query_geometry_score_runtime_scale(self) -> None:
+        scale = float(getattr(self, "query_geometry_score_runtime_scale", 1.0))
+        for processor in self.attn_processors.values():
+            setter = getattr(processor, "set_geometry_score_runtime_scale", None)
+            if callable(setter):
+                setter(scale)
+
+    def _sync_query_semantic_score_runtime_alpha(self) -> None:
+        alpha = float(getattr(self, "query_semantic_score_runtime_alpha", self.query_semantic_score_alpha))
+        for processor in self.attn_processors.values():
+            setter = getattr(processor, "set_semantic_score_runtime_alpha", None)
+            if callable(setter):
+                setter(alpha)
+
+    def set_query_geometry_score_runtime_scale(self, scale: float) -> None:
+        self.query_geometry_score_runtime_scale = float(scale)
+        self._sync_query_geometry_score_runtime_scale()
+
+    def set_query_semantic_score_runtime_alpha(self, alpha: float) -> None:
+        self.query_semantic_score_runtime_alpha = float(alpha)
+        self._sync_query_semantic_score_runtime_alpha()
 
     def set_attention_slice(self, slice_size="auto"):
         if (
-            not self.query_uv_pe_enabled
-            and not self.query_geometry_bias_enabled
-            and not self.query_geometry_score_enabled
+            not self.query_geometry_score_enabled
             and not self.attention_alignment_enabled
         ):
             return super().set_attention_slice(slice_size)
@@ -151,20 +185,23 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             sliced_processors[name] = QueryUVSlicedAttnProcessor(
                 query_dim=query_dim,
                 slice_size=int(slice_value),
-                query_uv_enabled=bool(self.query_uv_pe_enabled and name.endswith(".attn2.processor")),
-                geometry_bias_enabled=bool(self.query_geometry_bias_enabled and name.endswith(".attn2.processor")),
                 geometry_score_enabled=bool(self.query_geometry_score_enabled and name.endswith(".attn2.processor")),
                 geometry_score_dim=self.query_geometry_score_dim,
                 geometry_score_num_freqs=self.query_geometry_score_num_freqs,
                 geometry_score_gate_init=self.query_geometry_score_gate_init,
                 geometry_score_layers=self.query_geometry_score_layers,
                 geometry_score_max_query_tokens=self.query_geometry_score_max_query_tokens,
-                geometry_bias_scale=self.query_geometry_bias_scale,
-                geometry_invalid_penalty=self.query_geometry_invalid_penalty,
-                gate_init=self.query_uv_gate_init,
+                geometry_score_mode=self.query_geometry_score_mode,
+                candidate_radius=self.query_geometry_candidate_radius,
+                candidate_min_k=self.query_geometry_candidate_min_k,
+                candidate_invalid_penalty=self.query_geometry_candidate_invalid_penalty,
+                semantic_score_dim=self.query_semantic_score_dim,
+                semantic_score_alpha=self.query_semantic_score_alpha,
                 layer_name=layer_name,
             )
         self.set_attn_processor(sliced_processors)
+        self._sync_query_geometry_score_runtime_scale()
+        self._sync_query_semantic_score_runtime_alpha()
 
     def enable_attention_debug(
         self,
@@ -214,9 +251,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
             and isinstance(cross_attention_kwargs.get("attention_alignment"), dict)
         )
         if (
-            self.query_uv_pe_enabled
-            or self.query_geometry_bias_enabled
-            or self.query_geometry_score_enabled
+            self.query_geometry_score_enabled
             or attention_alignment_requested
             or self.is_attention_debug_enabled()
         ):
@@ -225,7 +260,7 @@ class SatelliteConditionedUNet(UNet2DConditionModel):
                     "query-based geometry features require cross_attention_kwargs['query_base_hw'] "
                     "to thread latent spatial coordinates into cross-attention"
                 )
-        if self.query_geometry_bias_enabled or self.query_geometry_score_enabled:
+        if self.query_geometry_score_enabled:
             if not isinstance(cross_attention_kwargs, dict) or cross_attention_kwargs.get("sat_perspective_uv") is None:
                 raise ValueError(
                     "query geometry features require cross_attention_kwargs['sat_perspective_uv']"
@@ -273,10 +308,34 @@ def load_model_state_dict(
     state_dict: Dict[str, torch.Tensor],
 ) -> Tuple[Sequence[str], Sequence[str]]:
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys:
-        raise RuntimeError(f"Missing keys when loading checkpoint: {missing_keys}")
-    if unexpected_keys:
-        raise RuntimeError(f"Unexpected keys when loading checkpoint: {unexpected_keys}")
+    def _is_optional_key(key: str) -> bool:
+        return (
+            key == "satellite_encoder.perspective_pe_gate"
+            or key.startswith("satellite_encoder.perspective_pos_encoder.")
+            or ".processor.query_uv_gate" in key
+            or ".processor.query_uv_encoder." in key
+            or ".processor.geometry_score_gate" in key
+            or ".processor.geometry_score_proj." in key
+            or ".processor.semantic_query_proj." in key
+            or ".processor.semantic_key_proj." in key
+        )
+
+    optional_missing = [key for key in missing_keys if _is_optional_key(key)]
+    optional_unexpected = [key for key in unexpected_keys if _is_optional_key(key)]
+    if optional_missing or optional_unexpected:
+        logger.warning(
+            "Checkpoint omitted/contained optional geometry-addressing keys; continuing with "
+            "initialized geometry params and ignoring removed additive PE params. "
+            "missing=%d unexpected=%d",
+            len(optional_missing),
+            len(optional_unexpected),
+        )
+    required_missing = [key for key in missing_keys if not _is_optional_key(key)]
+    required_unexpected = [key for key in unexpected_keys if not _is_optional_key(key)]
+    if required_missing:
+        raise RuntimeError(f"Missing keys when loading checkpoint: {required_missing}")
+    if required_unexpected:
+        raise RuntimeError(f"Unexpected keys when loading checkpoint: {required_unexpected}")
     return missing_keys, unexpected_keys
 
 
@@ -327,7 +386,7 @@ def _resolve_hf_snapshot_path(model_id: str, revision: Optional[str] = None) -> 
 
 
 class SatelliteConditionedSDModel(nn.Module):
-    """Stable Diffusion model conditioned by satellite tokens with perspective PE."""
+    """Stable Diffusion model conditioned by satellite content tokens and geometry addressing."""
 
     def __init__(
         self,
@@ -337,7 +396,6 @@ class SatelliteConditionedSDModel(nn.Module):
         satellite_encoder: Optional[SatelliteConditionEncoder] = None,
         freeze_base: bool = True,
         cond_drop_prob: float = 0.1,
-        perspective_pe_enabled: bool = True,
         attention_alignment_enabled: bool = False,
         attention_alignment_loss_weight: float = 0.0,
         attention_alignment_layers: Optional[Sequence[str]] = None,
@@ -351,7 +409,7 @@ class SatelliteConditionedSDModel(nn.Module):
         self.vae = vae
         self.noise_scheduler = noise_scheduler
         self.cond_drop_prob = float(cond_drop_prob)
-        self.perspective_pe_enabled = bool(perspective_pe_enabled)
+        self.perspective_geometry_enabled = True
         self.attention_alignment_enabled = bool(attention_alignment_enabled)
         self.attention_alignment_loss_weight = float(attention_alignment_loss_weight)
         self.attention_alignment_layers = tuple(
@@ -374,7 +432,6 @@ class SatelliteConditionedSDModel(nn.Module):
             sat_embed_dim = int(getattr(unet.config, "cross_attention_dim", 768) or 768)
             satellite_encoder = SatelliteConditionEncoder(
                 embed_dim=sat_embed_dim,
-                perspective_pe_enabled=self.perspective_pe_enabled,
             )
         self.satellite_encoder = satellite_encoder
 
@@ -406,9 +463,7 @@ class SatelliteConditionedSDModel(nn.Module):
             f"  Trainable attn2 processor params: "
             f"{sum(p.numel() for n, p in self.unet.named_parameters() if p.requires_grad and '.attn2.processor.' in n)}"
         )
-        logger.info(f"  Perspective PE enabled: {self.perspective_pe_enabled}")
-        logger.info(f"  Query UV PE enabled: {bool(getattr(self.unet, 'query_uv_pe_enabled', False))}")
-        logger.info(f"  Query geometry bias enabled: {bool(getattr(self.unet, 'query_geometry_bias_enabled', False))}")
+        logger.info("  Additive perspective/query PE enabled: False")
         logger.info(f"  Query geometry score enabled: {bool(getattr(self.unet, 'query_geometry_score_enabled', False))}")
         logger.info(f"  Attention alignment enabled: {self.attention_alignment_enabled}")
         logger.info(f"  Attention alignment loss weight: {self.attention_alignment_loss_weight:g}")
@@ -491,16 +546,13 @@ class SatelliteConditionedSDModel(nn.Module):
         attention_debug_active = bool(
             hasattr(self.unet, "is_attention_debug_enabled") and self.unet.is_attention_debug_enabled()
         )
-        if not bool(getattr(self.unet, "query_uv_pe_enabled", False)) and not bool(
-            getattr(self.unet, "query_geometry_bias_enabled", False)
-        ) and not bool(getattr(self.unet, "query_geometry_score_enabled", False)) and not alignment_active and not attention_debug_active:
+        if not bool(getattr(self.unet, "query_geometry_score_enabled", False)) and not alignment_active and not attention_debug_active:
             return None
         if reference.ndim != 4:
             raise ValueError(f"reference tensor must be [B,C,H,W], got {list(reference.shape)}")
         kwargs: Dict[str, Any] = {"query_base_hw": tuple(int(x) for x in reference.shape[-2:])}
         needs_sat_geometry = (
-            bool(getattr(self.unet, "query_geometry_bias_enabled", False))
-            or bool(getattr(self.unet, "query_geometry_score_enabled", False))
+            bool(getattr(self.unet, "query_geometry_score_enabled", False))
             or alignment_active
             or attention_debug_active
         )
@@ -553,19 +605,58 @@ class SatelliteConditionedSDModel(nn.Module):
             "mean_error",
             "valid_query_ratio",
             "valid_attention_mass",
+            "valid_attention_mass_without_geometry",
             "target_attention_mass",
             "target_token_fraction",
             "target_attention_lift",
+            "target_attention_lift_mixed",
+            "target_attention_lift_geometry_only",
+            "target_attention_lift_semantic_only",
+            "target_attention_mass_without_geometry",
+            "target_attention_lift_without_geometry",
+            "target_attention_lift_geometry_delta",
             "nearest_attention_mass",
+            "nearest_attention_mass_without_geometry",
             "target_logit_gap",
+            "target_logit_gap_mixed",
+            "target_logit_gap_geometry_only",
+            "target_logit_gap_semantic_only",
+            "target_logit_gap_without_geometry",
+            "target_logit_gap_geometry_delta",
+            "content_logits_std",
+            "content_logits_abs_mean",
+            "content_logits_top_gap",
+            "raw_content_qk_std",
+            "raw_content_qk_abs_mean",
+            "raw_content_qk_top_gap",
+            "raw_content_qk_to_geometry_ratio",
+            "geometry_bias_std",
+            "geometry_bias_abs_mean",
+            "geometry_bias_top_gap",
+            "geometry_to_content_std_ratio",
+            "geometry_to_content_abs_ratio",
+            "geometry_to_content_top_gap_ratio",
+            "geometry_logits_std",
+            "semantic_logits_std",
+            "semantic_logits_abs_mean",
+            "semantic_logits_top_gap",
+            "semantic_to_geometry_ratio",
+            "candidate_recall",
+            "candidate_count_mean",
+            "window_candidate_count_mean",
+            "window_fallback_ratio",
+            "candidate_valid_query_ratio",
+            "attention_geometry_kl",
             "query_content_norm",
-            "query_pe_norm",
-            "query_pe_ratio",
-            "query_uv_gate",
             "key_content_norm",
             "geometry_score_gate",
+            "geometry_score_gate_raw",
+            "geometry_score_runtime_scale",
             "geometry_score_raw_std",
             "geometry_score_bias_std",
+            "semantic_score_alpha",
+            "semantic_score_raw_std",
+            "semantic_score_bias_std",
         ):
             values = [
                 entry[metric_name].to(device=reference.device).float()
@@ -882,7 +973,7 @@ def create_sd_model(
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
-    perspective_pe_enabled: bool = True,
+    perspective_pe_enabled: bool = False,
     query_uv_pe_enabled: bool = False,
     query_geometry_bias_enabled: bool = False,
     query_geometry_bias_scale: float = 2.0,
@@ -892,7 +983,13 @@ def create_sd_model(
     query_geometry_score_num_freqs: int = 6,
     query_geometry_score_gate_init: float = 1.0,
     query_geometry_score_layers: Optional[Sequence[str]] = None,
-    query_geometry_score_max_query_tokens: Optional[int] = 256,
+    query_geometry_score_max_query_tokens: Optional[int] = None,
+    query_geometry_score_mode: str = "geometry_first_semantic_refine",
+    query_geometry_candidate_radius: float = 0.35,
+    query_geometry_candidate_min_k: int = 16,
+    query_geometry_candidate_invalid_penalty: float = -1e4,
+    query_semantic_score_dim: int = 64,
+    query_semantic_score_alpha: float = 0.25,
     query_uv_gate_init: float = 0.0,
     attention_alignment_enabled: bool = False,
     attention_alignment_loss_weight: float = 0.0,
@@ -903,6 +1000,8 @@ def create_sd_model(
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> SatelliteConditionedSDModel:
     """Create a satellite-conditioned Stable Diffusion model."""
+    del perspective_pe_enabled, query_uv_pe_enabled, query_geometry_bias_enabled
+    del query_geometry_bias_scale, query_geometry_invalid_penalty, query_uv_gate_init
     resolved_base_model = _resolve_hf_snapshot_path(base_model, revision=revision)
     load_source = str(resolved_base_model) if resolved_base_model is not None else base_model
     if resolved_base_model is not None:
@@ -929,7 +1028,26 @@ def create_sd_model(
 
     sat_encoder_cfg = dict(satellite_encoder_config or {})
     sat_encoder_cfg.pop("name", None)
-    sat_encoder_cfg.setdefault("perspective_pe_enabled", perspective_pe_enabled)
+    deprecated_sat_keys = {
+        "perspective_pe_enabled",
+        "perspective_num_freqs",
+        "perspective_pe_gate_init",
+        "perspective_invalid_mode",
+        "perspective_use_validity_embedding",
+        "perspective_ooi_init_std",
+        "perspective_validity_embed_init_std",
+        "perspective_pe_injection",
+        "perspective_pe_scale_mode",
+        "perspective_pe_target_ratio",
+    }
+    removed_sat_keys = sorted(key for key in deprecated_sat_keys if key in sat_encoder_cfg)
+    for key in removed_sat_keys:
+        sat_encoder_cfg.pop(key, None)
+    if removed_sat_keys:
+        logger.warning(
+            "Ignoring removed additive satellite PE config keys: %s",
+            ", ".join(removed_sat_keys),
+        )
     sat_embed_dim = int(getattr(base_unet.config, "cross_attention_dim", 768) or 768)
     requested_embed_dim = sat_encoder_cfg.get("embed_dim")
     if requested_embed_dim is not None and int(requested_embed_dim) != sat_embed_dim:
@@ -942,17 +1060,18 @@ def create_sd_model(
     satellite_encoder = SatelliteConditionEncoder(**sat_encoder_cfg)
 
     unet = SatelliteConditionedUNet(
-        query_uv_pe_enabled=query_uv_pe_enabled,
-        query_geometry_bias_enabled=query_geometry_bias_enabled,
-        query_geometry_bias_scale=query_geometry_bias_scale,
-        query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_geometry_score_enabled=query_geometry_score_enabled,
         query_geometry_score_dim=query_geometry_score_dim,
         query_geometry_score_num_freqs=query_geometry_score_num_freqs,
         query_geometry_score_gate_init=query_geometry_score_gate_init,
         query_geometry_score_layers=query_geometry_score_layers,
         query_geometry_score_max_query_tokens=query_geometry_score_max_query_tokens,
-        query_uv_gate_init=query_uv_gate_init,
+        query_geometry_score_mode=query_geometry_score_mode,
+        query_geometry_candidate_radius=query_geometry_candidate_radius,
+        query_geometry_candidate_min_k=query_geometry_candidate_min_k,
+        query_geometry_candidate_invalid_penalty=query_geometry_candidate_invalid_penalty,
+        query_semantic_score_dim=query_semantic_score_dim,
+        query_semantic_score_alpha=query_semantic_score_alpha,
         attention_alignment_enabled=attention_alignment_enabled,
         **base_unet.config,
     )
@@ -979,7 +1098,6 @@ def create_sd_model(
         satellite_encoder=satellite_encoder,
         freeze_base=freeze_base,
         cond_drop_prob=cond_drop_prob,
-        perspective_pe_enabled=perspective_pe_enabled,
         attention_alignment_enabled=attention_alignment_enabled,
         attention_alignment_loss_weight=attention_alignment_loss_weight,
         attention_alignment_layers=attention_alignment_layers,

@@ -37,12 +37,9 @@ def load_model_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
 ) -> Tuple[Sequence[str], Sequence[str]]:
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys:
-        raise RuntimeError(f"Missing keys when loading checkpoint: {missing_keys}")
-    if unexpected_keys:
-        raise RuntimeError(f"Unexpected keys when loading checkpoint: {unexpected_keys}")
-    return missing_keys, unexpected_keys
+    from models.sd_model import load_model_state_dict as _load_model_state_dict
+
+    return _load_model_state_dict(model, state_dict)
 
 
 def load_model_checkpoint(
@@ -63,12 +60,18 @@ def create_sd_model(
     revision: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
     cond_drop_prob: float = 0.1,
-    perspective_pe_enabled: bool = True,
-    query_uv_pe_enabled: bool = False,
-    query_geometry_bias_enabled: bool = False,
-    query_geometry_bias_scale: float = 2.0,
-    query_geometry_invalid_penalty: float = -1e4,
-    query_uv_gate_init: float = 0.0,
+    query_geometry_score_enabled: bool = False,
+    query_geometry_score_dim: int = 64,
+    query_geometry_score_num_freqs: int = 6,
+    query_geometry_score_gate_init: float = 1.0,
+    query_geometry_score_layers: Optional[Sequence[str]] = None,
+    query_geometry_score_max_query_tokens: Optional[int] = None,
+    query_geometry_score_mode: str = "geometry_first_semantic_refine",
+    query_geometry_candidate_radius: float = 0.35,
+    query_geometry_candidate_min_k: int = 16,
+    query_geometry_candidate_invalid_penalty: float = -1e4,
+    query_semantic_score_dim: int = 64,
+    query_semantic_score_alpha: float = 0.25,
     attention_alignment_enabled: bool = False,
     attention_alignment_loss_weight: float = 0.0,
     attention_alignment_layers: Optional[Sequence[str]] = None,
@@ -86,12 +89,18 @@ def create_sd_model(
         revision=revision,
         torch_dtype=torch_dtype,
         cond_drop_prob=cond_drop_prob,
-        perspective_pe_enabled=perspective_pe_enabled,
-        query_uv_pe_enabled=query_uv_pe_enabled,
-        query_geometry_bias_enabled=query_geometry_bias_enabled,
-        query_geometry_bias_scale=query_geometry_bias_scale,
-        query_geometry_invalid_penalty=query_geometry_invalid_penalty,
-        query_uv_gate_init=query_uv_gate_init,
+        query_geometry_score_enabled=query_geometry_score_enabled,
+        query_geometry_score_dim=query_geometry_score_dim,
+        query_geometry_score_num_freqs=query_geometry_score_num_freqs,
+        query_geometry_score_gate_init=query_geometry_score_gate_init,
+        query_geometry_score_layers=query_geometry_score_layers,
+        query_geometry_score_max_query_tokens=query_geometry_score_max_query_tokens,
+        query_geometry_score_mode=query_geometry_score_mode,
+        query_geometry_candidate_radius=query_geometry_candidate_radius,
+        query_geometry_candidate_min_k=query_geometry_candidate_min_k,
+        query_geometry_candidate_invalid_penalty=query_geometry_candidate_invalid_penalty,
+        query_semantic_score_dim=query_semantic_score_dim,
+        query_semantic_score_alpha=query_semantic_score_alpha,
         attention_alignment_enabled=attention_alignment_enabled,
         attention_alignment_loss_weight=attention_alignment_loss_weight,
         attention_alignment_layers=attention_alignment_layers,
@@ -122,6 +131,13 @@ class SDTrainer:
         num_train_epochs: int = 100,
         lr_scheduler_type: str = 'cosine',
         warmup_epochs: int = 5,
+        geometry_score_lr_multiplier: float = 1.0,
+        geometry_score_gate_warmup_steps: int = 0,
+        geometry_score_gate_warmup_start_scale: float = 1.0,
+        geometry_score_gate_warmup_end_scale: float = 1.0,
+        semantic_score_alpha_max: float = 0.25,
+        semantic_score_alpha_hold_steps: int = 1000,
+        semantic_score_alpha_warmup_steps: int = 2000,
         gradient_accumulation_steps: int = 1,
         output_dir: str = './output',
         save_every: int = 5,
@@ -159,6 +175,15 @@ class SDTrainer:
         self.num_train_epochs = num_train_epochs
         self.lr_scheduler_type = lr_scheduler_type
         self.warmup_epochs = warmup_epochs
+        self.geometry_score_lr_multiplier = float(geometry_score_lr_multiplier)
+        self.geometry_score_gate_warmup_steps = max(0, int(geometry_score_gate_warmup_steps))
+        self.geometry_score_gate_warmup_start_scale = float(geometry_score_gate_warmup_start_scale)
+        self.geometry_score_gate_warmup_end_scale = float(geometry_score_gate_warmup_end_scale)
+        self._last_geometry_score_runtime_scale = self.geometry_score_gate_warmup_end_scale
+        self.semantic_score_alpha_max = float(semantic_score_alpha_max)
+        self.semantic_score_alpha_hold_steps = max(0, int(semantic_score_alpha_hold_steps))
+        self.semantic_score_alpha_warmup_steps = max(0, int(semantic_score_alpha_warmup_steps))
+        self._last_semantic_score_runtime_alpha = self.semantic_score_alpha_max
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.output_dir = Path(output_dir)
         self.save_every = save_every
@@ -216,11 +241,11 @@ class SDTrainer:
             )
 
         # Setup optimizer
-        self.optimizer = AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=learning_rate,
+        optimizer_param_groups = self._build_optimizer_param_groups(
+            learning_rate=learning_rate,
             weight_decay=weight_decay,
         )
+        self.optimizer = AdamW(optimizer_param_groups)
 
         # Setup scheduler
         num_update_steps_per_epoch = max(1, math.ceil(len(train_dataloader) / gradient_accumulation_steps))
@@ -233,6 +258,8 @@ class SDTrainer:
             num_warmup_steps=warmup_steps,
             num_training_steps=max_train_steps,
         )
+        self._apply_geometry_score_gate_warmup(0)
+        self._apply_semantic_score_alpha_schedule(0)
 
         # Setup wandb
         if use_wandb and self.is_main_process:
@@ -260,6 +287,25 @@ class SDTrainer:
             logger.info(f"[SDTrainer] Initialized")
             logger.info(f"  Distributed: {self.distributed} (world_size={self.world_size})")
             logger.info(f"  Learning rate: {learning_rate}")
+            if self.geometry_score_lr_multiplier != 1.0:
+                logger.info(
+                    "  Geometry/semantic score learning rate: %.6g (x%.3g)",
+                    learning_rate * self.geometry_score_lr_multiplier,
+                    self.geometry_score_lr_multiplier,
+                )
+            if self.geometry_score_gate_warmup_steps > 0:
+                logger.info(
+                    "  Geometry score gate runtime scale warmup: %.3g -> %.3g over %d optimizer step(s)",
+                    self.geometry_score_gate_warmup_start_scale,
+                    self.geometry_score_gate_warmup_end_scale,
+                    self.geometry_score_gate_warmup_steps,
+                )
+            logger.info(
+                "  Semantic score alpha schedule: 0 for %d step(s), then warm up to %.3g over %d step(s)",
+                self.semantic_score_alpha_hold_steps,
+                self.semantic_score_alpha_max,
+                self.semantic_score_alpha_warmup_steps,
+            )
             logger.info(f"  Num epochs: {num_train_epochs}")
             logger.info(f"  Batch size per process: {train_dataloader.batch_size}")
             logger.info(
@@ -270,10 +316,7 @@ class SDTrainer:
             logger.info(f"  Max grad norm: {self.max_grad_norm}")
             unwrapped = self.unwrapped_model
             unet = getattr(unwrapped, "unet", None)
-            logger.info(f"  Perspective PE enabled: {bool(getattr(unwrapped, 'perspective_pe_enabled', False))}")
-            logger.info(f"  Query UV PE enabled: {bool(getattr(unet, 'query_uv_pe_enabled', False))}")
-            logger.info(f"  Query UV gate init: {float(getattr(unet, 'query_uv_gate_init', 0.0))}")
-            logger.info(f"  Query geometry bias enabled: {bool(getattr(unet, 'query_geometry_bias_enabled', False))}")
+            logger.info("  Additive perspective/query PE enabled: False")
             logger.info(f"  Query geometry score enabled: {bool(getattr(unet, 'query_geometry_score_enabled', False))}")
             logger.info(f"  Attention alignment enabled: {bool(getattr(unwrapped, 'attention_alignment_enabled', False))}")
             logger.info(
@@ -316,6 +359,109 @@ class SDTrainer:
         flag = torch.tensor(1 if value else 0, device=device, dtype=torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         return bool(flag.item())
+
+    @staticmethod
+    def _is_geometry_score_parameter(name: str) -> bool:
+        return (
+            ".processor.geometry_score_gate" in name
+            or ".processor.geometry_score_proj." in name
+            or ".processor.semantic_query_proj." in name
+            or ".processor.semantic_key_proj." in name
+        )
+
+    def _build_optimizer_param_groups(
+        self,
+        *,
+        learning_rate: float,
+        weight_decay: float,
+    ) -> List[Dict[str, Any]]:
+        base_params: List[nn.Parameter] = []
+        geometry_params: List[nn.Parameter] = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if self._is_geometry_score_parameter(name):
+                geometry_params.append(param)
+            else:
+                base_params.append(param)
+
+        if not geometry_params or self.geometry_score_lr_multiplier == 1.0:
+            return [
+                {
+                    "params": base_params + geometry_params,
+                    "lr": float(learning_rate),
+                    "weight_decay": float(weight_decay),
+                    "name": "base",
+                }
+            ]
+
+        groups: List[Dict[str, Any]] = []
+        if base_params:
+            groups.append(
+                {
+                    "params": base_params,
+                    "lr": float(learning_rate),
+                    "weight_decay": float(weight_decay),
+                    "name": "base",
+                }
+            )
+        groups.append(
+            {
+                "params": geometry_params,
+                "lr": float(learning_rate) * self.geometry_score_lr_multiplier,
+                "weight_decay": float(weight_decay),
+                "name": "geometry_score",
+            }
+        )
+        return groups
+
+    def _optimizer_group_lr(self, group_name: str) -> Optional[float]:
+        for group in self.optimizer.param_groups:
+            if group.get("name") == group_name:
+                return float(group.get("lr", 0.0))
+        return None
+
+    def _geometry_score_runtime_scale_for_update_step(self, update_step: int) -> float:
+        if self.geometry_score_gate_warmup_steps <= 0:
+            return self.geometry_score_gate_warmup_end_scale
+        progress = min(
+            1.0,
+            max(0.0, float(update_step) / float(self.geometry_score_gate_warmup_steps)),
+        )
+        return (
+            self.geometry_score_gate_warmup_start_scale
+            + (self.geometry_score_gate_warmup_end_scale - self.geometry_score_gate_warmup_start_scale) * progress
+        )
+
+    def _apply_geometry_score_gate_warmup(self, update_step: int) -> float:
+        scale = self._geometry_score_runtime_scale_for_update_step(update_step)
+        unet = getattr(self.unwrapped_model, "unet", None)
+        setter = getattr(unet, "set_query_geometry_score_runtime_scale", None)
+        if callable(setter):
+            setter(scale)
+        self._last_geometry_score_runtime_scale = float(scale)
+        return float(scale)
+
+    def _semantic_score_alpha_for_update_step(self, update_step: int) -> float:
+        if update_step < self.semantic_score_alpha_hold_steps:
+            return 0.0
+        if self.semantic_score_alpha_warmup_steps <= 0:
+            return self.semantic_score_alpha_max
+        warmup_step = update_step - self.semantic_score_alpha_hold_steps
+        progress = min(
+            1.0,
+            max(0.0, float(warmup_step) / float(self.semantic_score_alpha_warmup_steps)),
+        )
+        return self.semantic_score_alpha_max * progress
+
+    def _apply_semantic_score_alpha_schedule(self, update_step: int) -> float:
+        alpha = self._semantic_score_alpha_for_update_step(update_step)
+        unet = getattr(self.unwrapped_model, "unet", None)
+        setter = getattr(unet, "set_query_semantic_score_runtime_alpha", None)
+        if callable(setter):
+            setter(alpha)
+        self._last_semantic_score_runtime_alpha = float(alpha)
+        return float(alpha)
 
     def _move_batch_geometry(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         geometry: Dict[str, torch.Tensor] = {}
@@ -598,6 +744,7 @@ class SDTrainer:
         total_raw_loss = 0.0
         finite_loss_batches = 0
         num_batches = len(self.train_dataloader)
+        num_update_steps_per_epoch = max(1, math.ceil(num_batches / self.gradient_accumulation_steps))
         self.optimizer.zero_grad(set_to_none=True)
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         skip_accumulation_until = -1
@@ -620,6 +767,9 @@ class SDTrainer:
             accumulation_start = (step // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
             accumulation_end = min(accumulation_start + self.gradient_accumulation_steps, num_batches)
             accumulation_window_size = max(1, accumulation_end - accumulation_start)
+            optimizer_update_step = epoch * num_update_steps_per_epoch + step // self.gradient_accumulation_steps
+            geometry_score_runtime_scale = self._apply_geometry_score_gate_warmup(optimizer_update_step)
+            semantic_score_runtime_alpha = self._apply_semantic_score_alpha_schedule(optimizer_update_step)
             if step < skip_accumulation_until:
                 if self.is_main_process:
                     progress_bar.set_postfix({"raw_loss": "skipped"})
@@ -750,27 +900,71 @@ class SDTrainer:
                 log_payload = {
                     'train/raw_loss': raw_loss.item(),
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
+                    'train/geometry_score/runtime_scale': geometry_score_runtime_scale,
+                    'train/semantic_score/runtime_alpha': semantic_score_runtime_alpha,
                     'train/epoch': epoch + 1,
                 }
+                geometry_lr = self._optimizer_group_lr("geometry_score")
+                if geometry_lr is not None:
+                    log_payload["train/lr_geometry_score"] = geometry_lr
                 metric_name_map = {
                     "denoise_loss": "train/denoise_loss",
                     "attention_alignment_loss": "train/attention_alignment/loss",
                     "attention_alignment_mean_error": "train/attention_alignment/mean_error",
                     "attention_alignment_valid_query_ratio": "train/attention_alignment/valid_query_ratio",
                     "attention_alignment_valid_attention_mass": "train/attention_alignment/valid_attention_mass",
+                    "attention_alignment_valid_attention_mass_without_geometry": "train/attention_alignment/valid_attention_mass_without_geometry",
                     "attention_alignment_target_attention_mass": "train/attention_alignment/target_attention_mass",
                     "attention_alignment_target_token_fraction": "train/attention_alignment/target_token_fraction",
                     "attention_alignment_target_attention_lift": "train/attention_alignment/target_attention_lift",
+                    "attention_alignment_target_attention_mass_without_geometry": "train/attention_alignment/target_attention_mass_without_geometry",
+                    "attention_alignment_target_attention_lift_without_geometry": "train/attention_alignment/target_attention_lift_without_geometry",
+                    "attention_alignment_target_attention_lift_geometry_delta": "train/attention_alignment/target_attention_lift_geometry_delta",
                     "attention_alignment_nearest_attention_mass": "train/attention_alignment/nearest_attention_mass",
+                    "attention_alignment_nearest_attention_mass_without_geometry": "train/attention_alignment/nearest_attention_mass_without_geometry",
                     "attention_alignment_target_logit_gap": "train/attention_alignment/target_logit_gap",
+                    "attention_alignment_target_logit_gap_without_geometry": "train/attention_alignment/target_logit_gap_without_geometry",
+                    "attention_alignment_target_logit_gap_geometry_delta": "train/attention_alignment/target_logit_gap_geometry_delta",
+                    "attention_alignment_content_logits_std": "train/attention_alignment/content_logits_std",
+                    "attention_alignment_content_logits_abs_mean": "train/attention_alignment/content_logits_abs_mean",
+                    "attention_alignment_content_logits_top_gap": "train/attention_alignment/content_logits_top_gap",
+                    "attention_alignment_geometry_bias_std": "train/attention_alignment/geometry_bias_std",
+                    "attention_alignment_geometry_bias_abs_mean": "train/attention_alignment/geometry_bias_abs_mean",
+                    "attention_alignment_geometry_bias_top_gap": "train/attention_alignment/geometry_bias_top_gap",
+                    "attention_alignment_geometry_to_content_std_ratio": "train/attention_alignment/geometry_to_content_std_ratio",
+                    "attention_alignment_geometry_to_content_abs_ratio": "train/attention_alignment/geometry_to_content_abs_ratio",
+                    "attention_alignment_geometry_to_content_top_gap_ratio": "train/attention_alignment/geometry_to_content_top_gap_ratio",
+                    "attention_alignment_attention_geometry_kl": "train/attention_alignment/attention_geometry_kl",
                     "attention_alignment_query_content_norm": "train/attention_alignment/query_content_norm",
-                    "attention_alignment_query_pe_norm": "train/attention_alignment/query_pe_norm",
-                    "attention_alignment_query_pe_ratio": "train/attention_alignment/query_pe_ratio",
-                    "attention_alignment_query_uv_gate": "train/attention_alignment/query_uv_gate",
                     "attention_alignment_key_content_norm": "train/attention_alignment/key_content_norm",
                     "attention_alignment_geometry_score_gate": "train/attention_alignment/geometry_score_gate",
+                    "attention_alignment_geometry_score_gate_raw": "train/attention_alignment/geometry_score_gate_raw",
+                    "attention_alignment_geometry_score_runtime_scale": "train/attention_alignment/geometry_score_runtime_scale",
                     "attention_alignment_geometry_score_raw_std": "train/attention_alignment/geometry_score_raw_std",
                     "attention_alignment_geometry_score_bias_std": "train/attention_alignment/geometry_score_bias_std",
+                    "attention_alignment_semantic_score_alpha": "train/attention_alignment/semantic_score_alpha",
+                    "attention_alignment_semantic_score_raw_std": "train/attention_alignment/semantic_score_raw_std",
+                    "attention_alignment_semantic_score_bias_std": "train/attention_alignment/semantic_score_bias_std",
+                    "attention_alignment_geometry_logits_std": "train/attention_alignment/geometry_logits_std",
+                    "attention_alignment_semantic_logits_std": "train/attention_alignment/semantic_logits_std",
+                    "attention_alignment_semantic_logits_abs_mean": "train/attention_alignment/semantic_logits_abs_mean",
+                    "attention_alignment_semantic_logits_top_gap": "train/attention_alignment/semantic_logits_top_gap",
+                    "attention_alignment_semantic_to_geometry_ratio": "train/attention_alignment/semantic_to_geometry_ratio",
+                    "attention_alignment_raw_content_qk_std": "train/attention_alignment/raw_content_qk_std",
+                    "attention_alignment_raw_content_qk_abs_mean": "train/attention_alignment/raw_content_qk_abs_mean",
+                    "attention_alignment_raw_content_qk_top_gap": "train/attention_alignment/raw_content_qk_top_gap",
+                    "attention_alignment_raw_content_qk_to_geometry_ratio": "train/attention_alignment/raw_content_qk_to_geometry_ratio",
+                    "attention_alignment_candidate_recall": "train/attention_alignment/candidate_recall",
+                    "attention_alignment_candidate_count_mean": "train/attention_alignment/candidate_count_mean",
+                    "attention_alignment_window_candidate_count_mean": "train/attention_alignment/window_candidate_count_mean",
+                    "attention_alignment_window_fallback_ratio": "train/attention_alignment/window_fallback_ratio",
+                    "attention_alignment_candidate_valid_query_ratio": "train/attention_alignment/candidate_valid_query_ratio",
+                    "attention_alignment_target_attention_lift_mixed": "train/attention_alignment/target_attention_lift_mixed",
+                    "attention_alignment_target_attention_lift_geometry_only": "train/attention_alignment/target_attention_lift_geometry_only",
+                    "attention_alignment_target_attention_lift_semantic_only": "train/attention_alignment/target_attention_lift_semantic_only",
+                    "attention_alignment_target_logit_gap_mixed": "train/attention_alignment/target_logit_gap_mixed",
+                    "attention_alignment_target_logit_gap_geometry_only": "train/attention_alignment/target_logit_gap_geometry_only",
+                    "attention_alignment_target_logit_gap_semantic_only": "train/attention_alignment/target_logit_gap_semantic_only",
                     "attention_alignment_loss_weight": "train/attention_alignment/loss_weight",
                     "attention_alignment_loss_is_differentiable": "train/attention_alignment/loss_is_differentiable",
                 }
@@ -1125,12 +1319,14 @@ class SDTrainer:
         draw.line((x - radius * 1.6, y, x + radius * 1.6, y), fill=color + (255,), width=2)
         draw.line((x, y - radius * 1.6, x, y + radius * 1.6), fill=color + (255,), width=2)
 
-    @staticmethod
+    @classmethod
     def _draw_query_position_inset(
+        cls,
         image: Image.Image,
         *,
         query_index: int,
         query_hw: Tuple[int, int],
+        gt_image: Optional[torch.Tensor] = None,
     ) -> None:
         draw = ImageDraw.Draw(image, "RGBA")
         width, height = image.size
@@ -1138,26 +1334,48 @@ class SDTrainer:
         if query_h <= 0 or query_w <= 0:
             return
 
-        inset_w = max(72, min(128, width // 4))
-        inset_h = max(44, min(80, height // 6))
+        gt_pil = None
+        if torch.is_tensor(gt_image):
+            gt_pil = cls._tensor_to_pil(gt_image).convert("RGB")
+
+        if gt_pil is not None:
+            aspect = max(1e-6, float(gt_pil.width) / float(gt_pil.height))
+            inset_w = max(128, min(220, width // 3))
+            inset_h = max(48, int(round(float(inset_w) / aspect)))
+            max_inset_h = max(48, height // 4)
+            if inset_h > max_inset_h:
+                inset_h = max_inset_h
+                inset_w = max(72, int(round(float(inset_h) * aspect)))
+            inset_w = min(inset_w, width - 16)
+            inset_h = min(inset_h, height - 16)
+        else:
+            inset_w = max(72, min(128, width // 4))
+            inset_h = max(44, min(80, height // 6))
         margin = 8
         left = width - inset_w - margin
         top = height - inset_h - margin
         right = width - margin
         bottom = height - margin
-        draw.rectangle((left, top, right, bottom), fill=(0, 0, 0, 150), outline=(255, 255, 255, 170), width=1)
 
-        grid_left = left + 8
-        grid_top = top + 8
-        grid_right = right - 8
-        grid_bottom = bottom - 8
-        draw.rectangle((grid_left, grid_top, grid_right, grid_bottom), outline=(180, 180, 180, 170), width=1)
+        if gt_pil is not None:
+            inset = gt_pil.resize((inset_w, inset_h), Image.Resampling.BILINEAR)
+            image.paste(inset, (left, top))
+            draw.rectangle((left, top, right, bottom), outline=(255, 255, 255, 220), width=2)
+            draw.rectangle((left, top, right, bottom), outline=(0, 0, 0, 150), width=1)
+            grid_left, grid_top, grid_right, grid_bottom = left, top, right, bottom
+        else:
+            draw.rectangle((left, top, right, bottom), fill=(0, 0, 0, 150), outline=(255, 255, 255, 170), width=1)
+            grid_left = left + 8
+            grid_top = top + 8
+            grid_right = right - 8
+            grid_bottom = bottom - 8
+            draw.rectangle((grid_left, grid_top, grid_right, grid_bottom), outline=(180, 180, 180, 170), width=1)
 
         row = int(query_index) // query_w
         col = int(query_index) % query_w
         x = grid_left + (float(col) + 0.5) / float(query_w) * float(max(1, grid_right - grid_left))
         y = grid_top + (float(row) + 0.5) / float(query_h) * float(max(1, grid_bottom - grid_top))
-        radius = 4
+        radius = max(4, int(round(min(inset_w, inset_h) * 0.055)))
         draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 0, 255, 240))
         draw.line((x - radius * 2, y, x + radius * 2, y), fill=(255, 0, 255, 240), width=1)
         draw.line((x, y - radius * 2, x, y + radius * 2), fill=(255, 0, 255, 240), width=1)
@@ -1234,6 +1452,7 @@ class SDTrainer:
         *,
         attention_debug: Dict[str, Any],
         sat_image: torch.Tensor,
+        gt_image: Optional[torch.Tensor],
         front_bev_xy: Optional[torch.Tensor],
         front_ground_valid_mask: Optional[torch.Tensor],
         output_dir: Path,
@@ -1296,13 +1515,14 @@ class SDTrainer:
                 draw = ImageDraw.Draw(overlay, "RGBA")
                 row = int(query_index) // int(query_hw[1])
                 col = int(query_index) % int(query_hw[1])
-                draw.rectangle((4, 4, 260, 42), fill=(0, 0, 0, 150))
-                draw.text((8, 8), f"q=({row},{col}) magenta=image query", fill=(255, 255, 255, 255))
+                draw.rectangle((4, 4, 294, 42), fill=(0, 0, 0, 150))
+                draw.text((8, 8), f"q=({row},{col}) inset=GT view", fill=(255, 255, 255, 255))
                 draw.text((8, 24), "red/yellow=attention  cyan=target sat patches", fill=(255, 255, 255, 255))
                 self._draw_query_position_inset(
                     overlay,
                     query_index=int(query_index),
                     query_hw=(int(query_hw[0]), int(query_hw[1])),
+                    gt_image=gt_image,
                 )
                 heatmaps.append(overlay)
                 overlay.save(output_dir / f"{prefix}_{layer_token}_q{query_index:04d}_sat_heatmap.png")
@@ -1667,6 +1887,7 @@ class SDTrainer:
             self._save_attention_debug_visualizations(
                 attention_debug=attention_debug_by_sample[idx],
                 sat_image=sat_images[idx],
+                gt_image=target_images[idx],
                 front_bev_xy=front_bev_xy[idx] if front_bev_xy is not None else None,
                 front_ground_valid_mask=(
                     front_ground_valid_mask[idx] if front_ground_valid_mask is not None else None
@@ -1695,8 +1916,15 @@ class SDTrainer:
         """Load from checkpoint and return the next zero-based epoch index."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         load_model_state_dict(self.unwrapped_model, checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except ValueError as exc:
+            logger.warning(
+                "Checkpoint optimizer/scheduler state is incompatible with the current parameter groups; "
+                "continuing with freshly initialized optimizer state. Reason: %s",
+                exc,
+            )
         checkpoint_epoch = checkpoint.get('epoch')
         start_epoch = int(checkpoint_epoch) + 1 if checkpoint_epoch is not None else 0
         if checkpoint_epoch is None:

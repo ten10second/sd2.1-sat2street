@@ -82,7 +82,7 @@ class _DummyUNet(nn.Module):
         super().__init__()
         self.config = SimpleNamespace(in_channels=3, sample_size=8, cross_attention_dim=embed_dim)
         self.scale = nn.Parameter(torch.tensor(0.0))
-        self.query_uv_pe_enabled = True
+        self.query_geometry_score_enabled = True
         self.call_sat_token_means = []
         self.extra_kwarg_keys = []
         self.cross_attention_kwargs = []
@@ -131,11 +131,10 @@ class _SmallPerspectiveModel(SatelliteConditionedSDModel):
         self.vae = _DummyVAE()
         self.noise_scheduler = _DummyScheduler()
         self.cond_drop_prob = 0.0
-        self.perspective_pe_enabled = True
+        self.perspective_geometry_enabled = True
         self.satellite_encoder = SatelliteConditionEncoder(
             embed_dim=4,
             patch_size=4,
-            perspective_pe_enabled=True,
             num_heads=1,
         )
 
@@ -157,6 +156,36 @@ class _TrainableLossModel(nn.Module):
                 xy=torch.zeros((1, 4, 2), dtype=loss.dtype, device=loss.device),
             ),
         }
+
+
+class _RuntimeScaleUNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scales = []
+        self.semantic_alphas = []
+
+    def set_query_geometry_score_runtime_scale(self, scale: float) -> None:
+        self.scales.append(float(scale))
+
+    def set_query_semantic_score_runtime_alpha(self, alpha: float) -> None:
+        self.semantic_alphas.append(float(alpha))
+
+
+class _GeometryScoreParamModel(_TrainableLossModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.unet = nn.Module()
+        self.unet.processor = nn.Module()
+        self.unet.processor.geometry_score_gate = nn.Parameter(torch.tensor(1.0))
+        self.unet.processor.geometry_score_proj = nn.Linear(1, 1, bias=False)
+        self.unet.processor.semantic_query_proj = nn.Linear(1, 1, bias=False)
+        self.unet.processor.semantic_key_proj = nn.Linear(1, 1, bias=False)
+
+
+class _GeometryScoreWarmupModel(_TrainableLossModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.unet = _RuntimeScaleUNet()
 
 
 class _VisualizationModel(nn.Module):
@@ -428,9 +457,63 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         metric = attention_alignment["metrics"][0]
         self.assertGreater(float(metric["target_attention_lift"]), 1.0)
         self.assertGreater(float(metric["target_logit_gap"]), 0.0)
+        self.assertIn("content_logits_std", metric)
+        self.assertIn("geometry_to_content_std_ratio", metric)
+        self.assertIn("attention_geometry_kl", metric)
+        self.assertIn("target_attention_lift_without_geometry", metric)
+        self.assertGreater(float(metric["target_attention_lift_geometry_delta"]), 0.0)
         self.assertIn("geometry_score_gate", metric)
 
-    def test_query_geometry_bias_runs_without_query_uv_pe(self) -> None:
+    def test_geometry_first_attention_blocks_far_tokens_when_alpha_zero(self) -> None:
+        from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
+
+        torch.manual_seed(0)
+        layer_name = "test_block.attn2"
+        attn = Attention(query_dim=8, cross_attention_dim=8, heads=2, dim_head=4, bias=False)
+        processor = QueryUVAttnProcessor2_0(
+            query_dim=int(attn.to_q.out_features),
+            geometry_score_enabled=True,
+            geometry_score_gate_init=0.0,
+            geometry_score_layers=(layer_name,),
+            candidate_radius=0.1,
+            candidate_min_k=1,
+            semantic_score_alpha=0.25,
+            layer_name=layer_name,
+        )
+        processor.set_semantic_score_runtime_alpha(0.0)
+        attn.set_processor(processor)
+        hidden_states = torch.randn(1, 1, 8)
+        encoder_hidden_states = torch.randn(1, 2, 8)
+        attention_alignment = {
+            "enabled": True,
+            "layers": [layer_name],
+            "max_query_tokens": 1,
+            "valid_radius": 0.2,
+            "losses": [],
+            "metrics": [],
+            "debug_storage": {},
+        }
+
+        _ = attn(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            query_base_hw=(1, 1),
+            query_uv=torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
+            sat_perspective_uv=torch.tensor([[[0.0, 0.0], [0.8, 0.0]]], dtype=torch.float32),
+            sat_perspective_valid=torch.ones((1, 2), dtype=torch.bool),
+            attention_alignment=attention_alignment,
+        )
+
+        attention = attention_alignment["debug_storage"][layer_name]["attention"]
+        self.assertGreater(float(attention[0, 0, 0]), 0.999)
+        self.assertLess(float(attention[0, 0, 1]), 1e-4)
+        metric = attention_alignment["metrics"][0]
+        self.assertIn("raw_content_qk_std", metric)
+        self.assertIn("semantic_logits_std", metric)
+        self.assertIn("candidate_recall", metric)
+        self.assertIn("target_attention_lift_geometry_only", metric)
+
+    def test_removed_query_geometry_bias_is_ignored_without_additive_query_pe(self) -> None:
         from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
 
         torch.manual_seed(0)
@@ -459,11 +542,95 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
         )
 
         self.assertEqual(output.shape, hidden_states.shape)
-        self.assertIsNone(processor.query_uv_encoder)
-        self.assertIsNone(processor.query_uv_gate)
 
-    def test_query_uv_attn_processor_uses_fourier_coord_encoder(self) -> None:
-        from models.encoders.perspective_position_encoder import PerspectivePositionEncoder
+    def test_trainer_uses_separate_geometry_score_lr_group(self) -> None:
+        model = _GeometryScoreParamModel()
+        dataloader = DataLoader(_SingleSampleDataset(), batch_size=1, shuffle=False)
+
+        with TemporaryDirectory() as tmpdir:
+            trainer = SDTrainer(
+                model=model,
+                train_dataloader=dataloader,
+                val_dataloader=None,
+                learning_rate=1e-4,
+                geometry_score_lr_multiplier=3.0,
+                num_train_epochs=1,
+                warmup_epochs=0,
+                output_dir=tmpdir,
+                save_every=10,
+                log_every=10,
+                device="cpu",
+                use_wandb=False,
+                use_tensorboard=False,
+                mixed_precision=None,
+                visualize_every=0,
+            )
+
+            lrs = {group.get("name"): group["lr"] for group in trainer.optimizer.param_groups}
+            self.assertAlmostEqual(lrs["base"], 1e-4)
+            self.assertAlmostEqual(lrs["geometry_score"], 3e-4)
+            score_group = next(group for group in trainer.optimizer.param_groups if group.get("name") == "geometry_score")
+            score_param_ids = {id(param) for param in score_group["params"]}
+            self.assertIn(id(model.unet.processor.semantic_query_proj.weight), score_param_ids)
+            self.assertIn(id(model.unet.processor.semantic_key_proj.weight), score_param_ids)
+
+    def test_trainer_applies_geometry_score_gate_runtime_warmup(self) -> None:
+        model = _GeometryScoreWarmupModel()
+        dataloader = DataLoader(_SingleSampleDataset(), batch_size=1, shuffle=False)
+
+        with TemporaryDirectory() as tmpdir:
+            trainer = SDTrainer(
+                model=model,
+                train_dataloader=dataloader,
+                val_dataloader=None,
+                geometry_score_gate_warmup_steps=10,
+                geometry_score_gate_warmup_start_scale=0.25,
+                geometry_score_gate_warmup_end_scale=1.0,
+                num_train_epochs=1,
+                output_dir=tmpdir,
+                save_every=10,
+                log_every=10,
+                device="cpu",
+                use_wandb=False,
+                use_tensorboard=False,
+                mixed_precision=None,
+                visualize_every=0,
+            )
+
+            self.assertAlmostEqual(model.unet.scales[-1], 0.25)
+            self.assertAlmostEqual(trainer._apply_geometry_score_gate_warmup(5), 0.625)
+            self.assertAlmostEqual(model.unet.scales[-1], 0.625)
+            self.assertAlmostEqual(trainer._apply_geometry_score_gate_warmup(10), 1.0)
+
+    def test_trainer_applies_semantic_score_alpha_schedule(self) -> None:
+        model = _GeometryScoreWarmupModel()
+        dataloader = DataLoader(_SingleSampleDataset(), batch_size=1, shuffle=False)
+
+        with TemporaryDirectory() as tmpdir:
+            trainer = SDTrainer(
+                model=model,
+                train_dataloader=dataloader,
+                val_dataloader=None,
+                semantic_score_alpha_max=0.25,
+                semantic_score_alpha_hold_steps=10,
+                semantic_score_alpha_warmup_steps=20,
+                num_train_epochs=1,
+                output_dir=tmpdir,
+                save_every=10,
+                log_every=10,
+                device="cpu",
+                use_wandb=False,
+                use_tensorboard=False,
+                mixed_precision=None,
+                visualize_every=0,
+            )
+
+            self.assertAlmostEqual(model.unet.semantic_alphas[-1], 0.0)
+            self.assertAlmostEqual(trainer._apply_semantic_score_alpha_schedule(10), 0.0)
+            self.assertAlmostEqual(trainer._apply_semantic_score_alpha_schedule(20), 0.125)
+            self.assertAlmostEqual(trainer._apply_semantic_score_alpha_schedule(30), 0.25)
+
+    def test_query_uv_attn_processor_does_not_create_additive_query_encoder(self) -> None:
         from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0
 
         processor = QueryUVAttnProcessor2_0(
@@ -472,13 +639,9 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             geometry_bias_enabled=False,
         )
 
-        self.assertIsInstance(processor.query_uv_encoder, PerspectivePositionEncoder)
-        self.assertEqual(processor.query_uv_encoder.num_freqs, 6)
-        self.assertIsInstance(processor.query_uv_encoder.fourier_linear, nn.Linear)
-        self.assertEqual(processor.query_uv_encoder.fourier_linear.in_features, 24)
-        self.assertEqual(processor.query_uv_encoder.fourier_linear.out_features, 16)
-        self.assertIsInstance(processor.query_uv_encoder.fourier_norm, nn.LayerNorm)
-        self.assertEqual(processor.query_uv_encoder.ooi_token.shape, (16,))
+        self.assertIsNone(processor.query_uv_encoder)
+        self.assertIsNone(processor.query_uv_gate)
+        self.assertFalse(any("query_uv" in name for name, _ in processor.named_parameters()))
 
     def test_satellite_condition_encoder_uses_rope_self_attention(self) -> None:
         encoder = SatelliteConditionEncoder(
@@ -521,7 +684,7 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
 
         self.assertEqual(output.shape, hidden_states.shape)
 
-    def test_unet_attention_slicing_keeps_query_uv_processor(self) -> None:
+    def test_unet_attention_slicing_keeps_geometry_score_processor(self) -> None:
         torch.manual_seed(0)
         model = SatelliteConditionedUNet(
             sample_size=8,
@@ -537,13 +700,17 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             cross_attention_dim=16,
             attention_head_dim=8,
             norm_num_groups=8,
-            query_uv_pe_enabled=True,
-            query_geometry_bias_enabled=False,
+            query_geometry_score_enabled=True,
+            query_geometry_score_dim=8,
+            query_geometry_score_max_query_tokens=64,
         )
 
         model.set_attention_slice("auto")
         self.assertTrue(
-            any(isinstance(processor, QueryUVSlicedAttnProcessor) for processor in model.attn_processors.values())
+            any(
+                isinstance(processor, QueryUVSlicedAttnProcessor) and processor.geometry_score_enabled
+                for processor in model.attn_processors.values()
+            )
         )
 
         latents = torch.randn(1, 4, 8, 8)
@@ -552,12 +719,21 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             latents,
             torch.tensor([0], dtype=torch.long),
             encoder_hidden_states=encoder_hidden_states,
-            cross_attention_kwargs={"query_base_hw": (8, 8)},
+            cross_attention_kwargs={
+                "query_base_hw": (8, 8),
+                "sat_perspective_uv": build_normalized_image_uv_grid(
+                    2,
+                    2,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                ),
+                "sat_perspective_valid": torch.ones((1, 4), dtype=torch.bool),
+            },
         ).sample
 
         self.assertEqual(output.shape, latents.shape)
 
-    def test_unet_geometry_bias_runs_without_query_uv_pe_under_attention_slicing(self) -> None:
+    def test_unet_geometry_score_runs_under_attention_slicing(self) -> None:
         torch.manual_seed(0)
         model = SatelliteConditionedUNet(
             sample_size=8,
@@ -573,14 +749,16 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             cross_attention_dim=16,
             attention_head_dim=8,
             norm_num_groups=8,
-            query_uv_pe_enabled=False,
-            query_geometry_bias_enabled=True,
+            query_geometry_score_enabled=True,
+            query_geometry_score_dim=8,
+            query_geometry_score_max_query_tokens=64,
         )
 
         model.set_attention_slice("auto")
         self.assertTrue(
             any(
                 isinstance(processor, QueryUVSlicedAttnProcessor) and processor.geometry_bias_enabled
+                or isinstance(processor, QueryUVSlicedAttnProcessor) and processor.geometry_score_enabled
                 for processor in model.attn_processors.values()
             )
         )
@@ -621,8 +799,9 @@ class RandomYawGroundPETrainingTest(unittest.TestCase):
             cross_attention_dim=16,
             attention_head_dim=8,
             norm_num_groups=8,
-            query_uv_pe_enabled=True,
-            query_geometry_bias_enabled=False,
+            query_geometry_score_enabled=True,
+            query_geometry_score_dim=8,
+            query_geometry_score_max_query_tokens=64,
         )
         layer_name = next(
             name.removesuffix(".processor")

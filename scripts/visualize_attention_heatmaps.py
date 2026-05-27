@@ -90,14 +90,6 @@ def _build_dataset(args: argparse.Namespace, config: Dict[str, Any]) -> Kitti360
 def _build_model(args: argparse.Namespace, config: Dict[str, Any]):
     model_cfg = dict(config.get("model", {}) or {})
     satellite_encoder_config = dict(model_cfg.get("satellite_encoder", {}) or {})
-    perspective_pe_config = dict(model_cfg.get("perspective_position_encoding", {}) or {})
-    perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
-    query_uv_pe_enabled, query_uv_gate_init = _train_mod["_resolve_query_uv_config"](config)
-    (
-        query_geometry_bias_enabled,
-        query_geometry_bias_scale,
-        query_geometry_invalid_penalty,
-    ) = _train_mod["_resolve_query_geometry_bias_config"](config)
     query_geometry_score_config = _train_mod["_resolve_query_geometry_score_config"](config)
     attention_alignment_config = _train_mod["_resolve_attention_alignment_config"](config)
 
@@ -107,18 +99,18 @@ def _build_model(args: argparse.Namespace, config: Dict[str, Any]):
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=0.0,
-        perspective_pe_enabled=perspective_pe_enabled,
-        query_uv_pe_enabled=query_uv_pe_enabled,
-        query_geometry_bias_enabled=query_geometry_bias_enabled,
-        query_geometry_bias_scale=query_geometry_bias_scale,
-        query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_geometry_score_enabled=query_geometry_score_config["enabled"],
         query_geometry_score_dim=query_geometry_score_config["dim"],
         query_geometry_score_num_freqs=query_geometry_score_config["num_freqs"],
         query_geometry_score_gate_init=query_geometry_score_config["gate_init"],
         query_geometry_score_layers=query_geometry_score_config["layers"],
         query_geometry_score_max_query_tokens=query_geometry_score_config["max_query_tokens"],
-        query_uv_gate_init=query_uv_gate_init,
+        query_geometry_score_mode=query_geometry_score_config["mode"],
+        query_geometry_candidate_radius=query_geometry_score_config["candidate_radius"],
+        query_geometry_candidate_min_k=query_geometry_score_config["candidate_min_k"],
+        query_geometry_candidate_invalid_penalty=query_geometry_score_config["candidate_invalid_penalty"],
+        query_semantic_score_dim=query_geometry_score_config["semantic_score_dim"],
+        query_semantic_score_alpha=query_geometry_score_config["semantic_alpha_max"],
         attention_alignment_enabled=attention_alignment_config["enabled"],
         attention_alignment_loss_weight=attention_alignment_config["loss_weight"],
         attention_alignment_layers=attention_alignment_config["layers"],
@@ -277,6 +269,7 @@ def main() -> None:
             visualizer._save_attention_debug_visualizations(
                 attention_debug=attention_debug,
                 sat_image=sample["sat"],
+                gt_image=real_image,
                 front_bev_xy=sample.get("front_bev_xy"),
                 front_ground_valid_mask=sample.get("front_ground_valid_mask"),
                 output_dir=output_dir / "attention",

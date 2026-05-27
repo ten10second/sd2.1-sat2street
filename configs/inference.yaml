@@ -8,7 +8,7 @@ image_size: [256, 256]
 # 数据配置
 data:
   dataset: 'kitti360'
-  data_dir: '/mnt/shizhm/KITTI-360'
+  data_dir: '/media/shizhm/Lenovo/KITTI-360'
   batch_size: 1
   num_workers: 4
   mode: 'front'
@@ -31,23 +31,20 @@ model:
     patch_size: 16
     sat_resolution: 0.2
     sat_size: 512
-    perspective_num_freqs: 6
-    perspective_pe_gate_init: 0.1
 
-  # Perspective position encoding for satellite tokens
-  perspective_position_encoding:
+  query_geometry_score:
     enable: true
-
-  # Query-side UV positional encoding for UNet cross-attention
-  query_position_encoding:
-    enable: true
-    gate_init: 0.05
-
-  # Direct geometry bias on cross-attention scores
-  query_geometry_bias:
-    enable: false
-    distance_scale: 2.0
-    invalid_penalty: -10000.0
+    mode: 'geometry_first_semantic_refine'
+    dim: 64
+    num_freqs: 6
+    gate_init: 2.0
+    layers: null
+    max_query_tokens: null
+    candidate_radius: 0.35
+    candidate_min_k: 16
+    candidate_invalid_penalty: -10000.0
+    semantic_score_dim: 64
+    semantic_alpha_max: 0.25
 
 # 推理配置
 inference:

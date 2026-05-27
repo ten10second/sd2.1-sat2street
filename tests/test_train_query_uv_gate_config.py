@@ -17,12 +17,12 @@ _prefer_config = _TRAIN_MODULE["_prefer_config"]
 
 
 class TrainQueryUVGateConfigTest(unittest.TestCase):
-    def test_defaults_to_disabled_query_uv_gate(self) -> None:
+    def test_query_uv_config_is_ignored_for_clean_geometry_addressing(self) -> None:
         enabled, gate_init = _resolve_query_uv_config({})
         self.assertFalse(enabled)
-        self.assertEqual(gate_init, 0.05)
+        self.assertEqual(gate_init, 0.0)
 
-    def test_reads_explicit_gate_init(self) -> None:
+    def test_explicit_query_uv_config_still_resolves_to_disabled(self) -> None:
         enabled, gate_init = _resolve_query_uv_config(
             {
                 "model": {
@@ -34,13 +34,18 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
             }
         )
         self.assertFalse(enabled)
-        self.assertEqual(gate_init, 0.25)
+        self.assertEqual(gate_init, 0.0)
 
-    def test_geometry_bias_defaults_to_disabled(self) -> None:
+    def test_geometry_bias_config_is_ignored(self) -> None:
         enabled, scale, invalid_penalty = _resolve_query_geometry_bias_config({})
         self.assertFalse(enabled)
-        self.assertEqual(scale, 2.0)
-        self.assertEqual(invalid_penalty, -1e4)
+        self.assertEqual(scale, 0.0)
+        self.assertEqual(invalid_penalty, 0.0)
+
+    def test_geometry_score_default_has_no_query_token_cutoff(self) -> None:
+        config = _resolve_query_geometry_score_config({"model": {"query_geometry_score": {"enable": True}}})
+        self.assertTrue(config["enabled"])
+        self.assertIsNone(config["max_query_tokens"])
 
     def test_geometry_score_reads_layers_and_gate(self) -> None:
         config = _resolve_query_geometry_score_config(
@@ -53,6 +58,12 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
                         "gate_init": 0.5,
                         "layers": ["mid.attn2"],
                         "max_query_tokens": None,
+                        "mode": "geometry_first_semantic_refine",
+                        "candidate_radius": 0.4,
+                        "candidate_min_k": 12,
+                        "candidate_invalid_penalty": -5000.0,
+                        "semantic_score_dim": 48,
+                        "semantic_alpha_max": 0.2,
                     }
                 }
             }
@@ -63,6 +74,12 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
         self.assertEqual(config["gate_init"], 0.5)
         self.assertEqual(config["layers"], ["mid.attn2"])
         self.assertIsNone(config["max_query_tokens"])
+        self.assertEqual(config["mode"], "geometry_first_semantic_refine")
+        self.assertEqual(config["candidate_radius"], 0.4)
+        self.assertEqual(config["candidate_min_k"], 12)
+        self.assertEqual(config["candidate_invalid_penalty"], -5000.0)
+        self.assertEqual(config["semantic_score_dim"], 48)
+        self.assertEqual(config["semantic_alpha_max"], 0.2)
 
     def test_geometry_score_config_is_attached_to_training_args(self) -> None:
         args = Namespace()
@@ -88,6 +105,12 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
         self.assertEqual(args.query_geometry_score_gate_init, 0.75)
         self.assertEqual(args.query_geometry_score_layers, ["down.attn2", "mid.attn2"])
         self.assertEqual(args.query_geometry_score_max_query_tokens, 128)
+        self.assertEqual(args.query_geometry_score_mode, "geometry_first_semantic_refine")
+        self.assertEqual(args.query_geometry_candidate_radius, 0.35)
+        self.assertEqual(args.query_geometry_candidate_min_k, 16)
+        self.assertEqual(args.query_geometry_candidate_invalid_penalty, -1e4)
+        self.assertEqual(args.query_semantic_score_dim, 64)
+        self.assertEqual(args.query_semantic_score_alpha, 0.25)
 
     def test_geometry_score_model_config_verifier_rejects_unwired_model(self) -> None:
         config = {
@@ -106,6 +129,12 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
                 query_geometry_score_gate_init=1.0,
                 query_geometry_score_layers=("mid.attn2",),
                 query_geometry_score_max_query_tokens=256,
+                query_geometry_score_mode="geometry_first_semantic_refine",
+                query_geometry_candidate_radius=0.35,
+                query_geometry_candidate_min_k=16,
+                query_geometry_candidate_invalid_penalty=-1e4,
+                query_semantic_score_dim=64,
+                query_semantic_score_alpha=0.25,
             )
         )
 
@@ -129,6 +158,12 @@ class TrainQueryUVGateConfigTest(unittest.TestCase):
                 query_geometry_score_gate_init=1.0,
                 query_geometry_score_layers=("mid.attn2",),
                 query_geometry_score_max_query_tokens=256,
+                query_geometry_score_mode="geometry_first_semantic_refine",
+                query_geometry_candidate_radius=0.35,
+                query_geometry_candidate_min_k=16,
+                query_geometry_candidate_invalid_penalty=-1e4,
+                query_semantic_score_dim=64,
+                query_semantic_score_alpha=0.25,
             )
         )
 

@@ -29,6 +29,7 @@ wheels/
 *.ckpt
 *.bin
 *.safetensors
+checkpoints
 checkpoints/
 
 # Outputs and logs
@@ -38,6 +39,8 @@ logs/
 results/
 runs/
 tensorboard/
+visualizations
+visualizations/
 wandb/
 train.log
 *.log

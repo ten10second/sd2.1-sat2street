@@ -1,4 +1,4 @@
-"""Cross-attention processor that can add query UV PE and geometry bias."""
+"""Cross-attention processor with logit-level query/satellite geometry addressing."""
 
 from __future__ import annotations
 
@@ -8,9 +8,6 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from models.encoders.perspective_position_encoder import PerspectivePositionEncoder
-
 
 def build_normalized_image_uv_grid(
     height: int,
@@ -66,26 +63,41 @@ class _QueryUVAttnProcessorBase(nn.Module):
         self,
         query_dim: int,
         *,
-        query_uv_enabled: bool,
-        geometry_bias_enabled: bool,
+        query_uv_enabled: bool = False,
+        geometry_bias_enabled: bool = False,
         geometry_score_enabled: bool = False,
         geometry_score_dim: int = 64,
         geometry_score_num_freqs: int = 6,
         geometry_score_gate_init: float = 1.0,
         geometry_score_layers: Optional[Tuple[str, ...]] = None,
-        geometry_score_max_query_tokens: Optional[int] = 256,
+        geometry_score_max_query_tokens: Optional[int] = None,
+        geometry_score_mode: str = "geometry_first_semantic_refine",
+        candidate_radius: float = 0.35,
+        candidate_min_k: int = 16,
+        candidate_invalid_penalty: float = -1e4,
+        semantic_score_dim: int = 64,
+        semantic_score_alpha: float = 0.25,
         geometry_bias_scale: float = 2.0,
         geometry_invalid_penalty: float = -1e4,
         gate_init: float = 0.0,
         layer_name: Optional[str] = None,
     ) -> None:
         super().__init__()
+        del query_uv_enabled, geometry_bias_enabled, geometry_bias_scale
+        del geometry_invalid_penalty, gate_init
         self.query_dim = int(query_dim)
-        self.query_uv_enabled = bool(query_uv_enabled)
-        self.geometry_bias_enabled = bool(geometry_bias_enabled)
+        self.query_uv_enabled = False
+        self.geometry_bias_enabled = False
         self.geometry_score_enabled = bool(geometry_score_enabled)
         self.geometry_score_dim = int(geometry_score_dim)
         self.geometry_score_num_freqs = int(geometry_score_num_freqs)
+        self.geometry_score_mode = str(geometry_score_mode)
+        self.candidate_radius = float(candidate_radius)
+        self.candidate_min_k = max(1, int(candidate_min_k))
+        self.candidate_invalid_penalty = float(candidate_invalid_penalty)
+        self.semantic_score_dim = int(semantic_score_dim)
+        self.semantic_score_alpha = float(semantic_score_alpha)
+        self.semantic_score_runtime_alpha = float(semantic_score_alpha)
         self.geometry_score_layers = (
             None
             if geometry_score_layers is None
@@ -96,24 +108,24 @@ class _QueryUVAttnProcessorBase(nn.Module):
             if geometry_score_max_query_tokens is None
             else int(geometry_score_max_query_tokens)
         )
-        self.geometry_bias_scale = float(geometry_bias_scale)
-        self.geometry_invalid_penalty = float(geometry_invalid_penalty)
         self.layer_name = layer_name
-
-        if self.query_uv_enabled:
-            self.query_uv_encoder = PerspectivePositionEncoder(dim=self.query_dim)
-            self.query_uv_gate = nn.Parameter(torch.tensor(float(gate_init)))
-        else:
-            self.query_uv_encoder = None
-            self.register_parameter("query_uv_gate", None)
+        self.query_uv_encoder = None
+        self.query_uv_gate = None
+        self.geometry_score_runtime_scale = 1.0
 
         if self.geometry_score_enabled:
             fourier_dim = 4 * self.geometry_score_num_freqs
             self.geometry_score_proj = nn.Linear(fourier_dim, self.geometry_score_dim, bias=False)
             nn.init.orthogonal_(self.geometry_score_proj.weight)
             self.geometry_score_gate = nn.Parameter(torch.tensor(float(geometry_score_gate_init)))
+            self.semantic_query_proj = nn.Linear(self.query_dim, self.semantic_score_dim, bias=False)
+            self.semantic_key_proj = nn.Linear(self.query_dim, self.semantic_score_dim, bias=False)
+            nn.init.orthogonal_(self.semantic_query_proj.weight)
+            nn.init.orthogonal_(self.semantic_key_proj.weight)
         else:
             self.geometry_score_proj = None
+            self.semantic_query_proj = None
+            self.semantic_key_proj = None
             self.register_parameter("geometry_score_gate", None)
 
     def __call__(
@@ -145,6 +157,15 @@ class _QueryUVAttnProcessorBase(nn.Module):
             attention_alignment=attention_alignment,
             **kwargs,
         )
+
+    def set_geometry_score_runtime_scale(self, scale: float) -> None:
+        self.geometry_score_runtime_scale = float(scale)
+
+    def set_semantic_score_runtime_alpha(self, alpha: float) -> None:
+        self.semantic_score_runtime_alpha = float(alpha)
+
+    def _uses_geometry_first_mode(self) -> bool:
+        return self.geometry_score_mode == "geometry_first_semantic_refine"
 
     def _resolve_query_uv(
         self,
@@ -303,14 +324,98 @@ class _QueryUVAttnProcessorBase(nn.Module):
             sat_geo = sat_geo * sat_valid.unsqueeze(-1).to(dtype=sat_geo.dtype)
 
         raw_score = torch.matmul(query_geo, sat_geo.transpose(-1, -2))
-        gate = self.geometry_score_gate.float()
+        runtime_scale = torch.tensor(
+            float(getattr(self, "geometry_score_runtime_scale", 1.0)),
+            device=raw_score.device,
+            dtype=torch.float32,
+        )
+        gate = self.geometry_score_gate.float() * runtime_scale
         score = (gate * raw_score).to(dtype=dtype)
         metrics = {
             "geometry_score_gate": gate.detach(),
+            "geometry_score_gate_raw": self.geometry_score_gate.detach().float(),
+            "geometry_score_runtime_scale": runtime_scale.detach(),
             "geometry_score_raw_std": raw_score.detach().float().std(),
             "geometry_score_bias_std": score.detach().float().std(),
         }
         return score, metrics
+
+    def _build_semantic_score_bias(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if self.semantic_query_proj is None or self.semantic_key_proj is None:
+            return None, {}
+
+        query_sem = self.semantic_query_proj(query_states.to(dtype=self.semantic_query_proj.weight.dtype))
+        key_sem = self.semantic_key_proj(key_states.to(dtype=self.semantic_key_proj.weight.dtype))
+        query_sem = F.normalize(query_sem.float(), dim=-1)
+        key_sem = F.normalize(key_sem.float(), dim=-1)
+        raw_score = torch.matmul(query_sem, key_sem.transpose(-1, -2))
+        alpha = torch.tensor(
+            float(getattr(self, "semantic_score_runtime_alpha", self.semantic_score_alpha)),
+            device=raw_score.device,
+            dtype=torch.float32,
+        )
+        score = (alpha * raw_score).to(dtype=dtype)
+        metrics = {
+            "semantic_score_alpha": alpha.detach(),
+            "semantic_score_raw_std": raw_score.detach().float().std(),
+            "semantic_score_bias_std": score.detach().float().std(),
+        }
+        return score, metrics
+
+    def _build_candidate_mask(
+        self,
+        query_uv: torch.Tensor,
+        sat_perspective_uv: Optional[torch.Tensor],
+        sat_perspective_valid: Optional[torch.Tensor],
+        *,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if sat_perspective_uv is None:
+            return None, None, {}
+
+        sat_uv = sat_perspective_uv.float()
+        query_uv_f = query_uv.float()
+        sat_valid = (
+            sat_perspective_valid.to(device=sat_uv.device, dtype=torch.bool)
+            if sat_perspective_valid is not None
+            else torch.ones(sat_uv.shape[:2], device=sat_uv.device, dtype=torch.bool)
+        )
+        sat_valid = sat_valid & torch.isfinite(sat_uv).all(dim=-1)
+
+        dist2 = (query_uv_f[:, :, None, :] - sat_uv[:, None, :, :]).pow(2).sum(dim=-1)
+        valid_dist2 = dist2.masked_fill(~sat_valid[:, None, :], torch.finfo(dist2.dtype).max)
+        window_candidate = sat_valid[:, None, :] & (valid_dist2 <= self.candidate_radius * self.candidate_radius)
+        window_count = window_candidate.sum(dim=-1)
+        valid_count = sat_valid.sum(dim=-1, keepdim=True)
+
+        k = min(self.candidate_min_k, int(sat_uv.shape[1]))
+        nearest_indices = torch.topk(valid_dist2, k=k, dim=-1, largest=False).indices
+        nearest_candidate = torch.zeros_like(window_candidate)
+        nearest_candidate.scatter_(-1, nearest_indices, True)
+        nearest_candidate = nearest_candidate & sat_valid[:, None, :]
+
+        fallback = (window_count < self.candidate_min_k) & (valid_count > 0)
+        candidate = torch.where(fallback.unsqueeze(-1), nearest_candidate, window_candidate)
+        additive_mask = torch.full(
+            candidate.shape,
+            self.candidate_invalid_penalty,
+            device=query_uv.device,
+            dtype=dtype,
+        )
+        additive_mask = additive_mask.masked_fill(candidate, 0.0)
+        metrics = {
+            "candidate_count_mean": candidate.sum(dim=-1).float().mean().detach(),
+            "window_candidate_count_mean": window_count.float().mean().detach(),
+            "window_fallback_ratio": fallback.float().mean().detach(),
+            "candidate_valid_query_ratio": candidate.any(dim=-1).float().mean().detach(),
+        }
+        return additive_mask, candidate, metrics
 
     @staticmethod
     def _infer_square_hw(token_count: int) -> Optional[Tuple[int, int]]:
@@ -325,14 +430,29 @@ class _QueryUVAttnProcessorBase(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        scores = torch.matmul(query.float(), key.float().transpose(-1, -2))
-        scores = scores * (1.0 / math.sqrt(float(query.shape[-1])))
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        content_scores = torch.matmul(query.float(), key.float().transpose(-1, -2))
+        content_scores = content_scores * (1.0 / math.sqrt(float(query.shape[-1])))
+        scores = content_scores
         if attention_mask is not None:
             scores = scores + attention_mask.float()
         attention_probs = torch.softmax(scores, dim=-1)
         hidden_states = torch.matmul(attention_probs.to(dtype=value.dtype), value)
-        return hidden_states, attention_probs, scores
+        return hidden_states, attention_probs, scores, content_scores
+
+    @staticmethod
+    def _manual_attention_from_scores(
+        value: torch.Tensor,
+        attention_scores: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        attention_probs = torch.softmax(attention_scores.float(), dim=-1)
+        hidden_states = torch.matmul(attention_probs.to(dtype=value.dtype), value)
+        return hidden_states, attention_probs
+
+    @staticmethod
+    def _raw_content_scores(query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+        content_scores = torch.matmul(query.float(), key.float().transpose(-1, -2))
+        return content_scores * (1.0 / math.sqrt(float(query.shape[-1])))
 
     @staticmethod
     def _reshape_sliced_attention_mask(
@@ -363,11 +483,41 @@ class _QueryUVAttnProcessorBase(nn.Module):
         weights = mask.to(dtype=values.dtype)
         return (values * weights).sum() / weights.sum().clamp_min(1.0)
 
+    @staticmethod
+    def _finite_std(values: torch.Tensor) -> torch.Tensor:
+        finite = values[torch.isfinite(values)]
+        if finite.numel() <= 1:
+            return values.detach().float().new_tensor(0.0)
+        return finite.float().std(unbiased=False)
+
+    @staticmethod
+    def _finite_abs_mean(values: torch.Tensor) -> torch.Tensor:
+        finite = values[torch.isfinite(values)]
+        if finite.numel() == 0:
+            return values.detach().float().new_tensor(0.0)
+        return finite.float().abs().mean()
+
+    @staticmethod
+    def _mean_top_logit_gap(scores: torch.Tensor) -> torch.Tensor:
+        scores = scores.float()
+        if scores.shape[-1] < 2:
+            return scores.detach().new_tensor(0.0)
+        finite_scores = scores.masked_fill(~torch.isfinite(scores), -torch.finfo(scores.dtype).max)
+        top2 = torch.topk(finite_scores, k=2, dim=-1).values
+        gap = top2[..., 0] - top2[..., 1]
+        return gap[torch.isfinite(gap)].mean() if torch.isfinite(gap).any() else scores.detach().new_tensor(0.0)
+
     def _record_attention_alignment(
         self,
         *,
         attention_probs: torch.Tensor,
         attention_scores: Optional[torch.Tensor],
+        content_scores: Optional[torch.Tensor],
+        geometry_bias: Optional[torch.Tensor],
+        semantic_scores: Optional[torch.Tensor],
+        candidate_mask: Optional[torch.Tensor],
+        geometry_only_scores: Optional[torch.Tensor],
+        semantic_only_scores: Optional[torch.Tensor],
         query_uv: torch.Tensor,
         sat_perspective_uv: Optional[torch.Tensor],
         sat_perspective_valid: Optional[torch.Tensor],
@@ -430,8 +580,154 @@ class _QueryUVAttnProcessorBase(nn.Module):
             "target_attention_mass": mean_target_mass.detach(),
             "target_token_fraction": mean_target_fraction.detach(),
             "target_attention_lift": mean_target_lift.detach(),
+            "target_attention_lift_mixed": mean_target_lift.detach(),
             "nearest_attention_mass": mean_nearest_mass.detach(),
         }
+
+        def score_ablation_metrics(prefix: str, scores: torch.Tensor) -> None:
+            probs = torch.softmax(scores.float(), dim=-1).mean(dim=1)
+            target_mass_for_scores = (probs * target_mask.to(dtype=probs.dtype)).sum(dim=-1)
+            lift_for_scores = target_mass_for_scores / target_token_fraction.clamp_min(1e-6)
+            scores_mean = scores.float().mean(dim=1)
+            near_weights = target_mask.to(dtype=scores_mean.dtype)
+            far_mask = sat_valid[:, None, :] & ~target_mask
+            far_weights = far_mask.to(dtype=scores_mean.dtype)
+            near_score = (scores_mean * near_weights).sum(dim=-1) / near_weights.sum(dim=-1).clamp_min(1.0)
+            far_score = (scores_mean * far_weights).sum(dim=-1) / far_weights.sum(dim=-1).clamp_min(1.0)
+            gap_mask = query_mask & far_mask.any(dim=-1)
+            metric_payload[f"target_attention_lift_{prefix}"] = self._masked_mean(
+                lift_for_scores,
+                query_mask,
+            ).detach()
+            metric_payload[f"target_logit_gap_{prefix}"] = self._masked_mean(
+                near_score - far_score,
+                gap_mask,
+            ).detach()
+
+        if candidate_mask is not None:
+            candidate_bool = candidate_mask.to(device=target_mask.device, dtype=torch.bool)
+            target_counts = target_mask.to(dtype=torch.float32).sum(dim=-1)
+            covered_counts = (target_mask & candidate_bool).to(dtype=torch.float32).sum(dim=-1)
+            candidate_recall = covered_counts / target_counts.clamp_min(1.0)
+            metric_payload["candidate_recall"] = self._masked_mean(candidate_recall, query_mask).detach()
+            metric_payload["candidate_count_mean"] = candidate_bool.sum(dim=-1).float().mean().detach()
+
+        if content_scores is not None:
+            content_scores_f = content_scores.float()
+            content_probs = torch.softmax(content_scores_f, dim=-1)
+            content_attention_mean = content_probs.mean(dim=1)
+            content_valid_weights = content_attention_mean * sat_valid.to(dtype=content_attention_mean.dtype).unsqueeze(1)
+            content_valid_mass = content_valid_weights.sum(dim=-1)
+            content_target_mass = (
+                content_attention_mean * target_mask.to(dtype=content_attention_mean.dtype)
+            ).sum(dim=-1)
+            content_target_lift = content_target_mass / target_token_fraction.clamp_min(1e-6)
+            content_nearest_mass = torch.gather(
+                content_attention_mean,
+                dim=-1,
+                index=nearest_indices.unsqueeze(-1),
+            ).squeeze(-1)
+            content_std = self._finite_std(content_scores_f)
+            content_abs_mean = self._finite_abs_mean(content_scores_f)
+            content_top_gap = self._mean_top_logit_gap(content_scores_f)
+
+            eps = torch.finfo(content_probs.dtype).eps
+            geom_probs = attention_probs.float().clamp_min(eps)
+            kl_per_query = (geom_probs * (geom_probs.log() - content_probs.clamp_min(eps).log())).sum(dim=-1).mean(dim=1)
+
+            metric_payload.update(
+                {
+                    "content_logits_std": content_std.detach(),
+                    "content_logits_abs_mean": content_abs_mean.detach(),
+                    "content_logits_top_gap": content_top_gap.detach(),
+                    "raw_content_qk_std": content_std.detach(),
+                    "raw_content_qk_abs_mean": content_abs_mean.detach(),
+                    "raw_content_qk_top_gap": content_top_gap.detach(),
+                    "valid_attention_mass_without_geometry": self._masked_mean(
+                        content_valid_mass,
+                        query_mask,
+                    ).detach(),
+                    "target_attention_mass_without_geometry": self._masked_mean(
+                        content_target_mass,
+                        query_mask,
+                    ).detach(),
+                    "target_attention_lift_without_geometry": self._masked_mean(
+                        content_target_lift,
+                        query_mask,
+                    ).detach(),
+                    "target_attention_lift_geometry_delta": self._masked_mean(
+                        target_lift - content_target_lift,
+                        query_mask,
+                    ).detach(),
+                    "nearest_attention_mass_without_geometry": self._masked_mean(
+                        content_nearest_mass,
+                        query_mask,
+                    ).detach(),
+                    "attention_geometry_kl": self._masked_mean(
+                        kl_per_query,
+                        query_mask,
+                    ).detach(),
+                }
+            )
+
+        if geometry_bias is not None:
+            geometry_bias_f = geometry_bias.float()
+            if geometry_bias_f.shape[1] == 1 and attention_probs.shape[1] != 1:
+                geometry_bias_f = geometry_bias_f.expand(-1, attention_probs.shape[1], -1, -1)
+            geometry_std = self._finite_std(geometry_bias_f)
+            geometry_abs_mean = self._finite_abs_mean(geometry_bias_f)
+            geometry_top_gap = self._mean_top_logit_gap(geometry_bias_f)
+            metric_payload.update(
+                {
+                    "geometry_bias_std": geometry_std.detach(),
+                    "geometry_bias_abs_mean": geometry_abs_mean.detach(),
+                    "geometry_bias_top_gap": geometry_top_gap.detach(),
+                    "geometry_logits_std": geometry_std.detach(),
+                }
+            )
+            if content_scores is not None:
+                content_std = metric_payload["content_logits_std"].float()
+                content_abs_mean = metric_payload["content_logits_abs_mean"].float()
+                content_top_gap = metric_payload["content_logits_top_gap"].float()
+                metric_payload.update(
+                    {
+                        "geometry_to_content_std_ratio": (
+                            geometry_std / content_std.clamp_min(1e-6)
+                        ).detach(),
+                        "geometry_to_content_abs_ratio": (
+                            geometry_abs_mean / content_abs_mean.clamp_min(1e-6)
+                        ).detach(),
+                        "geometry_to_content_top_gap_ratio": (
+                            geometry_top_gap / content_top_gap.clamp_min(1e-6)
+                        ).detach(),
+                        "raw_content_qk_to_geometry_ratio": (
+                            content_std / geometry_std.clamp_min(1e-6)
+                        ).detach(),
+                    }
+                )
+
+        if semantic_scores is not None:
+            semantic_scores_f = semantic_scores.float()
+            if semantic_scores_f.shape[1] == 1 and attention_probs.shape[1] != 1:
+                semantic_scores_f = semantic_scores_f.expand(-1, attention_probs.shape[1], -1, -1)
+            semantic_std = self._finite_std(semantic_scores_f)
+            semantic_abs_mean = self._finite_abs_mean(semantic_scores_f)
+            semantic_top_gap = self._mean_top_logit_gap(semantic_scores_f)
+            metric_payload.update(
+                {
+                    "semantic_logits_std": semantic_std.detach(),
+                    "semantic_logits_abs_mean": semantic_abs_mean.detach(),
+                    "semantic_logits_top_gap": semantic_top_gap.detach(),
+                }
+            )
+            if geometry_bias is not None:
+                geometry_bias_f = geometry_bias.float()
+                if geometry_bias_f.shape[1] == 1 and semantic_scores_f.shape[1] != 1:
+                    geometry_bias_f = geometry_bias_f.expand(-1, semantic_scores_f.shape[1], -1, -1)
+                geometry_std = self._finite_std(geometry_bias_f)
+                metric_payload["semantic_to_geometry_ratio"] = (
+                    semantic_std / geometry_std.clamp_min(1e-6)
+                ).detach()
 
         if attention_scores is not None:
             scores_mean = attention_scores.float().mean(dim=1)
@@ -441,7 +737,30 @@ class _QueryUVAttnProcessorBase(nn.Module):
             near_score = (scores_mean * near_weights).sum(dim=-1) / near_weights.sum(dim=-1).clamp_min(1.0)
             far_score = (scores_mean * far_weights).sum(dim=-1) / far_weights.sum(dim=-1).clamp_min(1.0)
             gap_mask = query_mask & far_mask.any(dim=-1)
-            metric_payload["target_logit_gap"] = self._masked_mean(near_score - far_score, gap_mask).detach()
+            target_logit_gap = self._masked_mean(near_score - far_score, gap_mask)
+            metric_payload["target_logit_gap"] = target_logit_gap.detach()
+            metric_payload["target_logit_gap_mixed"] = target_logit_gap.detach()
+            if content_scores is not None:
+                content_scores_mean = content_scores.float().mean(dim=1)
+                content_near_score = (
+                    content_scores_mean * near_weights
+                ).sum(dim=-1) / near_weights.sum(dim=-1).clamp_min(1.0)
+                content_far_score = (
+                    content_scores_mean * far_weights
+                ).sum(dim=-1) / far_weights.sum(dim=-1).clamp_min(1.0)
+                content_logit_gap = self._masked_mean(
+                    content_near_score - content_far_score,
+                    gap_mask,
+                )
+                metric_payload["target_logit_gap_without_geometry"] = content_logit_gap.detach()
+                metric_payload["target_logit_gap_geometry_delta"] = (
+                    target_logit_gap - content_logit_gap
+                ).detach()
+
+        if geometry_only_scores is not None:
+            score_ablation_metrics("geometry_only", geometry_only_scores)
+        if semantic_only_scores is not None:
+            score_ablation_metrics("semantic_only", semantic_only_scores)
 
         if query_pe_metrics:
             for name, value in query_pe_metrics.items():
@@ -467,46 +786,6 @@ class _QueryUVAttnProcessorBase(nn.Module):
                 "query_hw": query_hw,
                 "sat_hw": self._infer_square_hw(sat_uv.shape[1]),
             }
-
-    def _build_geometry_bias(
-        self,
-        query_uv: torch.Tensor,
-        sat_perspective_uv: Optional[torch.Tensor],
-        sat_perspective_valid: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if not self.geometry_bias_enabled or sat_perspective_uv is None:
-            return None
-
-        if query_uv.ndim != 3 or sat_perspective_uv.ndim != 3:
-            raise ValueError(
-                f"query_uv and sat_perspective_uv must be [B,N,2], got {tuple(query_uv.shape)} and {tuple(sat_perspective_uv.shape)}"
-            )
-        if query_uv.shape[0] != sat_perspective_uv.shape[0]:
-            raise ValueError(
-                f"query_uv batch must match sat_perspective_uv batch: {query_uv.shape[0]} vs {sat_perspective_uv.shape[0]}"
-            )
-
-        dist2 = (query_uv[:, :, None, :] - sat_perspective_uv[:, None, :, :]).pow(2).sum(dim=-1)
-        bias = -self.geometry_bias_scale * dist2
-
-        if sat_perspective_valid is not None:
-            if sat_perspective_valid.ndim != 2:
-                raise ValueError(
-                    f"sat_perspective_valid must be [B,N], got {tuple(sat_perspective_valid.shape)}"
-                )
-            if sat_perspective_valid.shape[0] != bias.shape[0]:
-                raise ValueError(
-                    f"sat_perspective_valid batch must match query batch: {sat_perspective_valid.shape[0]} vs {bias.shape[0]}"
-                )
-            invalid_penalty = torch.tensor(
-                self.geometry_invalid_penalty,
-                device=bias.device,
-                dtype=bias.dtype,
-            )
-            bias = bias + (~sat_perspective_valid).to(dtype=bias.dtype).unsqueeze(1) * invalid_penalty
-
-        return bias
-
 
 class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
     """
@@ -573,9 +852,7 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
             query_pe_metrics["query_content_norm"] = query_norm
         query_uv_tensor = None
         if is_cross_attention and (
-            self.query_uv_enabled
-            or self.geometry_bias_enabled
-            or apply_geometry_score
+            apply_geometry_score
             or collect_alignment
         ):
             query_uv_tensor = self._resolve_query_uv(
@@ -584,25 +861,14 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
                 query_base_hw=query_base_hw,
                 query_uv=query_uv,
             ).to(dtype=query.dtype)
-        if self.query_uv_enabled and query_uv_tensor is not None:
-            uv = query_uv_tensor
-            query_pe = self.query_uv_encoder(uv)
-            scaled_query_pe = self.query_uv_gate.to(dtype=query.dtype) * query_pe
-            if collect_alignment:
-                query_pe_norm = scaled_query_pe.float().norm(dim=-1).mean()
-                query_pe_metrics["query_pe_norm"] = query_pe_norm
-                query_pe_metrics["query_pe_ratio"] = query_pe_norm / query_pe_metrics[
-                    "query_content_norm"
-                ].clamp_min(1e-6)
-                query_pe_metrics["query_uv_gate"] = self.query_uv_gate.float()
-            query = query + scaled_query_pe
-
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
+        query_states_for_semantic = query
         key = attn.to_k(encoder_hidden_states)
+        key_states_for_semantic = key
         value = attn.to_v(encoder_hidden_states)
         if collect_alignment:
             query_pe_metrics["key_content_norm"] = key.float().norm(dim=-1).mean()
@@ -621,7 +887,12 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
 
         sat_uv = None
         sat_valid = None
-        if (self.geometry_bias_enabled or apply_geometry_score or collect_alignment) and is_cross_attention:
+        geometry_bias_for_metrics = None
+        semantic_scores_for_metrics = None
+        candidate_bool_for_metrics = None
+        geometry_only_scores_for_metrics = None
+        semantic_only_scores_for_metrics = None
+        if (apply_geometry_score or collect_alignment) and is_cross_attention:
             sat_uv, sat_valid = self._resolve_sat_perspective_uv(
                 hidden_states,
                 batch_size=hidden_states.shape[0],
@@ -629,7 +900,8 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
                 sat_perspective_uv=sat_perspective_uv,
                 sat_perspective_valid=sat_perspective_valid,
             )
-        if apply_geometry_score and query_uv_tensor is not None:
+        use_geometry_first = apply_geometry_score and self._uses_geometry_first_mode()
+        if apply_geometry_score and query_uv_tensor is not None and not use_geometry_first:
             geometry_score_bias, geometry_score_metrics = self._build_geometry_score_bias(
                 query_uv_tensor,
                 sat_uv,
@@ -640,30 +912,80 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
                 query_pe_metrics.update(geometry_score_metrics)
             if geometry_score_bias is not None:
                 geometry_score_bias = geometry_score_bias.unsqueeze(1)
+                geometry_bias_for_metrics = geometry_score_bias
                 attention_mask = (
                     geometry_score_bias
                     if attention_mask is None
                     else attention_mask + geometry_score_bias
                 )
-        if self.geometry_bias_enabled and is_cross_attention:
-            if query_uv_tensor is None:
-                query_uv_tensor = self._resolve_query_uv(
-                    hidden_states,
-                    batch_size=hidden_states.shape[0],
-                    query_base_hw=query_base_hw,
-                    query_uv=query_uv,
-                ).to(dtype=query.dtype)
-            geometry_bias = self._build_geometry_bias(
+        if use_geometry_first and query_uv_tensor is not None:
+            geometry_score_bias, geometry_score_metrics = self._build_geometry_score_bias(
                 query_uv_tensor,
                 sat_uv,
                 sat_valid,
+                dtype=query.dtype,
             )
-            if geometry_bias is not None:
-                geometry_bias = geometry_bias.unsqueeze(1)
-                attention_mask = geometry_bias if attention_mask is None else attention_mask + geometry_bias
+            semantic_score_bias, semantic_score_metrics = self._build_semantic_score_bias(
+                query_states_for_semantic,
+                key_states_for_semantic,
+                dtype=query.dtype,
+            )
+            candidate_mask, candidate_bool, candidate_metrics = self._build_candidate_mask(
+                query_uv_tensor,
+                sat_uv,
+                sat_valid,
+                dtype=query.dtype,
+            )
+            query_pe_metrics.update(geometry_score_metrics)
+            query_pe_metrics.update(semantic_score_metrics)
+            query_pe_metrics.update(candidate_metrics)
 
-        if collect_alignment:
-            hidden_states, attention_probs, attention_scores = self._manual_scaled_dot_product_attention(
+            content_scores = self._raw_content_scores(query, key)
+            if candidate_mask is None:
+                active_scores = torch.zeros_like(content_scores)
+            else:
+                active_scores = candidate_mask.unsqueeze(1).float()
+            if geometry_score_bias is not None:
+                geometry_bias_for_metrics = geometry_score_bias.unsqueeze(1)
+                active_scores = active_scores + geometry_bias_for_metrics.float()
+            if semantic_score_bias is not None:
+                semantic_scores_for_metrics = semantic_score_bias.unsqueeze(1)
+                active_scores = active_scores + semantic_scores_for_metrics.float()
+            if attention_mask is not None:
+                active_scores = active_scores + attention_mask.float()
+
+            geometry_only_scores_for_metrics = (
+                (candidate_mask.unsqueeze(1).float() if candidate_mask is not None else torch.zeros_like(content_scores))
+                + (geometry_bias_for_metrics.float() if geometry_bias_for_metrics is not None else 0.0)
+                + (attention_mask.float() if attention_mask is not None else 0.0)
+            )
+            semantic_only_scores_for_metrics = (
+                (candidate_mask.unsqueeze(1).float() if candidate_mask is not None else torch.zeros_like(content_scores))
+                + (semantic_scores_for_metrics.float() if semantic_scores_for_metrics is not None else 0.0)
+                + (attention_mask.float() if attention_mask is not None else 0.0)
+            )
+            candidate_bool_for_metrics = candidate_bool
+            hidden_states, attention_probs = self._manual_attention_from_scores(value, active_scores)
+            attention_scores = active_scores
+            if collect_alignment and query_uv_tensor is not None:
+                self._record_attention_alignment(
+                    attention_probs=attention_probs,
+                    attention_scores=attention_scores,
+                    content_scores=content_scores,
+                    geometry_bias=geometry_bias_for_metrics,
+                    semantic_scores=semantic_scores_for_metrics,
+                    candidate_mask=candidate_bool_for_metrics,
+                    geometry_only_scores=geometry_only_scores_for_metrics,
+                    semantic_only_scores=semantic_only_scores_for_metrics,
+                    query_uv=query_uv_tensor,
+                    sat_perspective_uv=sat_uv,
+                    sat_perspective_valid=sat_valid,
+                    query_base_hw=query_base_hw,
+                    attention_alignment=attention_alignment,
+                    query_pe_metrics=query_pe_metrics,
+                )
+        elif collect_alignment:
+            hidden_states, attention_probs, attention_scores, content_scores = self._manual_scaled_dot_product_attention(
                 query,
                 key,
                 value,
@@ -673,6 +995,12 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
                 self._record_attention_alignment(
                     attention_probs=attention_probs,
                     attention_scores=attention_scores,
+                    content_scores=content_scores,
+                    geometry_bias=geometry_bias_for_metrics,
+                    semantic_scores=semantic_scores_for_metrics,
+                    candidate_mask=candidate_bool_for_metrics,
+                    geometry_only_scores=geometry_only_scores_for_metrics,
+                    semantic_only_scores=semantic_only_scores_for_metrics,
                     query_uv=query_uv_tensor,
                     sat_perspective_uv=sat_uv,
                     sat_perspective_valid=sat_valid,
@@ -707,39 +1035,48 @@ class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
 
 
 class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
-    """Sliced attention processor that preserves query UV PE and geometry bias."""
+    """Sliced attention processor that preserves logit-level geometry score."""
 
     def __init__(
         self,
         query_dim: int,
         *,
         slice_size: int,
-        query_uv_enabled: bool,
-        geometry_bias_enabled: bool,
+        query_uv_enabled: bool = False,
+        geometry_bias_enabled: bool = False,
         geometry_score_enabled: bool = False,
         geometry_score_dim: int = 64,
         geometry_score_num_freqs: int = 6,
         geometry_score_gate_init: float = 1.0,
         geometry_score_layers: Optional[Tuple[str, ...]] = None,
-        geometry_score_max_query_tokens: Optional[int] = 256,
+        geometry_score_max_query_tokens: Optional[int] = None,
+        geometry_score_mode: str = "geometry_first_semantic_refine",
+        candidate_radius: float = 0.35,
+        candidate_min_k: int = 16,
+        candidate_invalid_penalty: float = -1e4,
+        semantic_score_dim: int = 64,
+        semantic_score_alpha: float = 0.25,
         geometry_bias_scale: float = 2.0,
         geometry_invalid_penalty: float = -1e4,
         gate_init: float = 0.0,
         layer_name: Optional[str] = None,
     ) -> None:
+        del query_uv_enabled, geometry_bias_enabled, geometry_bias_scale
+        del geometry_invalid_penalty, gate_init
         super().__init__(
             query_dim=query_dim,
-            query_uv_enabled=query_uv_enabled,
-            geometry_bias_enabled=geometry_bias_enabled,
             geometry_score_enabled=geometry_score_enabled,
             geometry_score_dim=geometry_score_dim,
             geometry_score_num_freqs=geometry_score_num_freqs,
             geometry_score_gate_init=geometry_score_gate_init,
             geometry_score_layers=geometry_score_layers,
             geometry_score_max_query_tokens=geometry_score_max_query_tokens,
-            geometry_bias_scale=geometry_bias_scale,
-            geometry_invalid_penalty=geometry_invalid_penalty,
-            gate_init=gate_init,
+            geometry_score_mode=geometry_score_mode,
+            candidate_radius=candidate_radius,
+            candidate_min_k=candidate_min_k,
+            candidate_invalid_penalty=candidate_invalid_penalty,
+            semantic_score_dim=semantic_score_dim,
+            semantic_score_alpha=semantic_score_alpha,
             layer_name=layer_name,
         )
         self.slice_size = int(slice_size)
@@ -802,9 +1139,7 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
             query_pe_metrics["query_content_norm"] = query_norm
         query_uv_tensor = None
         if is_cross_attention and (
-            self.query_uv_enabled
-            or self.geometry_bias_enabled
-            or apply_geometry_score
+            apply_geometry_score
             or collect_alignment
         ):
             query_uv_tensor = self._resolve_query_uv(
@@ -813,25 +1148,14 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
                 query_base_hw=query_base_hw,
                 query_uv=query_uv,
             ).to(dtype=query.dtype)
-        if self.query_uv_enabled and query_uv_tensor is not None:
-            uv = query_uv_tensor
-            query_pe = self.query_uv_encoder(uv)
-            scaled_query_pe = self.query_uv_gate.to(dtype=query.dtype) * query_pe
-            if collect_alignment:
-                query_pe_norm = scaled_query_pe.float().norm(dim=-1).mean()
-                query_pe_metrics["query_pe_norm"] = query_pe_norm
-                query_pe_metrics["query_pe_ratio"] = query_pe_norm / query_pe_metrics[
-                    "query_content_norm"
-                ].clamp_min(1e-6)
-                query_pe_metrics["query_uv_gate"] = self.query_uv_gate.float()
-            query = query + scaled_query_pe
-
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
+        query_states_for_semantic = query
         key = attn.to_k(encoder_hidden_states)
+        key_states_for_semantic = key
         value = attn.to_v(encoder_hidden_states)
         if collect_alignment:
             query_pe_metrics["key_content_norm"] = key.float().norm(dim=-1).mean()
@@ -847,7 +1171,12 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
 
         sat_uv = None
         sat_valid = None
-        if (self.geometry_bias_enabled or apply_geometry_score or collect_alignment) and is_cross_attention:
+        geometry_bias_for_metrics = None
+        semantic_scores_for_metrics = None
+        candidate_bool_for_metrics = None
+        geometry_only_scores_for_metrics = None
+        semantic_only_scores_for_metrics = None
+        if (apply_geometry_score or collect_alignment) and is_cross_attention:
             sat_uv, sat_valid = self._resolve_sat_perspective_uv(
                 hidden_states,
                 batch_size=batch_size,
@@ -855,7 +1184,8 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
                 sat_perspective_uv=sat_perspective_uv,
                 sat_perspective_valid=sat_perspective_valid,
             )
-        if apply_geometry_score and query_uv_tensor is not None:
+        use_geometry_first = apply_geometry_score and self._uses_geometry_first_mode()
+        if apply_geometry_score and query_uv_tensor is not None and not use_geometry_first:
             geometry_score_bias, geometry_score_metrics = self._build_geometry_score_bias(
                 query_uv_tensor,
                 sat_uv,
@@ -866,30 +1196,98 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
                 query_pe_metrics.update(geometry_score_metrics)
             if geometry_score_bias is not None:
                 geometry_score_bias = geometry_score_bias.repeat_interleave(attn.heads, dim=0)
+                geometry_bias_for_metrics = self._reshape_sliced_attention_mask(
+                    geometry_score_bias,
+                    batch_size=batch_size,
+                    heads=attn.heads,
+                    query_tokens=query.shape[1],
+                    key_tokens=key.shape[1],
+                )
                 attention_mask = (
                     geometry_score_bias
                     if attention_mask is None
                     else attention_mask + geometry_score_bias
                 )
-        if self.geometry_bias_enabled and is_cross_attention:
-            if query_uv_tensor is None:
-                query_uv_tensor = self._resolve_query_uv(
-                    hidden_states,
-                    batch_size=batch_size,
-                    query_base_hw=query_base_hw,
-                    query_uv=query_uv,
-                ).to(dtype=query.dtype)
-            geometry_bias = self._build_geometry_bias(
+        batch_size_attention, query_tokens, dim = query.shape
+        if use_geometry_first and query_uv_tensor is not None:
+            query_4d = query.view(batch_size, attn.heads, query_tokens, dim)
+            key_4d = key.view(batch_size, attn.heads, key.shape[1], dim)
+            value_4d = value.view(batch_size, attn.heads, value.shape[1], dim)
+            attention_mask_4d = self._reshape_sliced_attention_mask(
+                attention_mask,
+                batch_size=batch_size,
+                heads=attn.heads,
+                query_tokens=query_tokens,
+                key_tokens=key.shape[1],
+            ) if attention_mask is not None else None
+
+            geometry_score_bias, geometry_score_metrics = self._build_geometry_score_bias(
                 query_uv_tensor,
                 sat_uv,
                 sat_valid,
+                dtype=query.dtype,
             )
-            if geometry_bias is not None:
-                geometry_bias = geometry_bias.repeat_interleave(attn.heads, dim=0)
-                attention_mask = geometry_bias if attention_mask is None else attention_mask + geometry_bias
+            semantic_score_bias, semantic_score_metrics = self._build_semantic_score_bias(
+                query_states_for_semantic,
+                key_states_for_semantic,
+                dtype=query.dtype,
+            )
+            candidate_mask, candidate_bool, candidate_metrics = self._build_candidate_mask(
+                query_uv_tensor,
+                sat_uv,
+                sat_valid,
+                dtype=query.dtype,
+            )
+            query_pe_metrics.update(geometry_score_metrics)
+            query_pe_metrics.update(semantic_score_metrics)
+            query_pe_metrics.update(candidate_metrics)
 
-        batch_size_attention, query_tokens, dim = query.shape
-        if collect_alignment:
+            content_scores = self._raw_content_scores(query_4d, key_4d)
+            if candidate_mask is None:
+                active_scores = torch.zeros_like(content_scores)
+            else:
+                active_scores = candidate_mask.unsqueeze(1).float()
+            if geometry_score_bias is not None:
+                geometry_bias_for_metrics = geometry_score_bias.unsqueeze(1)
+                active_scores = active_scores + geometry_bias_for_metrics.float()
+            if semantic_score_bias is not None:
+                semantic_scores_for_metrics = semantic_score_bias.unsqueeze(1)
+                active_scores = active_scores + semantic_scores_for_metrics.float()
+            if attention_mask_4d is not None:
+                active_scores = active_scores + attention_mask_4d.float()
+
+            geometry_only_scores_for_metrics = (
+                (candidate_mask.unsqueeze(1).float() if candidate_mask is not None else torch.zeros_like(content_scores))
+                + (geometry_bias_for_metrics.float() if geometry_bias_for_metrics is not None else 0.0)
+                + (attention_mask_4d.float() if attention_mask_4d is not None else 0.0)
+            )
+            semantic_only_scores_for_metrics = (
+                (candidate_mask.unsqueeze(1).float() if candidate_mask is not None else torch.zeros_like(content_scores))
+                + (semantic_scores_for_metrics.float() if semantic_scores_for_metrics is not None else 0.0)
+                + (attention_mask_4d.float() if attention_mask_4d is not None else 0.0)
+            )
+            candidate_bool_for_metrics = candidate_bool
+            hidden_4d, attention_probs = self._manual_attention_from_scores(value_4d, active_scores)
+            attention_scores = active_scores
+            hidden_states = hidden_4d.reshape(batch_size_attention, query_tokens, dim)
+            if collect_alignment:
+                self._record_attention_alignment(
+                    attention_probs=attention_probs,
+                    attention_scores=attention_scores,
+                    content_scores=content_scores,
+                    geometry_bias=geometry_bias_for_metrics,
+                    semantic_scores=semantic_scores_for_metrics,
+                    candidate_mask=candidate_bool_for_metrics,
+                    geometry_only_scores=geometry_only_scores_for_metrics,
+                    semantic_only_scores=semantic_only_scores_for_metrics,
+                    query_uv=query_uv_tensor,
+                    sat_perspective_uv=sat_uv,
+                    sat_perspective_valid=sat_valid,
+                    query_base_hw=query_base_hw,
+                    attention_alignment=attention_alignment,
+                    query_pe_metrics=query_pe_metrics,
+                )
+        elif collect_alignment:
             query_4d = query.view(batch_size, attn.heads, query_tokens, dim)
             key_4d = key.view(batch_size, attn.heads, key.shape[1], dim)
             value_4d = value.view(batch_size, attn.heads, value.shape[1], dim)
@@ -900,7 +1298,7 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
                 query_tokens=query_tokens,
                 key_tokens=key.shape[1],
             )
-            hidden_4d, attention_probs, attention_scores = self._manual_scaled_dot_product_attention(
+            hidden_4d, attention_probs, attention_scores, content_scores = self._manual_scaled_dot_product_attention(
                 query_4d,
                 key_4d,
                 value_4d,
@@ -911,6 +1309,12 @@ class QueryUVSlicedAttnProcessor(_QueryUVAttnProcessorBase):
                 self._record_attention_alignment(
                     attention_probs=attention_probs,
                     attention_scores=attention_scores,
+                    content_scores=content_scores,
+                    geometry_bias=geometry_bias_for_metrics,
+                    semantic_scores=semantic_scores_for_metrics,
+                    candidate_mask=candidate_bool_for_metrics,
+                    geometry_only_scores=geometry_only_scores_for_metrics,
+                    semantic_only_scores=semantic_only_scores_for_metrics,
                     query_uv=query_uv_tensor,
                     sat_perspective_uv=sat_uv,
                     sat_perspective_valid=sat_valid,

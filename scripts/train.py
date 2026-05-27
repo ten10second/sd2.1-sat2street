@@ -236,24 +236,13 @@ def _configure_logging(log_dir: Path) -> None:
 
 
 def _resolve_query_uv_config(config: Dict[str, Any]) -> Tuple[bool, float]:
-    query_pe_config = dict(_config_get(config, ("model", "query_position_encoding"), {}) or {})
-    query_uv_pe_enabled = bool(query_pe_config.get("enable", False))
-    query_uv_gate_init = query_pe_config.get("gate_init", 0.05)
-    if query_uv_gate_init is None:
-        query_uv_gate_init = 0.05
-    return query_uv_pe_enabled, float(query_uv_gate_init)
+    del config
+    return False, 0.0
 
 
 def _resolve_query_geometry_bias_config(config: Dict[str, Any]) -> Tuple[bool, float, float]:
-    geometry_config = dict(_config_get(config, ("model", "query_geometry_bias"), {}) or {})
-    geometry_enabled = bool(geometry_config.get("enable", False))
-    geometry_scale = geometry_config.get("distance_scale", 2.0)
-    if geometry_scale is None:
-        geometry_scale = 2.0
-    invalid_penalty = geometry_config.get("invalid_penalty", -1e4)
-    if invalid_penalty is None:
-        invalid_penalty = -1e4
-    return geometry_enabled, float(geometry_scale), float(invalid_penalty)
+    del config
+    return False, 0.0, 0.0
 
 
 def _resolve_query_geometry_score_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -261,7 +250,7 @@ def _resolve_query_geometry_score_config(config: Dict[str, Any]) -> Dict[str, An
     layers = score_config.get("layers")
     if layers is not None:
         layers = [str(layer) for layer in layers]
-    max_query_tokens = score_config.get("max_query_tokens", 256)
+    max_query_tokens = score_config.get("max_query_tokens", None)
     if max_query_tokens is not None:
         max_query_tokens = int(max_query_tokens)
     return {
@@ -271,6 +260,12 @@ def _resolve_query_geometry_score_config(config: Dict[str, Any]) -> Dict[str, An
         "gate_init": float(score_config.get("gate_init", 1.0) or 1.0),
         "layers": layers,
         "max_query_tokens": max_query_tokens,
+        "mode": str(score_config.get("mode", "geometry_first_semantic_refine")),
+        "candidate_radius": float(score_config.get("candidate_radius", 0.35) or 0.35),
+        "candidate_min_k": int(score_config.get("candidate_min_k", 16) or 16),
+        "candidate_invalid_penalty": float(score_config.get("candidate_invalid_penalty", -1e4) or -1e4),
+        "semantic_score_dim": int(score_config.get("semantic_score_dim", 64) or 64),
+        "semantic_alpha_max": float(score_config.get("semantic_alpha_max", 0.25) or 0.25),
     }
 
 
@@ -282,6 +277,12 @@ def _attach_query_geometry_score_args(args: argparse.Namespace, config: Dict[str
     args.query_geometry_score_gate_init = score_config["gate_init"]
     args.query_geometry_score_layers = score_config["layers"]
     args.query_geometry_score_max_query_tokens = score_config["max_query_tokens"]
+    args.query_geometry_score_mode = score_config["mode"]
+    args.query_geometry_candidate_radius = score_config["candidate_radius"]
+    args.query_geometry_candidate_min_k = score_config["candidate_min_k"]
+    args.query_geometry_candidate_invalid_penalty = score_config["candidate_invalid_penalty"]
+    args.query_semantic_score_dim = score_config["semantic_score_dim"]
+    args.query_semantic_score_alpha = score_config["semantic_alpha_max"]
     return score_config
 
 
@@ -304,6 +305,12 @@ def _verify_query_geometry_score_model_config(model: Any, score_config: Dict[str
         "query_geometry_score_gate_init": float(score_config["gate_init"]),
         "query_geometry_score_layers": expected_layers_list,
         "query_geometry_score_max_query_tokens": score_config["max_query_tokens"],
+        "query_geometry_score_mode": str(score_config.get("mode", "geometry_first_semantic_refine")),
+        "query_geometry_candidate_radius": float(score_config.get("candidate_radius", 0.35)),
+        "query_geometry_candidate_min_k": int(score_config.get("candidate_min_k", 16)),
+        "query_geometry_candidate_invalid_penalty": float(score_config.get("candidate_invalid_penalty", -1e4)),
+        "query_semantic_score_dim": int(score_config.get("semantic_score_dim", 64)),
+        "query_semantic_score_alpha": float(score_config.get("semantic_alpha_max", 0.25)),
     }
     actual = {
         "query_geometry_score_enabled": bool(getattr(unet, "query_geometry_score_enabled", False)),
@@ -312,6 +319,12 @@ def _verify_query_geometry_score_model_config(model: Any, score_config: Dict[str
         "query_geometry_score_gate_init": float(getattr(unet, "query_geometry_score_gate_init", float("nan"))),
         "query_geometry_score_layers": actual_layers_list,
         "query_geometry_score_max_query_tokens": getattr(unet, "query_geometry_score_max_query_tokens", None),
+        "query_geometry_score_mode": str(getattr(unet, "query_geometry_score_mode", "")),
+        "query_geometry_candidate_radius": float(getattr(unet, "query_geometry_candidate_radius", float("nan"))),
+        "query_geometry_candidate_min_k": int(getattr(unet, "query_geometry_candidate_min_k", -1)),
+        "query_geometry_candidate_invalid_penalty": float(getattr(unet, "query_geometry_candidate_invalid_penalty", float("nan"))),
+        "query_semantic_score_dim": int(getattr(unet, "query_semantic_score_dim", -1)),
+        "query_semantic_score_alpha": float(getattr(unet, "query_semantic_score_alpha", float("nan"))),
     }
     mismatches = {
         name: (expected, actual[name])
@@ -347,6 +360,22 @@ def _resolve_attention_alignment_config(config: Dict[str, Any]) -> Dict[str, Any
         "invalid_attention_weight": float(
             alignment_config.get("invalid_attention_weight", 0.1) or 0.0
         ),
+    }
+
+
+def _resolve_geometry_score_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    geometry_config = dict(_config_get(config, ("training", "geometry_score"), {}) or {})
+    def _value(name: str, default: Any) -> Any:
+        value = geometry_config.get(name, default)
+        return default if value is None else value
+
+    return {
+        "lr_multiplier": float(_value("lr_multiplier", 1.0)),
+        "gate_warmup_steps": int(_value("gate_warmup_steps", 0)),
+        "gate_warmup_start_scale": float(_value("gate_warmup_start_scale", 1.0)),
+        "gate_warmup_end_scale": float(_value("gate_warmup_end_scale", 1.0)),
+        "semantic_alpha_hold_steps": int(_value("semantic_alpha_hold_steps", 1000)),
+        "semantic_alpha_warmup_steps": int(_value("semantic_alpha_warmup_steps", 2000)),
     }
 
 
@@ -712,24 +741,19 @@ def main():
     front_resize = tuple(int(x) for x in front_resize_cfg)
     log_dir = Path(str(_config_get(config, ("logging", "log_dir"), args.output_dir)))
     satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
-    perspective_pe_config = dict(_config_get(config, ("model", "perspective_position_encoding"), {}) or {})
-    perspective_pe_enabled = bool(perspective_pe_config.get("enable", True))
-    query_uv_pe_enabled, query_uv_gate_init = _resolve_query_uv_config(config)
-    query_geometry_bias_enabled, query_geometry_bias_scale, query_geometry_invalid_penalty = _resolve_query_geometry_bias_config(config)
     query_geometry_score_config = _attach_query_geometry_score_args(args, config)
     attention_alignment_config = _resolve_attention_alignment_config(config)
-    args.perspective_pe_enabled = perspective_pe_enabled
-    args.query_uv_pe_enabled = query_uv_pe_enabled
-    args.query_uv_gate_init = query_uv_gate_init
-    args.query_geometry_bias_enabled = query_geometry_bias_enabled
-    args.query_geometry_bias_scale = query_geometry_bias_scale
-    args.query_geometry_invalid_penalty = query_geometry_invalid_penalty
+    geometry_score_training_config = _resolve_geometry_score_training_config(config)
     args.attention_alignment_enabled = attention_alignment_config["enabled"]
     args.attention_alignment_loss_weight = attention_alignment_config["loss_weight"]
     args.attention_alignment_layers = attention_alignment_config["layers"]
     args.attention_alignment_max_query_tokens = attention_alignment_config["max_query_tokens"]
     args.attention_alignment_valid_radius = attention_alignment_config["valid_radius"]
     args.attention_alignment_invalid_attention_weight = attention_alignment_config["invalid_attention_weight"]
+    args.geometry_score_lr_multiplier = geometry_score_training_config["lr_multiplier"]
+    args.geometry_score_gate_warmup_steps = geometry_score_training_config["gate_warmup_steps"]
+    args.geometry_score_gate_warmup_start_scale = geometry_score_training_config["gate_warmup_start_scale"]
+    args.geometry_score_gate_warmup_end_scale = geometry_score_training_config["gate_warmup_end_scale"]
 
     _configure_logging(log_dir)
 
@@ -763,15 +787,15 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    if attention_alignment_config["enabled"] and attention_alignment_config["loss_weight"] > 0.0 and gradient_checkpointing:
+        raise ValueError(
+            "training.attention_alignment.loss_weight > 0 requires gradient_checkpointing=false. "
+            "With UNet gradient checkpointing the captured attention tensors are non-differentiable, "
+            "so the auxiliary alignment loss would be logged but not trained. "
+            "Use --no-gradient_checkpointing and reduce --batch_size if needed."
+        )
     if is_main_process:
         logger.info(f"Training configuration: {args}")
-        if attention_alignment_config["enabled"] and attention_alignment_config["loss_weight"] > 0.0 and gradient_checkpointing:
-            raise ValueError(
-                "training.attention_alignment.loss_weight > 0 requires gradient_checkpointing=false. "
-                "With UNet gradient checkpointing the captured attention tensors are non-differentiable, "
-                "so the auxiliary alignment loss would be logged but not trained. "
-                "Use --no-gradient_checkpointing and reduce --batch_size if needed."
-            )
 
     # Load data
     if is_main_process:
@@ -882,18 +906,18 @@ def main():
         revision=args.base_model_revision,
         torch_dtype=None,
         cond_drop_prob=args.cond_drop_prob,
-        perspective_pe_enabled=perspective_pe_enabled,
-        query_uv_pe_enabled=query_uv_pe_enabled,
-        query_geometry_bias_enabled=query_geometry_bias_enabled,
-        query_geometry_bias_scale=query_geometry_bias_scale,
-        query_geometry_invalid_penalty=query_geometry_invalid_penalty,
         query_geometry_score_enabled=query_geometry_score_config["enabled"],
         query_geometry_score_dim=query_geometry_score_config["dim"],
         query_geometry_score_num_freqs=query_geometry_score_config["num_freqs"],
         query_geometry_score_gate_init=query_geometry_score_config["gate_init"],
         query_geometry_score_layers=query_geometry_score_config["layers"],
         query_geometry_score_max_query_tokens=query_geometry_score_config["max_query_tokens"],
-        query_uv_gate_init=query_uv_gate_init,
+        query_geometry_score_mode=query_geometry_score_config["mode"],
+        query_geometry_candidate_radius=query_geometry_score_config["candidate_radius"],
+        query_geometry_candidate_min_k=query_geometry_score_config["candidate_min_k"],
+        query_geometry_candidate_invalid_penalty=query_geometry_score_config["candidate_invalid_penalty"],
+        query_semantic_score_dim=query_geometry_score_config["semantic_score_dim"],
+        query_semantic_score_alpha=query_geometry_score_config["semantic_alpha_max"],
         attention_alignment_enabled=attention_alignment_config["enabled"],
         attention_alignment_loss_weight=attention_alignment_config["loss_weight"],
         attention_alignment_layers=attention_alignment_config["layers"],
@@ -935,6 +959,13 @@ def main():
         num_train_epochs=args.epochs,
         lr_scheduler_type=lr_scheduler_type,
         warmup_epochs=args.warmup,
+        geometry_score_lr_multiplier=geometry_score_training_config["lr_multiplier"],
+        geometry_score_gate_warmup_steps=geometry_score_training_config["gate_warmup_steps"],
+        geometry_score_gate_warmup_start_scale=geometry_score_training_config["gate_warmup_start_scale"],
+        geometry_score_gate_warmup_end_scale=geometry_score_training_config["gate_warmup_end_scale"],
+        semantic_score_alpha_max=query_geometry_score_config["semantic_alpha_max"],
+        semantic_score_alpha_hold_steps=geometry_score_training_config["semantic_alpha_hold_steps"],
+        semantic_score_alpha_warmup_steps=geometry_score_training_config["semantic_alpha_warmup_steps"],
         gradient_accumulation_steps=args.gradient_accumulation,
         output_dir=args.output_dir,
         save_every=save_every,

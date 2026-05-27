@@ -1,11 +1,10 @@
-"""Perspective position encoding for satellite tokens."""
+"""Projection helpers for satellite patch geometry."""
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
-import torch.nn as nn
 
 
 def compute_sat_patch_perspective_uv(
@@ -143,65 +142,3 @@ def _as_batch_vector(
     raise ValueError(
         f"{name} must be a scalar or contain {batch_size} values, got shape {tuple(tensor.shape)}"
     )
-
-
-class PerspectivePositionEncoder(nn.Module):
-    """Fourier-feature positional encoding for perspective pixel coordinates.
-
-    Replaces the previous deep MLP with a fixed sinusoidal Fourier feature
-    expansion (NeRF / ViT style) followed by a single linear projection +
-    LayerNorm.  Invalid (out-of-image) patches receive a dedicated learnable
-    *out-of-image* (OOI) sentinel embedding.
-
-    Args:
-        dim: output embedding dimension (default 768).
-        num_freqs: number of octave frequency bands per coordinate
-                   (default 6 -> fourier_dim = 2 coords x (sin+cos) x 6 = 24).
-    """
-
-    def __init__(self, dim: int = 768, num_freqs: int = 6):
-        super().__init__()
-        self.num_freqs = int(num_freqs)
-        fourier_dim = 4 * self.num_freqs  # 2 coords × (sin + cos) per freq
-        self.fourier_linear = nn.Linear(fourier_dim, dim)
-        self.fourier_norm = nn.LayerNorm(dim)
-        self.ooi_token = nn.Parameter(torch.zeros(dim))
-
-    @staticmethod
-    def _fourier_encode(uv: torch.Tensor, num_freqs: int) -> torch.Tensor:
-        """Sinusoidal Fourier feature expansion.
-
-        Args:
-            uv:  (…, 2) normalised pixel coords in [-1, 1].
-            num_freqs: number of octave frequency bands.
-
-        Returns:
-            (..., 4 * num_freqs) where the last dim is
-            [sin(u·f), cos(u·f), sin(v·f), cos(v·f), …]
-            with f ∈ {2⁰π, 2¹π, …, 2^(num_freqs-1)·π}.
-        """
-        freqs = (2.0 ** torch.arange(num_freqs, dtype=uv.dtype, device=uv.device)) * torch.pi
-        uv_exp = uv.unsqueeze(-1) * freqs          # (…, 2, F)
-        enc = torch.cat([torch.sin(uv_exp), torch.cos(uv_exp)], dim=-1)  # (…, 2, 2F)
-        return enc.flatten(-2)                     # (…, 4F)
-
-    def forward(
-        self,
-        uv_norm: torch.Tensor,
-        valid: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            uv_norm: (B, N, 2) normalised pixel coords in [-1, 1].
-            valid:   optional (B, N) boolean validity mask.
-
-        Returns:
-            pe: (B, N, dim) perspective position encoding.
-        """
-        pe = self.fourier_norm(
-            self.fourier_linear(self._fourier_encode(uv_norm, self.num_freqs))
-        )
-        if valid is not None:
-            ooi = self.ooi_token.to(dtype=pe.dtype)
-            pe = torch.where(valid.unsqueeze(-1), pe, ooi.expand_as(pe))
-        return pe
