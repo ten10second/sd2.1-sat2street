@@ -11,7 +11,7 @@ output_dir: './output/stage1_yaw_sync03_100ep'
 data:
   dataset: 'kitti360'
   data_dir: '/mnt/shizhm/KITTI-360'
-  batch_size: 2
+  batch_size: 16
   num_workers: 8
   image_size: [256, 256]
   sat_size: 512
