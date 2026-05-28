@@ -6,7 +6,7 @@ device: 'cuda'
 mixed_precision: 'bf16'
 gradient_checkpointing: false
 attention_slicing: false
-output_dir: './output/wip_pitch_roll_conditioning_sync03_geometry_score'
+output_dir: './output/wip_pitch_roll_conditioning_sync05_geometry_score'
 
 # 数据配置
 data:
@@ -101,14 +101,14 @@ training:
 
 # 保存配置
 checkpoint:
-  save_dir: './output/wip_pitch_roll_conditioning_sync03_geometry_score/checkpoints'
+  save_dir: './output/wip_pitch_roll_conditioning_sync05_geometry_score/checkpoints'
   save_every: 20
   max_checkpoints: 5
   resume_from: null
 
 # 日志配置
 logging:
-  log_dir: './output/wip_pitch_roll_conditioning_sync03_geometry_score/logs'
+  log_dir: './output/wip_pitch_roll_conditioning_sync05_geometry_score/logs'
   log_every: 100
   use_wandb: true
   project_name: 'kitti360_sd'
