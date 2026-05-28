@@ -5,7 +5,7 @@ import yaml
 
 
 class SatelliteEncoderDimAlignmentTest(unittest.TestCase):
-    def test_train_and_inference_configs_share_satellite_embed_dim(self) -> None:
+    def test_train_and_inference_configs_share_satellite_encoder_shape(self) -> None:
         root = Path(__file__).resolve().parents[1]
 
         with (root / "configs" / "train.yaml").open("r") as f:
@@ -15,10 +15,16 @@ class SatelliteEncoderDimAlignmentTest(unittest.TestCase):
 
         train_dim = train_cfg["model"]["satellite_encoder"]["embed_dim"]
         infer_dim = infer_cfg["model"]["satellite_encoder"]["embed_dim"]
+        train_heads = train_cfg["model"]["satellite_encoder"]["num_heads"]
+        infer_heads = infer_cfg["model"]["satellite_encoder"]["num_heads"]
 
         self.assertEqual(train_dim, 1024)
         self.assertEqual(infer_dim, 1024)
         self.assertEqual(train_dim, infer_dim)
+        self.assertEqual(train_heads, 8)
+        self.assertEqual(infer_heads, 8)
+        self.assertEqual(train_heads, infer_heads)
+        self.assertEqual(train_dim % train_heads, 0)
 
 
 if __name__ == "__main__":
