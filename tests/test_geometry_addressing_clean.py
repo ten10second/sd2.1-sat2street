@@ -217,6 +217,26 @@ class GeometryAddressingCleanTest(unittest.TestCase):
         self.assertTrue(torch.allclose(zero_score, torch.zeros_like(zero_score), atol=1e-7, rtol=0.0))
         self.assertGreater(float(full_score.abs().max()), 0.0)
 
+    def test_chain_attention_pair_metrics_compare_adjacent_views(self) -> None:
+        attention_mean = torch.zeros((4, 2, 4), dtype=torch.float32)
+        attention_mean[0, :, 0] = 1.0
+        attention_mean[1, :, 1] = 1.0
+        attention_mean[2, :, 2] = 1.0
+        attention_mean[3, :, 3] = 1.0
+
+        metrics = QueryUVAttnProcessor2_0._build_chain_attention_pair_metrics(
+            attention_mean=attention_mean,
+            query_mask=torch.ones((4, 2), dtype=torch.bool),
+            sat_valid=torch.ones((4, 4), dtype=torch.bool),
+            chain_group_size=2,
+        )
+
+        self.assertIn("chain_attention_coverage_overlap", metrics)
+        self.assertIn("chain_attention_centroid_shift", metrics)
+        self.assertEqual(float(metrics["chain_attention_valid_pair_ratio"]), 1.0)
+        self.assertEqual(float(metrics["chain_attention_coverage_overlap"]), 0.0)
+        self.assertGreater(float(metrics["chain_attention_centroid_shift"]), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

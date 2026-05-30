@@ -4,6 +4,7 @@ Stable Diffusion Trainer for satellite-to-frontview generation.
 This module provides a simplified training interface using diffusers library.
 """
 
+import json
 import math
 import numpy as np
 import torch
@@ -32,6 +33,26 @@ DEFAULT_ATTENTION_VIS_LAYERS = [
     "down_blocks.2.attentions.1.transformer_blocks.0.attn2",
     "mid_block.attentions.0.transformer_blocks.0.attn2",
 ]
+JOINT_VISUALIZATION_CHAINS: Sequence[Tuple[str, Sequence[Tuple[str, Optional[float]]]]] = (
+    (
+        "right",
+        (
+            ("front", None),
+            ("yaw_p60", 60.0),
+            ("yaw_p90", 90.0),
+            ("yaw_p120", 120.0),
+        ),
+    ),
+    (
+        "left",
+        (
+            ("front", None),
+            ("yaw_m60", -60.0),
+            ("yaw_m90", -90.0),
+            ("yaw_m120", -120.0),
+        ),
+    ),
+)
 
 def load_model_state_dict(
     model: nn.Module,
@@ -78,6 +99,21 @@ def create_sd_model(
     attention_alignment_max_query_tokens: Optional[int] = 256,
     attention_alignment_valid_radius: float = 0.25,
     attention_alignment_invalid_attention_weight: float = 0.1,
+    transition_aux_enabled: bool = False,
+    transition_aux_loss_weight: float = 0.0,
+    transition_aux_cycle_weight: float = 0.1,
+    transition_aux_composition_weight: float = 0.05,
+    transition_aux_mse_weight: float = 0.1,
+    transition_aux_hidden_channels: int = 128,
+    transition_aux_action_dim: int = 128,
+    transition_aux_source: str = "gt_latent",
+    joint_view_generation_enabled: bool = False,
+    joint_view_generation_loss_weight: float = 0.0,
+    joint_view_generation_hidden_dim: int = 32,
+    joint_view_generation_num_heads: int = 4,
+    joint_view_generation_dropout: float = 0.0,
+    joint_view_generation_bev_sigma: float = 0.25,
+    joint_view_generation_gate_init: float = 0.0,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
     """Backward-compatible import surface for the clean perspective-PE model."""
@@ -107,6 +143,21 @@ def create_sd_model(
         attention_alignment_max_query_tokens=attention_alignment_max_query_tokens,
         attention_alignment_valid_radius=attention_alignment_valid_radius,
         attention_alignment_invalid_attention_weight=attention_alignment_invalid_attention_weight,
+        transition_aux_enabled=transition_aux_enabled,
+        transition_aux_loss_weight=transition_aux_loss_weight,
+        transition_aux_cycle_weight=transition_aux_cycle_weight,
+        transition_aux_composition_weight=transition_aux_composition_weight,
+        transition_aux_mse_weight=transition_aux_mse_weight,
+        transition_aux_hidden_channels=transition_aux_hidden_channels,
+        transition_aux_action_dim=transition_aux_action_dim,
+        transition_aux_source=transition_aux_source,
+        joint_view_generation_enabled=joint_view_generation_enabled,
+        joint_view_generation_loss_weight=joint_view_generation_loss_weight,
+        joint_view_generation_hidden_dim=joint_view_generation_hidden_dim,
+        joint_view_generation_num_heads=joint_view_generation_num_heads,
+        joint_view_generation_dropout=joint_view_generation_dropout,
+        joint_view_generation_bev_sigma=joint_view_generation_bev_sigma,
+        joint_view_generation_gate_init=joint_view_generation_gate_init,
         satellite_encoder_config=satellite_encoder_config,
     )
 
@@ -132,6 +183,8 @@ class SDTrainer:
         lr_scheduler_type: str = 'cosine',
         warmup_epochs: int = 5,
         geometry_score_lr_multiplier: float = 1.0,
+        transition_aux_lr_multiplier: float = 1.0,
+        transition_aux_warmup_steps: int = 0,
         geometry_score_gate_warmup_steps: int = 0,
         geometry_score_gate_warmup_start_scale: float = 1.0,
         geometry_score_gate_warmup_end_scale: float = 1.0,
@@ -142,6 +195,7 @@ class SDTrainer:
         output_dir: str = './output',
         save_every: int = 5,
         log_every: int = 100,
+        validate_every: int = 1,
         device: str = 'cuda',
         use_wandb: bool = False,
         project_name: str = 'kitti360_sd',
@@ -170,12 +224,16 @@ class SDTrainer:
         self.is_main_process = self.rank == 0
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+        self.run_config = self._sanitize_checkpoint_metadata(run_config or {})
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.num_train_epochs = num_train_epochs
         self.lr_scheduler_type = lr_scheduler_type
         self.warmup_epochs = warmup_epochs
         self.geometry_score_lr_multiplier = float(geometry_score_lr_multiplier)
+        self.transition_aux_lr_multiplier = float(transition_aux_lr_multiplier)
+        self.transition_aux_warmup_steps = max(0, int(transition_aux_warmup_steps))
+        self._last_transition_aux_runtime_scale = 1.0
         self.geometry_score_gate_warmup_steps = max(0, int(geometry_score_gate_warmup_steps))
         self.geometry_score_gate_warmup_start_scale = float(geometry_score_gate_warmup_start_scale)
         self.geometry_score_gate_warmup_end_scale = float(geometry_score_gate_warmup_end_scale)
@@ -186,8 +244,10 @@ class SDTrainer:
         self._last_semantic_score_runtime_alpha = self.semantic_score_alpha_max
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.output_dir = Path(output_dir)
+        self.scalar_log_path = self.output_dir / "logs" / "scalars.jsonl"
         self.save_every = save_every
         self.log_every = log_every
+        self.validate_every = max(0, int(validate_every))
         self.device = device
         self.use_wandb = bool(use_wandb) and self.is_main_process
         self.project_name = project_name
@@ -227,6 +287,7 @@ class SDTrainer:
         # Setup output dir
         if self.is_main_process:
             self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.scalar_log_path.parent.mkdir(parents=True, exist_ok=True)
         self._barrier()
 
         self._materialize_lazy_condition_modules()
@@ -293,6 +354,17 @@ class SDTrainer:
                     learning_rate * self.geometry_score_lr_multiplier,
                     self.geometry_score_lr_multiplier,
                 )
+            transition_aux_lr = self._optimizer_group_lr("transition_aux")
+            if transition_aux_lr is not None:
+                logger.info(
+                    "  Transition auxiliary learning rate: %.6g (x%.3g)",
+                    transition_aux_lr,
+                    self.transition_aux_lr_multiplier,
+                )
+                logger.info(
+                    "  Transition auxiliary loss warmup: %d optimizer step(s)",
+                    self.transition_aux_warmup_steps,
+                )
             if self.geometry_score_gate_warmup_steps > 0:
                 logger.info(
                     "  Geometry score gate runtime scale warmup: %.3g -> %.3g over %d optimizer step(s)",
@@ -314,6 +386,11 @@ class SDTrainer:
             )
             logger.info(f"  Mixed precision: {self.mixed_precision or 'disabled'}")
             logger.info(f"  Max grad norm: {self.max_grad_norm}")
+            if self.val_dataloader is not None:
+                if self.validate_every > 0:
+                    logger.info(f"  Validation: every {self.validate_every} epoch(s) and final epoch")
+                else:
+                    logger.info("  Validation: final epoch only")
             unwrapped = self.unwrapped_model
             unet = getattr(unwrapped, "unet", None)
             logger.info("  Additive perspective/query PE enabled: False")
@@ -369,6 +446,10 @@ class SDTrainer:
             or ".processor.semantic_key_proj." in name
         )
 
+    @staticmethod
+    def _is_transition_aux_parameter(name: str) -> bool:
+        return "transition_head." in name or ".transition_head." in name
+
     def _build_optimizer_param_groups(
         self,
         *,
@@ -377,18 +458,21 @@ class SDTrainer:
     ) -> List[Dict[str, Any]]:
         base_params: List[nn.Parameter] = []
         geometry_params: List[nn.Parameter] = []
+        transition_params: List[nn.Parameter] = []
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if self._is_geometry_score_parameter(name):
+            if self._is_transition_aux_parameter(name):
+                transition_params.append(param)
+            elif self._is_geometry_score_parameter(name):
                 geometry_params.append(param)
             else:
                 base_params.append(param)
 
-        if not geometry_params or self.geometry_score_lr_multiplier == 1.0:
+        if not geometry_params and not transition_params:
             return [
                 {
-                    "params": base_params + geometry_params,
+                    "params": base_params,
                     "lr": float(learning_rate),
                     "weight_decay": float(weight_decay),
                     "name": "base",
@@ -405,14 +489,24 @@ class SDTrainer:
                     "name": "base",
                 }
             )
-        groups.append(
-            {
-                "params": geometry_params,
-                "lr": float(learning_rate) * self.geometry_score_lr_multiplier,
-                "weight_decay": float(weight_decay),
-                "name": "geometry_score",
-            }
-        )
+        if geometry_params:
+            groups.append(
+                {
+                    "params": geometry_params,
+                    "lr": float(learning_rate) * self.geometry_score_lr_multiplier,
+                    "weight_decay": float(weight_decay),
+                    "name": "geometry_score",
+                }
+            )
+        if transition_params:
+            groups.append(
+                {
+                    "params": transition_params,
+                    "lr": float(learning_rate) * self.transition_aux_lr_multiplier,
+                    "weight_decay": float(weight_decay),
+                    "name": "transition_aux",
+                }
+            )
         return groups
 
     def _optimizer_group_lr(self, group_name: str) -> Optional[float]:
@@ -463,13 +557,148 @@ class SDTrainer:
         self._last_semantic_score_runtime_alpha = float(alpha)
         return float(alpha)
 
-    def _move_batch_geometry(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        geometry: Dict[str, torch.Tensor] = {}
-        for key in ("K", "T_cam_to_world", "T_imu_to_world", "camera_height_m"):
+    def _transition_aux_runtime_scale_for_update_step(self, update_step: int) -> float:
+        if self.transition_aux_warmup_steps <= 0:
+            return 1.0
+        return min(1.0, max(0.0, float(update_step) / float(self.transition_aux_warmup_steps)))
+
+    def _apply_transition_aux_warmup(self, update_step: int) -> float:
+        scale = self._transition_aux_runtime_scale_for_update_step(update_step)
+        setter = getattr(self.unwrapped_model, "set_transition_aux_runtime_scale", None)
+        if callable(setter):
+            setter(scale)
+        self._last_transition_aux_runtime_scale = float(scale)
+        return float(scale)
+
+    def _move_batch_geometry(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        geometry: Dict[str, Any] = {}
+        for key in (
+            "K",
+            "T_cam_to_world",
+            "T_imu_to_world",
+            "camera_height_m",
+            "front_bev_xy",
+            "front_ground_valid_mask",
+        ):
             value = batch.get(key)
             if torch.is_tensor(value):
                 geometry[key] = value.to(self.device)
+        vehicle_yaw_degs = batch.get("vehicle_yaw_degs")
+        if torch.is_tensor(vehicle_yaw_degs):
+            geometry["vehicle_yaw_degs"] = vehicle_yaw_degs.to(self.device)
+        view_names = batch.get("view_names")
+        if view_names is not None:
+            geometry["view_names"] = view_names
         return geometry
+
+    @staticmethod
+    def _compute_chain_coverage_metrics(
+        batch: Dict[str, Any],
+        *,
+        grid_size: int = 32,
+    ) -> Dict[str, float]:
+        image = batch.get("image")
+        front_bev_xy = batch.get("front_bev_xy")
+        valid_mask = batch.get("front_ground_valid_mask")
+        if (
+            not torch.is_tensor(image)
+            or image.ndim != 5
+            or not torch.is_tensor(front_bev_xy)
+            or not torch.is_tensor(valid_mask)
+        ):
+            return {}
+        if front_bev_xy.ndim != 5 or valid_mask.ndim != 5:
+            return {}
+
+        coords = front_bev_xy.detach().float().cpu()
+        valid = valid_mask.detach().float().cpu() > 0.5
+        if coords.shape[2] == 2:
+            x = coords[:, :, 0]
+            y = coords[:, :, 1]
+        elif coords.shape[-1] == 2:
+            x = coords[..., 0]
+            y = coords[..., 1]
+        else:
+            return {}
+        valid = valid.squeeze(2) if valid.shape[2] == 1 else valid
+        valid = valid & torch.isfinite(x) & torch.isfinite(y)
+        valid = valid & (x >= -1.0) & (x <= 1.0) & (y >= -1.0) & (y <= 1.0)
+        if valid.ndim != 4:
+            return {}
+
+        batch_size, num_views = int(valid.shape[0]), int(valid.shape[1])
+        if num_views < 2:
+            return {}
+
+        grid = int(grid_size)
+        x_bin = ((x + 1.0) * 0.5 * float(grid)).floor().long().clamp(0, grid - 1)
+        y_bin = ((1.0 - (y + 1.0) * 0.5) * float(grid)).floor().long().clamp(0, grid - 1)
+        token_index = y_bin * grid + x_bin
+
+        coverage = torch.zeros(batch_size * num_views, grid * grid, dtype=torch.bool)
+        flat_valid = valid.reshape(batch_size * num_views, -1)
+        flat_index = token_index.reshape(batch_size * num_views, -1)
+        row_ids = torch.arange(batch_size * num_views).unsqueeze(1).expand_as(flat_index)
+        coverage[row_ids[flat_valid], flat_index[flat_valid]] = True
+        coverage = coverage.reshape(batch_size, num_views, grid * grid)
+
+        left = coverage[:, :-1]
+        right = coverage[:, 1:]
+        intersection = (left & right).sum(dim=-1).float()
+        union = (left | right).sum(dim=-1).float()
+        overlap = intersection / union.clamp_min(1.0)
+        valid_pairs = union > 0
+
+        x_values = x.masked_fill(~valid, 0.0)
+        y_values = y.masked_fill(~valid, 0.0)
+        counts = valid.float().sum(dim=(-1, -2)).clamp_min(1.0)
+        centroids = torch.stack(
+            [
+                x_values.sum(dim=(-1, -2)) / counts,
+                y_values.sum(dim=(-1, -2)) / counts,
+            ],
+            dim=-1,
+        )
+        centroid_shift = (centroids[:, 1:] - centroids[:, :-1]).pow(2).sum(dim=-1).sqrt()
+        if not bool(valid_pairs.any().item()):
+            return {}
+
+        return {
+            "chain/coverage_overlap": float(overlap[valid_pairs].mean().item()),
+            "chain/coverage_centroid_shift": float(centroid_shift[valid_pairs].mean().item()),
+            "chain/valid_pair_ratio": float(valid_pairs.float().mean().item()),
+            "chain/group_size": float(num_views),
+        }
+
+    @staticmethod
+    def _collect_output_scalar_metrics(
+        outputs: Dict[str, Any],
+        keys: Sequence[str],
+    ) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        for key in keys:
+            value = outputs.get(key)
+            if torch.is_tensor(value) and value.numel() == 1:
+                metrics[key] = float(value.detach().float().item())
+        return metrics
+
+    @staticmethod
+    def _sanitize_checkpoint_metadata(value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {
+                str(key): SDTrainer._sanitize_checkpoint_metadata(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                SDTrainer._sanitize_checkpoint_metadata(item)
+                for item in value
+            ]
+        return repr(value)
 
     @torch.no_grad()
     def _materialize_lazy_condition_modules(self) -> None:
@@ -618,6 +847,15 @@ class SDTrainer:
             return True
         return int(log_every) > 0 and current_step % int(log_every) == 0
 
+    @staticmethod
+    def _should_validate_epoch(epoch: int, num_train_epochs: int, validate_every: int) -> bool:
+        current_epoch = int(epoch) + 1
+        total_epochs = max(1, int(num_train_epochs))
+        if current_epoch >= total_epochs:
+            return True
+        interval = int(validate_every)
+        return interval > 0 and current_epoch % interval == 0
+
     def _log_scalars(self, metrics: Dict[str, float], step: int) -> None:
         scalar_metrics = {
             key: float(value)
@@ -626,6 +864,11 @@ class SDTrainer:
         }
         if not scalar_metrics:
             return
+
+        if self.is_main_process:
+            record = {"step": int(step), **scalar_metrics}
+            with open(self.scalar_log_path, "a") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
 
         if self.use_wandb:
             import wandb
@@ -715,13 +958,19 @@ class SDTrainer:
                     )
 
                 # Validate
-                if self.val_dataloader is not None and self.is_main_process:
+                if (
+                    self.val_dataloader is not None
+                    and self.is_main_process
+                    and self._should_validate_epoch(epoch, self.num_train_epochs, self.validate_every)
+                ):
                     val_loss = self._validate(epoch)
                     logger.info(f"  Val loss: {val_loss:.4f}")
                     self._log_scalars(
                         {
                             "val/loss": val_loss,
+                            "val/epoch": epoch + 1,
                             "train/epoch": epoch + 1,
+                            **getattr(self, "_last_validation_metrics", {}),
                         },
                         step=epoch_step,
                     )
@@ -770,6 +1019,7 @@ class SDTrainer:
             optimizer_update_step = epoch * num_update_steps_per_epoch + step // self.gradient_accumulation_steps
             geometry_score_runtime_scale = self._apply_geometry_score_gate_warmup(optimizer_update_step)
             semantic_score_runtime_alpha = self._apply_semantic_score_alpha_schedule(optimizer_update_step)
+            transition_aux_runtime_scale = self._apply_transition_aux_warmup(optimizer_update_step)
             if step < skip_accumulation_until:
                 if self.is_main_process:
                     progress_bar.set_postfix({"raw_loss": "skipped"})
@@ -886,6 +1136,12 @@ class SDTrainer:
             postfix = {'raw_loss': f"{raw_loss.item():.3f}"}
             if torch.is_tensor(outputs.get("attention_alignment_mean_error")):
                 postfix["attn_err"] = f"{outputs['attention_alignment_mean_error'].detach().float().item():.3f}"
+            if torch.is_tensor(outputs.get("chain_group_size")):
+                postfix["views"] = f"{int(outputs['chain_group_size'].detach().float().item())}"
+            if torch.is_tensor(outputs.get("transition_aux_loss")):
+                postfix["trans"] = f"{outputs['transition_aux_loss'].detach().float().item():.3f}"
+            if torch.is_tensor(outputs.get("joint_view_generation_consistency_loss")):
+                postfix["joint"] = f"{outputs['joint_view_generation_consistency_loss'].detach().float().item():.3f}"
             if self.is_main_process:
                 progress_bar.set_postfix(postfix)
 
@@ -902,13 +1158,38 @@ class SDTrainer:
                     'train/lr': self.lr_scheduler.get_last_lr()[0],
                     'train/geometry_score/runtime_scale': geometry_score_runtime_scale,
                     'train/semantic_score/runtime_alpha': semantic_score_runtime_alpha,
+                    'train/transition_aux/runtime_scale': transition_aux_runtime_scale,
                     'train/epoch': epoch + 1,
                 }
+                for key, value in self._compute_chain_coverage_metrics(batch).items():
+                    log_payload[f"train/{key}"] = value
                 geometry_lr = self._optimizer_group_lr("geometry_score")
                 if geometry_lr is not None:
                     log_payload["train/lr_geometry_score"] = geometry_lr
+                transition_lr = self._optimizer_group_lr("transition_aux")
+                if transition_lr is not None:
+                    log_payload["train/lr_transition_aux"] = transition_lr
                 metric_name_map = {
                     "denoise_loss": "train/denoise_loss",
+                    "transition_aux_loss": "train/transition_aux/loss",
+                    "transition_aux_weighted_loss": "train/transition_aux/weighted_loss",
+                    "transition_aux_weight": "train/transition_aux/weight",
+                    "transition_aux_transition_loss": "train/transition_aux/transition_loss",
+                    "transition_aux_front_to_side_loss": "train/transition_aux/front_to_side_loss",
+                    "transition_aux_side_to_side_loss": "train/transition_aux/side_to_side_loss",
+                    "transition_aux_cycle_loss": "train/transition_aux/cycle_loss",
+                    "transition_aux_composition_loss": "train/transition_aux/composition_loss",
+                    "transition_aux_num_pairs": "train/transition_aux/num_pairs",
+                    "transition_aux_source_predicted_x0": "train/transition_aux/source_predicted_x0",
+                    "joint_view_generation_source_refined_x0": "train/joint_view_generation/source=refined_x0",
+                    "joint_view_generation_consistency_loss": "train/joint_view_generation/consistency_loss",
+                    "joint_view_generation_weighted_loss": "train/joint_view_generation/weighted_loss",
+                    "joint_view_generation_weight": "train/joint_view_generation/weight",
+                    "joint_view_generation_refiner_gate": "train/joint_view_generation/refiner_gate",
+                    "joint_view_generation_attention_entropy": "train/joint_view_generation/attention_entropy",
+                    "joint_view_generation_bev_match_distance": "train/joint_view_generation/bev_match_distance",
+                    "joint_view_generation_valid_match_ratio": "train/joint_view_generation/valid_match_ratio",
+                    "joint_view_generation_num_adjacent_directions": "train/joint_view_generation/num_adjacent_directions",
                     "attention_alignment_loss": "train/attention_alignment/loss",
                     "attention_alignment_mean_error": "train/attention_alignment/mean_error",
                     "attention_alignment_valid_query_ratio": "train/attention_alignment/valid_query_ratio",
@@ -967,6 +1248,10 @@ class SDTrainer:
                     "attention_alignment_target_logit_gap_semantic_only": "train/attention_alignment/target_logit_gap_semantic_only",
                     "attention_alignment_loss_weight": "train/attention_alignment/loss_weight",
                     "attention_alignment_loss_is_differentiable": "train/attention_alignment/loss_is_differentiable",
+                    "attention_alignment_chain_attention_coverage_overlap": "train/chain/attention_coverage_overlap",
+                    "attention_alignment_chain_attention_centroid_shift": "train/chain/attention_centroid_shift",
+                    "attention_alignment_chain_attention_valid_pair_ratio": "train/chain/attention_valid_pair_ratio",
+                    "chain_group_size": "train/chain/group_size_from_model",
                 }
                 for output_key, metric_key in metric_name_map.items():
                     value = outputs.get(output_key)
@@ -986,6 +1271,44 @@ class SDTrainer:
         was_training = eval_model.training
         eval_model.eval()
         total_loss = 0.0
+        chain_metric_sums: Dict[str, float] = {}
+        chain_metric_count = 0
+        output_metric_sums: Dict[str, float] = {}
+        output_metric_count = 0
+        val_output_metric_keys = (
+            "denoise_loss",
+            "transition_aux_loss",
+            "transition_aux_weighted_loss",
+            "transition_aux_weight",
+            "transition_aux_transition_loss",
+            "transition_aux_front_to_side_loss",
+            "transition_aux_side_to_side_loss",
+            "transition_aux_cycle_loss",
+            "transition_aux_composition_loss",
+            "transition_aux_num_pairs",
+            "transition_aux_source_predicted_x0",
+            "joint_view_generation_source_refined_x0",
+            "joint_view_generation_consistency_loss",
+            "joint_view_generation_weighted_loss",
+            "joint_view_generation_weight",
+            "joint_view_generation_refiner_gate",
+            "joint_view_generation_attention_entropy",
+            "joint_view_generation_bev_match_distance",
+            "joint_view_generation_valid_match_ratio",
+            "joint_view_generation_num_adjacent_directions",
+            "attention_alignment_loss",
+            "attention_alignment_mean_error",
+            "attention_alignment_candidate_recall",
+            "attention_alignment_target_attention_lift_mixed",
+            "attention_alignment_target_attention_lift_geometry_only",
+            "attention_alignment_target_attention_lift_semantic_only",
+            "attention_alignment_target_attention_lift_without_geometry",
+            "attention_alignment_semantic_to_geometry_ratio",
+            "attention_alignment_chain_attention_coverage_overlap",
+            "attention_alignment_chain_attention_centroid_shift",
+            "attention_alignment_chain_attention_valid_pair_ratio",
+            "chain_group_size",
+        )
 
         for batch in tqdm(self.val_dataloader, desc=f"Val Epoch {epoch+1}"):
             sat_images = batch['sat'].to(self.device)
@@ -1004,9 +1327,29 @@ class SDTrainer:
                 )
                 loss = outputs['loss']
             total_loss += loss.item()
+            chain_metrics = self._compute_chain_coverage_metrics(batch)
+            if chain_metrics:
+                chain_metric_count += 1
+                for key, value in chain_metrics.items():
+                    chain_metric_sums[key] = chain_metric_sums.get(key, 0.0) + float(value)
+            output_metrics = self._collect_output_scalar_metrics(outputs, val_output_metric_keys)
+            if output_metrics:
+                output_metric_count += 1
+                for key, value in output_metrics.items():
+                    output_metric_sums[key] = output_metric_sums.get(key, 0.0) + float(value)
 
         if was_training:
             eval_model.train()
+        self._last_validation_metrics = {
+            f"val/{key}": value / max(1, chain_metric_count)
+            for key, value in chain_metric_sums.items()
+        }
+        self._last_validation_metrics.update(
+            {
+                f"val/{key}": value / max(1, output_metric_count)
+                for key, value in output_metric_sums.items()
+            }
+        )
         return total_loss / len(self.val_dataloader)
 
     def _save_checkpoint(self, epoch: int):
@@ -1019,6 +1362,25 @@ class SDTrainer:
             'model_state_dict': self.unwrapped_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.lr_scheduler.state_dict(),
+            'run_config': self.run_config,
+            'trainer_metadata': {
+                'checkpoint_epoch': epoch + 1,
+                'validate_every': self.validate_every,
+                'world_size': self.world_size,
+                'gradient_accumulation_steps': self.gradient_accumulation_steps,
+                'transition_aux_enabled': bool(getattr(self.unwrapped_model, "transition_aux_enabled", False)),
+                'transition_aux_loss_weight': float(getattr(self.unwrapped_model, "transition_aux_loss_weight", 0.0)),
+                'transition_aux_source': str(getattr(self.unwrapped_model, "transition_aux_source", "gt_latent")),
+                'transition_aux_warmup_steps': self.transition_aux_warmup_steps,
+                'transition_aux_camera_action': "relative_SE3 + intrinsics + camera_identity + view_type + yaw",
+                'joint_view_generation_enabled': bool(
+                    getattr(self.unwrapped_model, "joint_view_generation_enabled", False)
+                ),
+                'joint_view_generation_loss_weight': float(
+                    getattr(self.unwrapped_model, "joint_view_generation_loss_weight", 0.0)
+                ),
+                'joint_view_generation_source': "refined_x0",
+            },
         }
 
         torch.save(checkpoint, checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pt')
@@ -1264,6 +1626,32 @@ class SDTrainer:
         for img in (sat_pil, gen_pil, real_pil):
             canvas.paste(img, (x_offset, 0))
             x_offset += img.width
+        return canvas
+
+    @staticmethod
+    def _stack_pil_rows(images: Sequence[Image.Image], gap: int = 0) -> Image.Image:
+        if not images:
+            raise ValueError("Cannot stack an empty image list")
+        widths = [image.width for image in images]
+        heights = [image.height for image in images]
+        canvas = Image.new(
+            "RGB",
+            (max(widths), sum(heights) + max(0, int(gap)) * max(0, len(images) - 1)),
+            (18, 18, 18),
+        )
+        y_offset = 0
+        for image in images:
+            canvas.paste(image.convert("RGB"), (0, y_offset))
+            y_offset += image.height + max(0, int(gap))
+        return canvas
+
+    @staticmethod
+    def _add_contact_sheet_title(image: Image.Image, title: str) -> Image.Image:
+        title_h = 30
+        canvas = Image.new("RGB", (image.width, image.height + title_h), (12, 12, 12))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((10, 8), str(title), fill=(255, 255, 255))
+        canvas.paste(image.convert("RGB"), (0, title_h))
         return canvas
 
     @staticmethod
@@ -1566,21 +1954,11 @@ class SDTrainer:
             bev_error_pil.save(output_dir / f"{prefix}_{layer_token}_bev_alignment_error.png")
 
     @staticmethod
-    def _visualization_view_specs() -> List[Tuple[str, Optional[float]]]:
-        return [
-            ("front", None),
-            ("yaw_m120", -120.0),
-            ("yaw_m90", -90.0),
-            ("yaw_m60", -60.0),
-            ("yaw_p60", 60.0),
-            ("yaw_p90", 90.0),
-            ("yaw_p120", 120.0),
-        ]
-
-    @staticmethod
     def _sample_with_visualization_view(base_sample: Any, view_label: str, yaw_deg: Optional[float]) -> Any:
         base_meta = getattr(base_sample, "meta", None)
         meta = dict(base_meta) if isinstance(base_meta, dict) else {}
+        for key in ("view_set", "pose_chain_name", "pose_chain_yaws", "pose_chain_view_names"):
+            meta.pop(key, None)
         meta["view_name"] = view_label
         if yaw_deg is None:
             meta["mode_override"] = "front"
@@ -1595,8 +1973,7 @@ class SDTrainer:
             frame_id=getattr(base_sample, "frame_id"),
             meta=meta,
         )
-
-    def _collect_fixed_yaw_visualization_items(self, data_loader: DataLoader) -> Optional[List[Dict[str, Any]]]:
+    def _collect_joint_visualization_chains(self, data_loader: DataLoader) -> Optional[List[Dict[str, Any]]]:
         dataset = getattr(data_loader, "dataset", None)
         samples = getattr(dataset, "samples", None)
         if dataset is None or not samples:
@@ -1604,24 +1981,32 @@ class SDTrainer:
 
         base_index = 0
         base_sample = samples[base_index]
-        items = []
-        for view_label, yaw_deg in self._visualization_view_specs():
-            override_sample = self._sample_with_visualization_view(base_sample, view_label, yaw_deg)
-            original_sample = samples[base_index]
-            try:
-                samples[base_index] = override_sample
-                item = dataset[base_index]
-            finally:
-                samples[base_index] = original_sample
+        chain_batches: List[Dict[str, Any]] = []
+        for chain_name, chain_specs in JOINT_VISUALIZATION_CHAINS:
+            items = []
+            for view_label, yaw_deg in chain_specs:
+                override_sample = self._sample_with_visualization_view(base_sample, view_label, yaw_deg)
+                original_sample = samples[base_index]
+                try:
+                    samples[base_index] = override_sample
+                    item = dataset[base_index]
+                finally:
+                    samples[base_index] = original_sample
 
-            if not isinstance(item, dict):
+                if not isinstance(item, dict):
+                    return None
+                item = dict(item)
+                item["_visualization_view_label"] = view_label
+                item["_visualization_yaw_deg"] = yaw_deg
+                items.append(item)
+
+            stacked = self._stack_visualization_items(items)
+            if stacked is None:
                 return None
-            item = dict(item)
-            item["_visualization_view_label"] = view_label
-            item["_visualization_yaw_deg"] = yaw_deg
-            items.append(item)
+            stacked["chain_name"] = str(chain_name)
+            chain_batches.append(stacked)
 
-        return items
+        return chain_batches or None
 
     @staticmethod
     def _stack_visualization_items(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1676,241 +2061,134 @@ class SDTrainer:
                 result[cam_key] = torch.stack([item[cam_key] for item in items], dim=0)
         return result
 
-    def _collect_fallback_visualization_batch(self, data_loader: DataLoader) -> Optional[Dict[str, Any]]:
-        sat_chunks = []
-        target_chunks = []
-        front_bev_xy_chunks = []
-        front_ground_valid_mask_chunks = []
-        K_chunks = []
-        T_cam_to_world_chunks = []
-        T_imu_to_world_chunks = []
-        camera_height_chunks = []
-        frame_ids = []
-        view_labels = []
-        yaw_degs = []
-
-        for batch in data_loader:
-            batch_count = batch['sat'].shape[0]
-            remaining = self.num_visualizations - len(frame_ids)
-            if remaining <= 0:
-                break
-
-            take = min(remaining, batch_count)
-            sat_chunks.append(batch['sat'][:take])
-            target_chunks.append(batch['image'][:take])
-
-            front_bev_xy = batch.get('front_bev_xy')
-            if front_bev_xy is not None:
-                front_bev_xy_chunks.append(front_bev_xy[:take])
-            front_ground_valid_mask = batch.get('front_ground_valid_mask')
-            if front_ground_valid_mask is not None:
-                front_ground_valid_mask_chunks.append(front_ground_valid_mask[:take])
-
-            for cam_key, chunks in [
-                ('K', K_chunks),
-                ('T_cam_to_world', T_cam_to_world_chunks),
-                ('T_imu_to_world', T_imu_to_world_chunks),
-            ]:
-                cam_val = batch.get(cam_key)
-                if cam_val is not None:
-                    chunks.append(cam_val[:take])
-            camera_height = batch.get('camera_height_m')
-            if torch.is_tensor(camera_height):
-                camera_height_chunks.append(camera_height[:take])
-
-            batch_frame_ids = batch.get('frame_id')
-            if batch_frame_ids is None:
-                frame_ids.extend([None] * take)
-            else:
-                frame_ids.extend(list(batch_frame_ids[:take]))
-            view_labels.extend([None] * take)
-            yaw_degs.extend([None] * take)
-
-            if len(frame_ids) >= self.num_visualizations:
-                break
-
-        if not sat_chunks:
-            return None
-
-        result = {
-            "sat": torch.cat(sat_chunks, dim=0),
-            "image": torch.cat(target_chunks, dim=0),
-            "front_bev_xy": torch.cat(front_bev_xy_chunks, dim=0) if front_bev_xy_chunks else None,
-            "front_ground_valid_mask": (
-                torch.cat(front_ground_valid_mask_chunks, dim=0)
-                if front_ground_valid_mask_chunks else None
-            ),
-            "frame_ids": frame_ids,
-            "view_labels": view_labels,
-            "yaw_degs": yaw_degs,
-        }
-        if camera_height_chunks:
-            result["camera_height_m"] = torch.cat(camera_height_chunks, dim=0)
-        for cam_key, chunks in [
-            ('K', K_chunks),
-            ('T_cam_to_world', T_cam_to_world_chunks),
-            ('T_imu_to_world', T_imu_to_world_chunks),
-        ]:
-            if chunks:
-                result[cam_key] = torch.cat(chunks, dim=0)
-        return result
-
     @torch.no_grad()
     def _save_visualizations(self, epoch: int):
         data_loader = self.val_dataloader if self.val_dataloader is not None else self.train_dataloader
         if data_loader is None:
             return
 
-        fixed_items = self._collect_fixed_yaw_visualization_items(data_loader)
-        visualization_batch = (
-            self._stack_visualization_items(fixed_items)
-            if fixed_items is not None
-            else None
-        )
-        if visualization_batch is None:
-            visualization_batch = self._collect_fallback_visualization_batch(data_loader)
-        if visualization_batch is None:
+        chain_batches = self._collect_joint_visualization_chains(data_loader)
+        if not chain_batches:
             return
 
-        sat_images = visualization_batch["sat"].to(self.device)
-        target_images = visualization_batch["image"].to(self.device)
-        front_bev_xy = visualization_batch["front_bev_xy"]
-        if front_bev_xy is not None:
-            front_bev_xy = front_bev_xy.to(self.device)
-        front_ground_valid_mask = visualization_batch["front_ground_valid_mask"]
-        front_ground_valid_mask = (
-            front_ground_valid_mask.to(self.device) if front_ground_valid_mask is not None else None
-        )
-        frame_ids = visualization_batch["frame_ids"]
-        view_labels = visualization_batch["view_labels"]
-        yaw_degs = visualization_batch["yaw_degs"]
-
-        K = visualization_batch.get("K")
-        if K is not None:
-            K = K.to(self.device)
-        T_cam_to_world = visualization_batch.get("T_cam_to_world")
-        if T_cam_to_world is not None:
-            T_cam_to_world = T_cam_to_world.to(self.device)
-        T_imu_to_world = visualization_batch.get("T_imu_to_world")
-        if T_imu_to_world is not None:
-            T_imu_to_world = T_imu_to_world.to(self.device)
-        camera_height_m = visualization_batch.get("camera_height_m")
-        if torch.is_tensor(camera_height_m):
-            camera_height_m = camera_height_m.to(self.device)
-        target_size = (int(target_images.shape[2]), int(target_images.shape[3]))
-
         generator_device = self.device if self.device.startswith("cuda") else "cpu"
-
         eval_model = self.unwrapped_model
+        if not hasattr(eval_model, "generate_pose_chain"):
+            logger.warning("Skipping visualization because model has no generate_pose_chain method")
+            return
+        if not bool(getattr(eval_model, "joint_view_generation_enabled", False)):
+            logger.warning("Skipping visualization because joint_view_generation is disabled")
+            return
+
         was_training = eval_model.training
         eval_model.eval()
-        sat_state = eval_model.encode_satellite(
-            sat_images,
-            K=K,
-            T_cam_to_world=T_cam_to_world,
-            T_imu_to_world=T_imu_to_world,
-            camera_height_m=camera_height_m,
-            image_size=target_size,
-        )
-        generator = torch.Generator(device=generator_device)
-        generator.manual_seed(self.visualization_seed)
-        generated_chunks = []
-        attention_debug_by_sample: List[Dict[str, Any]] = []
-        unet = getattr(eval_model, "unet", None)
-        for idx in range(sat_images.shape[0]):
-            view_sat_state = SatelliteMemoryState(
-                tokens=sat_state.tokens[idx:idx + 1],
-                xy=sat_state.xy[idx:idx + 1],
-                bev_coords=(
-                    sat_state.bev_coords[idx:idx + 1]
-                    if sat_state.bev_coords is not None
-                    else None
-                ),
-                perspective_uv=(
-                    sat_state.perspective_uv[idx:idx + 1]
-                    if sat_state.perspective_uv is not None
-                    else None
-                ),
-                perspective_valid=(
-                    sat_state.perspective_valid[idx:idx + 1]
-                    if sat_state.perspective_valid is not None
-                    else None
-                ),
-            )
-            attention_debug: Dict[str, Any] = {}
-            if unet is not None and hasattr(unet, "enable_attention_debug"):
-                unet.enable_attention_debug(
-                    layers=self.attention_visualization_layers,
-                    storage=attention_debug,
-                )
-            try:
-                generated_view, _ = eval_model.generate_with_satellite_state(
-                    view_sat_state,
-                    target_size=tuple(target_images.shape[-2:]),
-                    num_inference_steps=self.visualization_inference_steps,
-                    guidance_scale=self.visualization_guidance_scale,
-                    generator=generator,
-                )
-            finally:
-                if unet is not None and hasattr(unet, "disable_attention_debug"):
-                    unet.disable_attention_debug()
-            generated_chunks.append(generated_view)
-            attention_debug_by_sample.append(attention_debug)
-        generated_images = torch.cat(generated_chunks, dim=0)
-        if was_training:
-            eval_model.train()
 
         epoch_dir = self.visualization_dir / f"epoch_{epoch + 1:04d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
-        attention_dir = epoch_dir / "attention"
-        comparison_images = []
-        captions = []
+        comparison_images: List[Image.Image] = []
+        captions: List[str] = []
 
-        for idx in range(sat_images.shape[0]):
-            frame_id = frame_ids[idx]
-            frame_suffix = f"_frame_{int(frame_id):010d}" if frame_id is not None else ""
-            view_label = view_labels[idx]
-            view_suffix = f"_{view_label}" if view_label else ""
-            comparison = self._compose_visualization(
-                sat_images[idx],
-                generated_images[idx],
-                target_images[idx],
-                front_bev_xy=front_bev_xy[idx] if front_bev_xy is not None else None,
-                front_ground_valid_mask=(
-                    front_ground_valid_mask[idx] if front_ground_valid_mask is not None else None
-                ),
-                view_label=view_label,
-                yaw_deg=yaw_degs[idx],
-            )
-            comparison.save(epoch_dir / f"sample_{idx:02d}{view_suffix}{frame_suffix}.png")
-            attention_prefix = f"sample_{idx:02d}{view_suffix}{frame_suffix}"
-            self._save_attention_debug_visualizations(
-                attention_debug=attention_debug_by_sample[idx],
-                sat_image=sat_images[idx],
-                gt_image=target_images[idx],
-                front_bev_xy=front_bev_xy[idx] if front_bev_xy is not None else None,
-                front_ground_valid_mask=(
-                    front_ground_valid_mask[idx] if front_ground_valid_mask is not None else None
-                ),
-                output_dir=attention_dir,
-                prefix=attention_prefix,
-            )
-            comparison_images.append(comparison)
-            caption = f"epoch={epoch + 1} sample={idx:02d}"
-            if view_label:
-                caption += f" view={view_label}"
-            if yaw_degs[idx] is not None:
-                caption += f" yaw={float(yaw_degs[idx]):g}"
-            if frame_id is not None:
-                caption += f" frame={int(frame_id):010d}"
-            captions.append(caption)
+        try:
+            for chain_index, visualization_batch in enumerate(chain_batches):
+                chain_name = str(visualization_batch.get("chain_name", f"chain_{chain_index:02d}"))
+                sat_images = visualization_batch["sat"].to(self.device)
+                target_images = visualization_batch["image"].to(self.device)
+                frame_ids = visualization_batch["frame_ids"]
+                view_labels = visualization_batch["view_labels"]
+                yaw_degs = visualization_batch["yaw_degs"]
+                target_size = (int(target_images.shape[2]), int(target_images.shape[3]))
 
-        logger.info(f"Saved visualizations: {epoch_dir}")
-        self._log_visualizations(
-            comparison_images,
-            captions,
-            step=self._global_step(epoch, max(0, len(self.train_dataloader) - 1)),
-        )
+                K = visualization_batch.get("K")
+                T_cam_to_world = visualization_batch.get("T_cam_to_world")
+                T_imu_to_world = visualization_batch.get("T_imu_to_world")
+                camera_height_m = visualization_batch.get("camera_height_m")
+                if K is None or T_cam_to_world is None or T_imu_to_world is None or camera_height_m is None:
+                    logger.warning("Skipping visualization chain %s because camera geometry is incomplete", chain_name)
+                    continue
+
+                front_bev_xy = visualization_batch["front_bev_xy"]
+                if front_bev_xy is not None:
+                    front_bev_xy = front_bev_xy.to(self.device).unsqueeze(0)
+                front_ground_valid_mask = visualization_batch["front_ground_valid_mask"]
+                if front_ground_valid_mask is not None:
+                    front_ground_valid_mask = front_ground_valid_mask.to(self.device).unsqueeze(0)
+
+                vehicle_yaw_degs = torch.tensor(
+                    [[float("nan") if yaw_deg is None else float(yaw_deg) for yaw_deg in yaw_degs]],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+
+                generator = torch.Generator(device=generator_device)
+                generator.manual_seed(self.visualization_seed + chain_index)
+                generated_images = eval_model.generate_pose_chain(
+                    sat_images[:1],
+                    K=K.to(self.device).unsqueeze(0),
+                    T_cam_to_world=T_cam_to_world.to(self.device).unsqueeze(0),
+                    T_imu_to_world=T_imu_to_world.to(self.device).unsqueeze(0),
+                    camera_height_m=camera_height_m.to(self.device).unsqueeze(0),
+                    vehicle_yaw_degs=vehicle_yaw_degs,
+                    front_bev_xy=front_bev_xy,
+                    front_ground_valid_mask=front_ground_valid_mask,
+                    target_size=target_size,
+                    num_inference_steps=self.visualization_inference_steps,
+                    guidance_scale=self.visualization_guidance_scale,
+                    generator=generator,
+                )[0].detach().cpu()
+
+                sat_images_cpu = sat_images.detach().cpu()
+                target_images_cpu = target_images.detach().cpu()
+                front_bev_xy_cpu = front_bev_xy.squeeze(0).detach().cpu() if front_bev_xy is not None else None
+                front_ground_valid_mask_cpu = (
+                    front_ground_valid_mask.squeeze(0).detach().cpu()
+                    if front_ground_valid_mask is not None
+                    else None
+                )
+
+                rows: List[Image.Image] = []
+                for view_index in range(target_images_cpu.shape[0]):
+                    rows.append(
+                        self._compose_visualization(
+                            sat_images_cpu[view_index],
+                            generated_images[view_index],
+                            target_images_cpu[view_index],
+                            front_bev_xy=(
+                                front_bev_xy_cpu[view_index]
+                                if front_bev_xy_cpu is not None
+                                else None
+                            ),
+                            front_ground_valid_mask=(
+                                front_ground_valid_mask_cpu[view_index]
+                                if front_ground_valid_mask_cpu is not None
+                                else None
+                            ),
+                            view_label=view_labels[view_index],
+                            yaw_deg=yaw_degs[view_index],
+                        )
+                    )
+
+                frame_id = frame_ids[0] if frame_ids else None
+                frame_suffix = f"_frame_{int(frame_id):010d}" if frame_id is not None else ""
+                sheet = self._stack_pil_rows(rows, gap=2)
+                title = f"epoch={epoch + 1} joint={chain_name}{frame_suffix}"
+                sheet = self._add_contact_sheet_title(sheet, title)
+                filename = f"joint_{chain_name}{frame_suffix}.png"
+                sheet.save(epoch_dir / filename)
+                comparison_images.append(sheet)
+                captions.append(title)
+
+            if comparison_images:
+                combined = self._stack_pil_rows(comparison_images, gap=12)
+                combined.save(epoch_dir / "joint_contact_sheet.png")
+                logger.info(f"Saved joint visualization contact sheet: {epoch_dir / 'joint_contact_sheet.png'}")
+                self._log_visualizations(
+                    comparison_images,
+                    captions,
+                    step=self._global_step(epoch, max(0, len(self.train_dataloader) - 1)),
+                )
+        finally:
+            if was_training:
+                eval_model.train()
 
     def _load_checkpoint(self, checkpoint_path: str) -> int:
         """Load from checkpoint and return the next zero-based epoch index."""

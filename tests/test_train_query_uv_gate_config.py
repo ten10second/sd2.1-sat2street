@@ -2,6 +2,9 @@ import runpy
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
+
+import yaml
 
 
 _TRAIN_MODULE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "train.py"))
@@ -12,15 +15,107 @@ _attach_query_geometry_score_args = _TRAIN_MODULE["_attach_query_geometry_score_
 _verify_query_geometry_score_model_config = _TRAIN_MODULE["_verify_query_geometry_score_model_config"]
 _resolve_unet_attention_slicing_config = _TRAIN_MODULE["_resolve_unet_attention_slicing_config"]
 _resolve_gradient_checkpointing_config = _TRAIN_MODULE["_resolve_gradient_checkpointing_config"]
+_infer_pose_chain_group_size = _TRAIN_MODULE["_infer_pose_chain_group_size"]
 _collect_cli_options = _TRAIN_MODULE["_collect_cli_options"]
 _prefer_config = _TRAIN_MODULE["_prefer_config"]
+_init_distributed = _TRAIN_MODULE["_init_distributed"]
+DEFAULT_DISTRIBUTED_TIMEOUT = _TRAIN_MODULE["DEFAULT_DISTRIBUTED_TIMEOUT"]
+_TRAIN_DIST = _TRAIN_MODULE["dist"]
 
 
 class TrainQueryUVGateConfigTest(unittest.TestCase):
+    def test_train_config_enables_pose_chain_view_set(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with (root / "configs" / "train.yaml").open("r") as f:
+            config = yaml.safe_load(f)
+
+        self.assertEqual(config["data"]["view_set"], "pose_chain")
+        self.assertEqual(
+            config["data"]["pose_chains"],
+            [
+                {"name": "right", "yaws": ["front", 60.0, 90.0, 120.0]},
+                {"name": "left", "yaws": ["front", -60.0, -90.0, -120.0]},
+            ],
+        )
+        self.assertEqual(config["data"]["batch_size"], 2)
+        self.assertEqual(config["validation"]["validate_every"], 10)
+        self.assertTrue(config["training"]["joint_view_generation"]["enable"])
+        self.assertFalse(config["training"]["transition_aux"]["enable"])
+
     def test_query_uv_config_is_ignored_for_clean_geometry_addressing(self) -> None:
         enabled, gate_init = _resolve_query_uv_config({})
         self.assertFalse(enabled)
         self.assertEqual(gate_init, 0.0)
+
+    def test_pose_chain_group_size_infers_view_count_for_effective_view_batch(self) -> None:
+        self.assertEqual(_infer_pose_chain_group_size("single", None), 1)
+        self.assertEqual(
+            _infer_pose_chain_group_size(
+                "pose_chain",
+                [{"name": "right", "yaws": ["front", 60.0, 90.0, 120.0]}],
+            ),
+            4,
+        )
+        self.assertEqual(_infer_pose_chain_group_size("pose_chain", None), 4)
+
+    def test_pose_chain_group_size_rejects_mismatched_chain_lengths(self) -> None:
+        with self.assertRaisesRegex(ValueError, "same number of views"):
+            _infer_pose_chain_group_size(
+                "pose_chain",
+                [
+                    {"name": "right", "yaws": ["front", 60.0, 90.0, 120.0]},
+                    {"name": "left", "yaws": ["front", -60.0, -90.0]},
+                ],
+            )
+
+    def test_pose_chain_group_size_rejects_duplicate_chain_names(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unique"):
+            _infer_pose_chain_group_size(
+                "pose_chain",
+                [
+                    {"name": "right", "yaws": ["front", 60.0]},
+                    {"name": "right", "yaws": ["front", 90.0]},
+                ],
+            )
+
+    def test_pose_chain_group_size_rejects_string_yaws(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not a string"):
+            _infer_pose_chain_group_size(
+                "pose_chain",
+                [
+                    {"name": "right", "yaws": "front,60,90"},
+                ],
+            )
+
+    def test_validate_every_cli_option_overrides_config_even_when_cli_value_is_default(self) -> None:
+        cli_options = _collect_cli_options(["--validate_every", "1"])
+
+        value = _prefer_config(
+            1,
+            1,
+            10,
+            cli_option="--validate_every",
+            cli_options=cli_options,
+        )
+
+        self.assertEqual(value, 1)
+
+    def test_distributed_init_uses_long_timeout_for_rank0_validation_waits(self) -> None:
+        args = Namespace(device="cpu")
+
+        with patch.dict(
+            "os.environ",
+            {"WORLD_SIZE": "2", "RANK": "0", "LOCAL_RANK": "0"},
+            clear=False,
+        ), patch.object(_TRAIN_DIST, "init_process_group") as init_process_group:
+            distributed, rank, local_rank, world_size = _init_distributed(args)
+
+        self.assertTrue(distributed)
+        self.assertEqual((rank, local_rank, world_size), (0, 0, 2))
+        init_process_group.assert_called_once_with(
+            backend="gloo",
+            timeout=DEFAULT_DISTRIBUTED_TIMEOUT,
+        )
 
     def test_explicit_query_uv_config_still_resolves_to_disabled(self) -> None:
         enabled, gate_init = _resolve_query_uv_config(

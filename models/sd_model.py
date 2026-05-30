@@ -19,7 +19,10 @@ except ImportError:  # pragma: no cover - compatibility with older diffusers lay
 from diffusers.models.attention_processor import AttnProcessor2_0
 
 from models.conditioning import SatelliteMemoryState
+from models.cross_view_refiner import CrossViewLatentRefiner
+from models.encoders.perspective_position_encoder import compute_sat_patch_perspective_uv
 from models.encoders.satellite_condition_encoder import SatelliteConditionEncoder
+from models.pose_transition import TransitionHead, compute_transition_auxiliary_outputs
 from models.unet.query_uv_attn_processor import QueryUVAttnProcessor2_0, QueryUVSlicedAttnProcessor
 
 
@@ -29,6 +32,29 @@ logger = logging.getLogger(__name__)
 DEFAULT_ATTENTION_ALIGNMENT_LAYERS = (
     "mid_block.attentions.0.transformer_blocks.0.attn2",
 )
+TRANSITION_AUX_SOURCE_GT_LATENT = "gt_latent"
+TRANSITION_AUX_SOURCE_PREDICTED_X0 = "predicted_x0"
+
+
+def normalize_transition_aux_source(source: str) -> str:
+    normalized = str(source).strip().lower().replace("-", "_")
+    aliases = {
+        "gt": TRANSITION_AUX_SOURCE_GT_LATENT,
+        "gt_latent": TRANSITION_AUX_SOURCE_GT_LATENT,
+        "gt_latents": TRANSITION_AUX_SOURCE_GT_LATENT,
+        "latent": TRANSITION_AUX_SOURCE_GT_LATENT,
+        "vae_latent": TRANSITION_AUX_SOURCE_GT_LATENT,
+        "x0": TRANSITION_AUX_SOURCE_PREDICTED_X0,
+        "pred_x0": TRANSITION_AUX_SOURCE_PREDICTED_X0,
+        "predicted_x0": TRANSITION_AUX_SOURCE_PREDICTED_X0,
+        "pred_original_sample": TRANSITION_AUX_SOURCE_PREDICTED_X0,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "transition_aux_source must be one of "
+            f"{TRANSITION_AUX_SOURCE_GT_LATENT!r} or {TRANSITION_AUX_SOURCE_PREDICTED_X0!r}, got {source!r}"
+        )
+    return aliases[normalized]
 
 
 def _resolve_module_path(root: nn.Module, path: str) -> nn.Module:
@@ -402,6 +428,21 @@ class SatelliteConditionedSDModel(nn.Module):
         attention_alignment_max_query_tokens: Optional[int] = 256,
         attention_alignment_valid_radius: float = 0.25,
         attention_alignment_invalid_attention_weight: float = 0.1,
+        transition_aux_enabled: bool = False,
+        transition_aux_loss_weight: float = 0.0,
+        transition_aux_cycle_weight: float = 0.1,
+        transition_aux_composition_weight: float = 0.05,
+        transition_aux_mse_weight: float = 0.1,
+        transition_aux_hidden_channels: int = 128,
+        transition_aux_action_dim: int = 128,
+        transition_aux_source: str = TRANSITION_AUX_SOURCE_GT_LATENT,
+        joint_view_generation_enabled: bool = False,
+        joint_view_generation_loss_weight: float = 0.0,
+        joint_view_generation_hidden_dim: int = 32,
+        joint_view_generation_num_heads: int = 4,
+        joint_view_generation_dropout: float = 0.0,
+        joint_view_generation_bev_sigma: float = 0.25,
+        joint_view_generation_gate_init: float = 0.0,
     ):
         super().__init__()
 
@@ -427,6 +468,16 @@ class SatelliteConditionedSDModel(nn.Module):
         self.attention_alignment_valid_radius = float(attention_alignment_valid_radius)
         self.attention_alignment_invalid_attention_weight = float(attention_alignment_invalid_attention_weight)
         self._logged_nondifferentiable_alignment_loss = False
+        self.transition_aux_enabled = bool(transition_aux_enabled)
+        self.transition_aux_loss_weight = float(transition_aux_loss_weight)
+        self.transition_aux_cycle_weight = float(transition_aux_cycle_weight)
+        self.transition_aux_composition_weight = float(transition_aux_composition_weight)
+        self.transition_aux_mse_weight = float(transition_aux_mse_weight)
+        self.transition_aux_source = normalize_transition_aux_source(transition_aux_source)
+        self.transition_aux_runtime_scale = 1.0
+        self.joint_view_generation_enabled = bool(joint_view_generation_enabled)
+        self.joint_view_generation_loss_weight = float(joint_view_generation_loss_weight)
+        self.joint_view_generation_runtime_scale = 1.0
 
         if satellite_encoder is None:
             sat_embed_dim = int(getattr(unet.config, "cross_attention_dim", 768) or 768)
@@ -434,6 +485,32 @@ class SatelliteConditionedSDModel(nn.Module):
                 embed_dim=sat_embed_dim,
             )
         self.satellite_encoder = satellite_encoder
+        self.transition_head: Optional[TransitionHead] = None
+        self.cross_view_refiner: Optional[CrossViewLatentRefiner] = None
+        latent_channels = int(
+            getattr(
+                vae.config,
+                "latent_channels",
+                getattr(unet.config, "in_channels", 4),
+            )
+            or 4
+        )
+        if self.transition_aux_enabled:
+            self.transition_head = TransitionHead(
+                latent_channels=latent_channels,
+                sat_token_dim=int(self.satellite_encoder.embed_dim),
+                action_dim=int(transition_aux_action_dim),
+                hidden_channels=int(transition_aux_hidden_channels),
+            )
+        if self.joint_view_generation_enabled:
+            self.cross_view_refiner = CrossViewLatentRefiner(
+                latent_channels=latent_channels,
+                hidden_dim=int(joint_view_generation_hidden_dim),
+                num_heads=int(joint_view_generation_num_heads),
+                dropout=float(joint_view_generation_dropout),
+                bev_sigma=float(joint_view_generation_bev_sigma),
+                gate_init=float(joint_view_generation_gate_init),
+            )
 
         if freeze_base:
             for param in self.vae.parameters():
@@ -451,6 +528,9 @@ class SatelliteConditionedSDModel(nn.Module):
 
         for param in self.satellite_encoder.parameters():
             param.requires_grad = True
+        if self.cross_view_refiner is not None:
+            for param in self.cross_view_refiner.parameters():
+                param.requires_grad = True
 
         logger.info("[SatelliteConditionedSDModel] Initialized")
         logger.info(f"  UNet trainable params: {sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
@@ -467,7 +547,38 @@ class SatelliteConditionedSDModel(nn.Module):
         logger.info(f"  Query geometry score enabled: {bool(getattr(self.unet, 'query_geometry_score_enabled', False))}")
         logger.info(f"  Attention alignment enabled: {self.attention_alignment_enabled}")
         logger.info(f"  Attention alignment loss weight: {self.attention_alignment_loss_weight:g}")
+        logger.info(f"  Transition auxiliary enabled: {self.transition_aux_enabled}")
+        logger.info(f"  Transition auxiliary loss weight: {self.transition_aux_loss_weight:g}")
+        logger.info(f"  Transition auxiliary source: {self.transition_aux_source}")
+        logger.info(f"  Joint view generation enabled: {self.joint_view_generation_enabled}")
+        logger.info(f"  Joint view generation loss weight: {self.joint_view_generation_loss_weight:g}")
         logger.info(f"  Condition dropout: {self.cond_drop_prob}")
+
+    def set_transition_aux_runtime_scale(self, scale: float) -> None:
+        self.transition_aux_runtime_scale = float(scale)
+
+    def _effective_transition_aux_weight(self) -> float:
+        if (
+            not self.training
+            or not bool(getattr(self, "transition_aux_enabled", False))
+            or getattr(self, "transition_head", None) is None
+        ):
+            return 0.0
+        return float(self.transition_aux_loss_weight) * float(getattr(self, "transition_aux_runtime_scale", 1.0))
+
+    def set_joint_view_generation_runtime_scale(self, scale: float) -> None:
+        self.joint_view_generation_runtime_scale = float(scale)
+
+    def _effective_joint_view_generation_weight(self) -> float:
+        if (
+            not self.training
+            or not bool(getattr(self, "joint_view_generation_enabled", False))
+            or getattr(self, "cross_view_refiner", None) is None
+        ):
+            return 0.0
+        return float(self.joint_view_generation_loss_weight) * float(
+            getattr(self, "joint_view_generation_runtime_scale", 1.0)
+        )
 
     def encode_satellite(
         self,
@@ -495,6 +606,15 @@ class SatelliteConditionedSDModel(nn.Module):
     @staticmethod
     def _normalize_images_for_vae(images: torch.Tensor) -> torch.Tensor:
         return images * 2.0 - 1.0
+
+    def _encode_images_to_latent_mode(self, images: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            image_latents = self.vae.encode(self._normalize_images_for_vae(images)).latent_dist
+            if hasattr(image_latents, "mode"):
+                latents = image_latents.mode()
+            else:
+                latents = image_latents.sample()
+            return latents * self.vae.config.scaling_factor
 
     @staticmethod
     def _expand_condition_mask(condition_mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -537,12 +657,88 @@ class SatelliteConditionedSDModel(nn.Module):
             ),
         )
 
+    @staticmethod
+    def _repeat_satellite_state_for_views(
+        sat_state: SatelliteMemoryState,
+        num_views: int,
+    ) -> SatelliteMemoryState:
+        def repeat_optional(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return None if tensor is None else tensor.repeat_interleave(int(num_views), dim=0)
+
+        return SatelliteMemoryState(
+            tokens=sat_state.tokens.repeat_interleave(int(num_views), dim=0),
+            xy=sat_state.xy.repeat_interleave(int(num_views), dim=0),
+            bev_coords=repeat_optional(sat_state.bev_coords),
+            perspective_uv=repeat_optional(sat_state.perspective_uv),
+            perspective_valid=repeat_optional(sat_state.perspective_valid),
+        )
+
+    @staticmethod
+    def _flatten_group_tensor(
+        name: str,
+        tensor: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        num_views: int,
+        trailing_dims: Tuple[int, ...],
+    ) -> torch.Tensor:
+        if tensor is None:
+            raise ValueError(f"pose-chain group forward requires {name}")
+        expected_group_ndim = 2 + len(trailing_dims)
+        expected_single_ndim = 1 + len(trailing_dims)
+        if tensor.ndim == expected_group_ndim:
+            if int(tensor.shape[0]) != batch_size or int(tensor.shape[1]) != num_views:
+                raise ValueError(
+                    f"{name} must start with [B,V], got {list(tensor.shape)} "
+                    f"for B={batch_size}, V={num_views}"
+                )
+            return tensor.reshape(batch_size * num_views, *trailing_dims)
+        if tensor.ndim == expected_single_ndim:
+            if int(tensor.shape[0]) != batch_size:
+                raise ValueError(
+                    f"{name} must start with [B], got {list(tensor.shape)} for B={batch_size}"
+                )
+            return tensor.repeat_interleave(num_views, dim=0).reshape(batch_size * num_views, *trailing_dims)
+        raise ValueError(
+            f"{name} must be [B,V{''.join(',' + str(d) for d in trailing_dims)}] "
+            f"or [B{''.join(',' + str(d) for d in trailing_dims)}], got {list(tensor.shape)}"
+        )
+
+    def _project_group_satellite_state(
+        self,
+        sat_state: SatelliteMemoryState,
+        *,
+        K: torch.Tensor,
+        T_cam_to_world: torch.Tensor,
+        T_imu_to_world: torch.Tensor,
+        camera_height_m: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> SatelliteMemoryState:
+        if sat_state.bev_coords is None:
+            raise ValueError("pose-chain group forward requires satellite bev_coords")
+        image_h, image_w = int(image_size[0]), int(image_size[1])
+        perspective_uv, perspective_valid = compute_sat_patch_perspective_uv(
+            bev_coords=sat_state.bev_coords,
+            K=K,
+            T_cam_to_world=T_cam_to_world,
+            T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
+            image_w=image_w,
+            image_h=image_h,
+        )
+        return sat_state.replace(
+            perspective_uv=perspective_uv,
+            perspective_valid=perspective_valid,
+        )
+
     def _build_cross_attention_kwargs(
         self,
         reference: torch.Tensor,
         sat_state: SatelliteMemoryState,
+        *,
+        chain_group_size: Optional[int] = None,
     ):
-        alignment_active = bool(getattr(self, "attention_alignment_enabled", False)) and self.training
+        alignment_active = bool(getattr(self, "attention_alignment_enabled", False))
         attention_debug_active = bool(
             hasattr(self.unet, "is_attention_debug_enabled") and self.unet.is_attention_debug_enabled()
         )
@@ -572,6 +768,8 @@ class SatelliteConditionedSDModel(nn.Module):
                 "losses": [],
                 "metrics": [],
             }
+            if chain_group_size is not None:
+                kwargs["attention_alignment"]["chain_group_size"] = int(chain_group_size)
         return kwargs
 
     def _aggregate_attention_alignment(
@@ -657,6 +855,9 @@ class SatelliteConditionedSDModel(nn.Module):
             "semantic_score_alpha",
             "semantic_score_raw_std",
             "semantic_score_bias_std",
+            "chain_attention_coverage_overlap",
+            "chain_attention_centroid_shift",
+            "chain_attention_valid_pair_ratio",
         ):
             values = [
                 entry[metric_name].to(device=reference.device).float()
@@ -667,6 +868,353 @@ class SatelliteConditionedSDModel(nn.Module):
                 metrics[metric_name] = torch.stack(values).mean().to(dtype=reference.dtype)
 
         return alignment_loss, metrics
+
+    def _compute_transition_auxiliary(
+        self,
+        *,
+        source_latents: torch.Tensor,
+        target_latents: torch.Tensor,
+        sat_state: SatelliteMemoryState,
+        batch: Dict[str, Any],
+        image_hw: Tuple[int, int],
+        reference: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        transition_head = getattr(self, "transition_head", None)
+        if not bool(getattr(self, "transition_aux_enabled", False)) or transition_head is None:
+            zero = reference * 0.0
+            return {
+                "transition_aux_loss": zero,
+                "transition_aux_weighted_loss": zero,
+                "transition_aux_weight": zero,
+            }
+
+        outputs = compute_transition_auxiliary_outputs(
+            transition_head,
+            source_latents=source_latents,
+            target_latents=target_latents,
+            sat_state=sat_state,
+            batch=batch,
+            image_hw=image_hw,
+            cycle_weight=float(self.transition_aux_cycle_weight),
+            composition_weight=float(self.transition_aux_composition_weight),
+            mse_weight=float(self.transition_aux_mse_weight),
+        )
+        weight = torch.tensor(
+            float(self._effective_transition_aux_weight()),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        transition_loss = outputs["loss"].to(device=reference.device, dtype=reference.dtype)
+        return {
+            "transition_aux_loss": transition_loss,
+            "transition_aux_weighted_loss": transition_loss * weight,
+            "transition_aux_weight": weight,
+            "transition_aux_transition_loss": outputs["transition_loss"].to(device=reference.device, dtype=reference.dtype),
+            "transition_aux_front_to_side_loss": outputs["front_to_side_loss"].to(device=reference.device, dtype=reference.dtype),
+            "transition_aux_side_to_side_loss": outputs["side_to_side_loss"].to(device=reference.device, dtype=reference.dtype),
+            "transition_aux_cycle_loss": outputs["cycle_loss"].to(device=reference.device, dtype=reference.dtype),
+            "transition_aux_composition_loss": outputs["composition_loss"].to(device=reference.device, dtype=reference.dtype),
+            "transition_aux_num_pairs": outputs["num_pairs"].to(device=reference.device, dtype=reference.dtype),
+            "transition_aux_source_predicted_x0": torch.tensor(
+                float(self.transition_aux_source == TRANSITION_AUX_SOURCE_PREDICTED_X0),
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
+        }
+
+    def _predict_original_sample(
+        self,
+        *,
+        noisy_latents: torch.Tensor,
+        model_pred: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        prediction_type = str(getattr(self.noise_scheduler.config, "prediction_type", "epsilon"))
+        if prediction_type == "sample":
+            return model_pred
+
+        alphas_cumprod = getattr(self.noise_scheduler, "alphas_cumprod", None)
+        if alphas_cumprod is None:
+            if prediction_type == "epsilon":
+                return noisy_latents - model_pred
+            raise ValueError(
+                f"Cannot compute predicted x0 for prediction_type={prediction_type!r} "
+                "because the scheduler does not expose alphas_cumprod"
+            )
+
+        alpha_prod_t = alphas_cumprod.to(device=noisy_latents.device, dtype=torch.float32).index_select(
+            0,
+            timesteps.to(device=noisy_latents.device, dtype=torch.long),
+        )
+        while alpha_prod_t.ndim < noisy_latents.ndim:
+            alpha_prod_t = alpha_prod_t.unsqueeze(-1)
+        beta_prod_t = (1.0 - alpha_prod_t).clamp_min(0.0)
+        sample = noisy_latents.float()
+        pred = model_pred.float()
+
+        if prediction_type == "epsilon":
+            pred_x0 = (sample - beta_prod_t.sqrt() * pred) / alpha_prod_t.sqrt().clamp_min(1e-8)
+        elif prediction_type == "v_prediction":
+            pred_x0 = alpha_prod_t.sqrt() * sample - beta_prod_t.sqrt() * pred
+        else:
+            raise ValueError(
+                f"prediction_type must be one of 'epsilon', 'sample', or 'v_prediction', got {prediction_type!r}"
+            )
+        return pred_x0.to(dtype=model_pred.dtype)
+
+    def _predict_model_output_from_original_sample(
+        self,
+        *,
+        noisy_latents: torch.Tensor,
+        pred_x0: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        prediction_type = str(getattr(self.noise_scheduler.config, "prediction_type", "epsilon"))
+        if prediction_type == "sample":
+            return pred_x0
+
+        alphas_cumprod = getattr(self.noise_scheduler, "alphas_cumprod", None)
+        if alphas_cumprod is None:
+            if prediction_type == "epsilon":
+                return noisy_latents - pred_x0
+            raise ValueError(
+                f"Cannot convert refined x0 to prediction_type={prediction_type!r} "
+                "because the scheduler does not expose alphas_cumprod"
+            )
+
+        alpha_prod_t = alphas_cumprod.to(device=noisy_latents.device, dtype=torch.float32).index_select(
+            0,
+            timesteps.to(device=noisy_latents.device, dtype=torch.long),
+        )
+        while alpha_prod_t.ndim < noisy_latents.ndim:
+            alpha_prod_t = alpha_prod_t.unsqueeze(-1)
+        beta_prod_t = (1.0 - alpha_prod_t).clamp_min(0.0)
+        sample = noisy_latents.float()
+        x0 = pred_x0.float()
+
+        if prediction_type == "epsilon":
+            model_output = (sample - alpha_prod_t.sqrt() * x0) / beta_prod_t.sqrt().clamp_min(1e-8)
+        elif prediction_type == "v_prediction":
+            model_output = (alpha_prod_t.sqrt() * sample - x0) / beta_prod_t.sqrt().clamp_min(1e-8)
+        else:
+            raise ValueError(
+                f"prediction_type must be one of 'epsilon', 'sample', or 'v_prediction', got {prediction_type!r}"
+            )
+        return model_output.to(dtype=pred_x0.dtype)
+
+    def _sample_training_timesteps(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        chain_group_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        if (
+            bool(getattr(self, "joint_view_generation_enabled", False))
+            and chain_group_size is not None
+            and int(chain_group_size) > 1
+        ):
+            group_size = int(chain_group_size)
+            if batch_size % group_size != 0:
+                raise ValueError(
+                    f"Flattened batch_size={batch_size} must be divisible by chain_group_size={group_size}"
+                )
+            group_count = batch_size // group_size
+            group_timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (group_count,),
+                device=device,
+                dtype=torch.long,
+            )
+            return group_timesteps.repeat_interleave(group_size, dim=0)
+        return torch.randint(
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (batch_size,),
+            device=device,
+            dtype=torch.long,
+        )
+
+    def _forward_denoising_with_sat_state(
+        self,
+        target_images: torch.Tensor,
+        sat_state: SatelliteMemoryState,
+        *,
+        condition_mask: Optional[torch.Tensor] = None,
+        chain_group_size: Optional[int] = None,
+        vehicle_yaw_degs: Optional[torch.Tensor] = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size = target_images.shape[0]
+        if condition_mask is None:
+            condition_mask = self._sample_condition_mask(
+                batch_size=batch_size,
+                device=target_images.device,
+            )
+        conditioned_sat_state = self._apply_condition_dropout(sat_state, condition_mask)
+
+        with torch.no_grad():
+            target_images_vae = self._normalize_images_for_vae(target_images)
+            latents = self.vae.encode(target_images_vae).latent_dist.sample()
+            latents = latents * self.vae.config.scaling_factor
+
+        noise = torch.randn_like(latents)
+        timesteps = self._sample_training_timesteps(
+            batch_size=batch_size,
+            device=target_images.device,
+            chain_group_size=chain_group_size,
+        )
+        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+        cross_attention_kwargs = self._build_cross_attention_kwargs(
+            noisy_latents,
+            conditioned_sat_state,
+            chain_group_size=chain_group_size,
+        )
+        attention_alignment = (
+            cross_attention_kwargs.get("attention_alignment")
+            if isinstance(cross_attention_kwargs, dict)
+            else None
+        )
+        base_model_pred = self.unet(
+            noisy_latents,
+            timesteps,
+            sat_tokens=conditioned_sat_state.tokens,
+            cross_attention_kwargs=cross_attention_kwargs,
+        ).sample
+
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+        base_pred_x0_latents = self._predict_original_sample(
+            noisy_latents=noisy_latents,
+            model_pred=base_model_pred,
+            timesteps=timesteps,
+        )
+        pred_x0_latents = base_pred_x0_latents
+        model_pred = base_model_pred
+        joint_consistency_loss = base_model_pred.sum() * 0.0
+        joint_weight = torch.tensor(0.0, device=base_model_pred.device, dtype=base_model_pred.dtype)
+        joint_metrics: Dict[str, torch.Tensor] = {
+            "joint_view_generation_source_refined_x0": torch.tensor(
+                0.0, device=base_model_pred.device, dtype=base_model_pred.dtype
+            ),
+            "joint_view_generation_consistency_loss": joint_consistency_loss,
+            "joint_view_generation_weighted_loss": joint_consistency_loss,
+            "joint_view_generation_weight": joint_weight,
+        }
+        cross_view_refiner = getattr(self, "cross_view_refiner", None)
+        if (
+            bool(getattr(self, "joint_view_generation_enabled", False))
+            and cross_view_refiner is not None
+            and chain_group_size is not None
+            and int(chain_group_size) > 1
+        ):
+            group_size = int(chain_group_size)
+            if batch_size % group_size != 0:
+                raise ValueError(
+                    f"Flattened batch_size={batch_size} must be divisible by chain_group_size={group_size}"
+                )
+            group_count = batch_size // group_size
+            refiner_output = cross_view_refiner(
+                base_pred_x0_latents.reshape(group_count, group_size, *base_pred_x0_latents.shape[1:]),
+                target_latents=latents.reshape(group_count, group_size, *latents.shape[1:]),
+                vehicle_yaw_degs=vehicle_yaw_degs,
+                front_bev_xy=front_bev_xy,
+                front_ground_valid_mask=front_ground_valid_mask,
+            )
+            pred_x0_latents = refiner_output.refined_x0.reshape_as(base_pred_x0_latents)
+            model_pred = self._predict_model_output_from_original_sample(
+                noisy_latents=noisy_latents,
+                pred_x0=pred_x0_latents,
+                timesteps=timesteps,
+            )
+            joint_consistency_loss = refiner_output.consistency_loss.to(device=model_pred.device, dtype=model_pred.dtype)
+            joint_weight = torch.tensor(
+                float(self._effective_joint_view_generation_weight()),
+                device=model_pred.device,
+                dtype=model_pred.dtype,
+            )
+            joint_metrics = {
+                "joint_view_generation_source_refined_x0": torch.tensor(
+                    1.0, device=model_pred.device, dtype=model_pred.dtype
+                ),
+                "joint_view_generation_consistency_loss": joint_consistency_loss,
+                "joint_view_generation_weighted_loss": joint_consistency_loss * joint_weight,
+                "joint_view_generation_weight": joint_weight,
+            }
+            for key, value in refiner_output.metrics.items():
+                normalized_key = key.replace("/", "_").replace("=", "_")
+                joint_metrics[normalized_key] = value.to(device=model_pred.device, dtype=model_pred.dtype)
+
+        per_item_denoise_loss = (model_pred.float() - target.float()).pow(2).mean(dim=(1, 2, 3))
+        denoise_loss = per_item_denoise_loss.mean().to(dtype=model_pred.dtype)
+        alignment_loss, alignment_metrics = self._aggregate_attention_alignment(
+            attention_alignment,
+            reference=denoise_loss,
+        )
+        captured_alignment_losses = (
+            attention_alignment.get("losses", [])
+            if isinstance(attention_alignment, dict)
+            else []
+        )
+        alignment_requested = (
+            isinstance(attention_alignment, dict)
+            and bool(attention_alignment.get("enabled", False))
+        )
+        alignment_loss_is_differentiable = any(
+            torch.is_tensor(loss_value) and bool(loss_value.requires_grad)
+            for loss_value in captured_alignment_losses
+        )
+        effective_alignment_weight = float(getattr(self, "attention_alignment_loss_weight", 0.0))
+        if not alignment_requested or not self.training:
+            effective_alignment_weight = 0.0
+        elif effective_alignment_weight > 0.0 and not alignment_loss_is_differentiable:
+            effective_alignment_weight = 0.0
+            if not getattr(self, "_logged_nondifferentiable_alignment_loss", False):
+                logger.warning(
+                    "Attention alignment loss is being logged but not added to the objective because "
+                    "the captured tensors are non-differentiable. This usually happens with UNet gradient "
+                    "checkpointing; disable gradient_checkpointing or use a smaller batch to train with this loss."
+                )
+                self._logged_nondifferentiable_alignment_loss = True
+        loss = (
+            denoise_loss
+            + float(effective_alignment_weight) * alignment_loss
+            + joint_metrics["joint_view_generation_weighted_loss"]
+        )
+        result = {
+            "loss": loss,
+            "denoise_loss": denoise_loss,
+            "per_item_denoise_loss": per_item_denoise_loss.to(dtype=loss.dtype),
+            "attention_alignment_loss": alignment_loss,
+            "attention_alignment_loss_weight": torch.tensor(
+                float(effective_alignment_weight),
+                device=loss.device,
+                dtype=loss.dtype,
+            ),
+            "attention_alignment_loss_is_differentiable": torch.tensor(
+                float(alignment_loss_is_differentiable),
+                device=loss.device,
+                dtype=loss.dtype,
+            ),
+            "model_pred": model_pred,
+            "base_model_pred": base_model_pred,
+            "base_pred_x0_latents": base_pred_x0_latents,
+            "pred_x0_latents": pred_x0_latents,
+            "target": target,
+            "timesteps": timesteps,
+            "sat_state": conditioned_sat_state,
+            "condition_mask": condition_mask,
+        }
+        result.update(joint_metrics)
+        for key, value in alignment_metrics.items():
+            result[f"attention_alignment_{key}"] = value
+        return result
 
     @staticmethod
     def _zero_sat_geometry(sat_state: SatelliteMemoryState) -> SatelliteMemoryState:
@@ -849,6 +1397,173 @@ class SatelliteConditionedSDModel(nn.Module):
         )
         return generated_images
 
+    @torch.no_grad()
+    def generate_pose_chain(
+        self,
+        sat_images: torch.Tensor,
+        *,
+        K: torch.Tensor,
+        T_cam_to_world: torch.Tensor,
+        T_imu_to_world: torch.Tensor,
+        camera_height_m: torch.Tensor,
+        vehicle_yaw_degs: Optional[torch.Tensor] = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
+        target_size: Optional[Tuple[int, int]] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        generator: Optional[torch.Generator] = None,
+        sat_condition_mode: str = "normal",
+    ) -> torch.Tensor:
+        """Jointly sample a fixed pose chain with the cross-view refiner."""
+        if K.ndim != 4:
+            raise ValueError(f"generate_pose_chain expects grouped K [B,V,3,3], got {list(K.shape)}")
+        batch_size, num_views = int(K.shape[0]), int(K.shape[1])
+        if int(sat_images.shape[0]) != batch_size:
+            raise ValueError(f"sat_images batch {sat_images.shape[0]} does not match K batch {batch_size}")
+
+        image_h, image_w = self._infer_generation_size(target_size=target_size)
+        target_size = (image_h, image_w)
+        base_sat_state = self.encode_satellite(sat_images, image_size=None)
+        view_sat_state = self._repeat_satellite_state_for_views(base_sat_state, num_views=num_views)
+        view_sat_state = self._project_group_satellite_state(
+            view_sat_state,
+            K=self._flatten_group_tensor("K", K, batch_size=batch_size, num_views=num_views, trailing_dims=(3, 3)),
+            T_cam_to_world=self._flatten_group_tensor(
+                "T_cam_to_world",
+                T_cam_to_world,
+                batch_size=batch_size,
+                num_views=num_views,
+                trailing_dims=(4, 4),
+            ),
+            T_imu_to_world=self._flatten_group_tensor(
+                "T_imu_to_world",
+                T_imu_to_world,
+                batch_size=batch_size,
+                num_views=num_views,
+                trailing_dims=(4, 4),
+            ),
+            camera_height_m=self._flatten_group_tensor(
+                "camera_height_m",
+                camera_height_m,
+                batch_size=batch_size,
+                num_views=num_views,
+                trailing_dims=(),
+            ),
+            image_size=target_size,
+        )
+
+        flat_batch = batch_size * num_views
+        device = view_sat_state.tokens.device
+        if sat_condition_mode == "normal":
+            condition_mask = torch.ones(flat_batch, device=device, dtype=torch.bool)
+        elif sat_condition_mode == "zero":
+            condition_mask = torch.zeros(flat_batch, device=device, dtype=torch.bool)
+        else:
+            raise ValueError(f"Unknown sat_condition_mode: {sat_condition_mode}")
+        view_sat_state = self._apply_condition_dropout(view_sat_state, condition_mask)
+
+        vae_scale_factor = self._get_vae_scale_factor()
+        latent_h = max(1, (image_h + vae_scale_factor - 1) // vae_scale_factor)
+        latent_w = max(1, (image_w + vae_scale_factor - 1) // vae_scale_factor)
+        unet_param = next(self.unet.parameters(), None)
+        latent_dtype = unet_param.dtype if unet_param is not None else view_sat_state.tokens.dtype
+
+        latents = torch.randn(
+            (flat_batch, self.unet.config.in_channels, latent_h, latent_w),
+            device=device,
+            dtype=latent_dtype,
+            generator=generator,
+        )
+
+        use_cfg = guidance_scale > 1.0
+        if use_cfg:
+            cfg_sat_state = self._build_cfg_sat_state(view_sat_state)
+
+        self.noise_scheduler.set_timesteps(num_inference_steps)
+        cross_view_refiner = getattr(self, "cross_view_refiner", None)
+
+        for t in self.noise_scheduler.timesteps:
+            if torch.is_tensor(t):
+                timestep_tensor = t.to(device=device, dtype=torch.long).reshape(1).expand(flat_batch)
+            else:
+                timestep_tensor = torch.full((flat_batch,), int(t), device=device, dtype=torch.long)
+
+            if use_cfg:
+                latent_model_input = torch.cat([latents, latents], dim=0)
+                cfg_timestep = torch.cat([timestep_tensor, timestep_tensor], dim=0)
+                cross_attention_kwargs = self._build_cross_attention_kwargs(
+                    latent_model_input,
+                    cfg_sat_state,
+                    chain_group_size=num_views,
+                )
+                model_pred_both = self.unet(
+                    latent_model_input,
+                    cfg_timestep,
+                    sat_tokens=cfg_sat_state.tokens,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                ).sample
+                model_pred_cond, model_pred_uncond = model_pred_both.chunk(2, dim=0)
+                model_pred = model_pred_uncond + guidance_scale * (model_pred_cond - model_pred_uncond)
+            else:
+                cross_attention_kwargs = self._build_cross_attention_kwargs(
+                    latents,
+                    view_sat_state,
+                    chain_group_size=num_views,
+                )
+                model_pred = self.unet(
+                    latents,
+                    timestep_tensor,
+                    sat_tokens=view_sat_state.tokens,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                ).sample
+
+            if (
+                bool(getattr(self, "joint_view_generation_enabled", False))
+                and cross_view_refiner is not None
+                and num_views > 1
+            ):
+                pred_x0 = self._predict_original_sample(
+                    noisy_latents=latents,
+                    model_pred=model_pred,
+                    timesteps=timestep_tensor,
+                )
+                refiner_output = cross_view_refiner(
+                    pred_x0.reshape(batch_size, num_views, *pred_x0.shape[1:]),
+                    vehicle_yaw_degs=vehicle_yaw_degs,
+                    front_bev_xy=front_bev_xy,
+                    front_ground_valid_mask=front_ground_valid_mask,
+                )
+                model_pred = self._predict_model_output_from_original_sample(
+                    noisy_latents=latents,
+                    pred_x0=refiner_output.refined_x0.reshape_as(pred_x0),
+                    timesteps=timestep_tensor,
+                )
+
+            if generator is not None:
+                try:
+                    latents = self.noise_scheduler.step(model_pred, t, latents, generator=generator).prev_sample
+                except TypeError:
+                    latents = self.noise_scheduler.step(model_pred, t, latents).prev_sample
+            else:
+                latents = self.noise_scheduler.step(model_pred, t, latents).prev_sample
+
+        vae_param = next(self.vae.parameters(), None)
+        vae_dtype = vae_param.dtype if vae_param is not None else latents.dtype
+        decode_latents = (latents / self.vae.config.scaling_factor).to(dtype=vae_dtype)
+        generated_images = self.vae.decode(decode_latents).sample
+        generated_images = (generated_images / 2 + 0.5).clamp(0, 1)
+
+        if generated_images.shape[-2:] != target_size:
+            generated_images = F.interpolate(
+                generated_images,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        return generated_images.reshape(batch_size, num_views, *generated_images.shape[1:])
+
     def forward(
         self,
         sat_images: torch.Tensor,
@@ -858,11 +1573,122 @@ class SatelliteConditionedSDModel(nn.Module):
         T_cam_to_world: Optional[torch.Tensor] = None,
         T_imu_to_world: Optional[torch.Tensor] = None,
         camera_height_m: Optional[torch.Tensor] = None,
+        vehicle_yaw_degs: Optional[torch.Tensor] = None,
+        view_names: Optional[Any] = None,
+        front_bev_xy: Optional[torch.Tensor] = None,
+        front_ground_valid_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        if target_images.ndim == 5:
+            batch_size, num_views = int(target_images.shape[0]), int(target_images.shape[1])
+            flat_target_images = target_images.reshape(batch_size * num_views, *target_images.shape[2:])
+            target_size = tuple(int(x) for x in flat_target_images.shape[-2:])
+
+            base_sat_state = self.encode_satellite(
+                sat_images,
+                image_size=None,
+            )
+            view_sat_state = self._repeat_satellite_state_for_views(
+                base_sat_state,
+                num_views=num_views,
+            )
+            flat_K = self._flatten_group_tensor(
+                "K",
+                K,
+                batch_size=batch_size,
+                num_views=num_views,
+                trailing_dims=(3, 3),
+            )
+            flat_T_cam_to_world = self._flatten_group_tensor(
+                "T_cam_to_world",
+                T_cam_to_world,
+                batch_size=batch_size,
+                num_views=num_views,
+                trailing_dims=(4, 4),
+            )
+            flat_T_imu_to_world = self._flatten_group_tensor(
+                "T_imu_to_world",
+                T_imu_to_world,
+                batch_size=batch_size,
+                num_views=num_views,
+                trailing_dims=(4, 4),
+            )
+            flat_camera_height_m = self._flatten_group_tensor(
+                "camera_height_m",
+                camera_height_m,
+                batch_size=batch_size,
+                num_views=num_views,
+                trailing_dims=(),
+            )
+            view_sat_state = self._project_group_satellite_state(
+                view_sat_state,
+                K=flat_K,
+                T_cam_to_world=flat_T_cam_to_world,
+                T_imu_to_world=flat_T_imu_to_world,
+                camera_height_m=flat_camera_height_m,
+                image_size=target_size,
+            )
+            group_condition_mask = self._sample_condition_mask(
+                batch_size=batch_size,
+                device=target_images.device,
+            ).repeat_interleave(num_views, dim=0)
+            denoising_kwargs: Dict[str, Any] = {}
+            if bool(getattr(self, "joint_view_generation_enabled", False)):
+                denoising_kwargs.update(
+                    {
+                        "vehicle_yaw_degs": vehicle_yaw_degs,
+                        "front_bev_xy": front_bev_xy,
+                        "front_ground_valid_mask": front_ground_valid_mask,
+                    }
+                )
+            result = self._forward_denoising_with_sat_state(
+                flat_target_images,
+                view_sat_state,
+                condition_mask=group_condition_mask,
+                chain_group_size=num_views,
+                **denoising_kwargs,
+            )
+            if bool(getattr(self, "transition_aux_enabled", False)) and getattr(self, "transition_head", None) is not None:
+                transition_target_latents = self._encode_images_to_latent_mode(flat_target_images)
+                if self.transition_aux_source == TRANSITION_AUX_SOURCE_PREDICTED_X0:
+                    transition_source_latents = result["pred_x0_latents"]
+                else:
+                    transition_source_latents = transition_target_latents
+                transition_batch: Dict[str, Any] = {
+                    "K": K,
+                    "T_cam_to_world": T_cam_to_world,
+                    "T_imu_to_world": T_imu_to_world,
+                    "camera_height_m": camera_height_m,
+                }
+                if vehicle_yaw_degs is not None:
+                    transition_batch["vehicle_yaw_degs"] = vehicle_yaw_degs
+                if view_names is not None:
+                    transition_batch["view_names"] = view_names
+                transition_outputs = self._compute_transition_auxiliary(
+                    source_latents=transition_source_latents,
+                    target_latents=transition_target_latents,
+                    sat_state=base_sat_state,
+                    batch=transition_batch,
+                    image_hw=target_size,
+                    reference=result["loss"],
+                )
+                result["loss"] = result["loss"] + transition_outputs["transition_aux_weighted_loss"]
+                result.update(transition_outputs)
+            result["chain_group_size"] = torch.tensor(
+                float(num_views),
+                device=result["loss"].device,
+                dtype=result["loss"].dtype,
+            )
+            result["per_view_denoise_loss"] = result["per_item_denoise_loss"].reshape(
+                batch_size,
+                num_views,
+            )
+            result["chain_denoise_loss"] = result["per_view_denoise_loss"].mean(dim=1)
+            return result
+
         if target_images.ndim != 4:
             raise ValueError(
-                "This experiment trains one random-yaw street view per sample; "
-                f"target_images must be [B,C,H,W], got {list(target_images.shape)}"
+                "target_images must be [B,C,H,W] for single-view training or "
+                f"[B,V,C,H,W] for pose-chain group training, got {list(target_images.shape)}"
             )
 
         sat_state = self.encode_satellite(
@@ -874,97 +1700,7 @@ class SatelliteConditionedSDModel(nn.Module):
             image_size=tuple(int(x) for x in target_images.shape[-2:]),
         )
 
-        batch_size = target_images.shape[0]
-        condition_mask = self._sample_condition_mask(batch_size=batch_size, device=target_images.device)
-        conditioned_sat_state = self._apply_condition_dropout(sat_state, condition_mask)
-
-        with torch.no_grad():
-            target_images_vae = self._normalize_images_for_vae(target_images)
-            latents = self.vae.encode(target_images_vae).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
-
-        noise = torch.randn_like(latents)
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (batch_size,),
-            device=target_images.device,
-            dtype=torch.long,
-        )
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-        cross_attention_kwargs = self._build_cross_attention_kwargs(noisy_latents, conditioned_sat_state)
-        attention_alignment = (
-            cross_attention_kwargs.get("attention_alignment")
-            if isinstance(cross_attention_kwargs, dict)
-            else None
-        )
-        model_pred = self.unet(
-            noisy_latents,
-            timesteps,
-            sat_tokens=conditioned_sat_state.tokens,
-            cross_attention_kwargs=cross_attention_kwargs,
-        ).sample
-
-        if self.noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif self.noise_scheduler.config.prediction_type == "v_prediction":
-            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-        else:
-            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-
-        denoise_loss = F.mse_loss(model_pred, target, reduction="mean")
-        alignment_loss, alignment_metrics = self._aggregate_attention_alignment(
-            attention_alignment,
-            reference=denoise_loss,
-        )
-        captured_alignment_losses = (
-            attention_alignment.get("losses", [])
-            if isinstance(attention_alignment, dict)
-            else []
-        )
-        alignment_requested = (
-            isinstance(attention_alignment, dict)
-            and bool(attention_alignment.get("enabled", False))
-        )
-        alignment_loss_is_differentiable = any(
-            torch.is_tensor(loss_value) and bool(loss_value.requires_grad)
-            for loss_value in captured_alignment_losses
-        )
-        effective_alignment_weight = float(getattr(self, "attention_alignment_loss_weight", 0.0))
-        if not alignment_requested:
-            effective_alignment_weight = 0.0
-        elif effective_alignment_weight > 0.0 and not alignment_loss_is_differentiable:
-            effective_alignment_weight = 0.0
-            if not getattr(self, "_logged_nondifferentiable_alignment_loss", False):
-                logger.warning(
-                    "Attention alignment loss is being logged but not added to the objective because "
-                    "the captured tensors are non-differentiable. This usually happens with UNet gradient "
-                    "checkpointing; disable gradient_checkpointing or use a smaller batch to train with this loss."
-                )
-                self._logged_nondifferentiable_alignment_loss = True
-        loss = denoise_loss + float(effective_alignment_weight) * alignment_loss
-        result = {
-            "loss": loss,
-            "denoise_loss": denoise_loss,
-            "attention_alignment_loss": alignment_loss,
-            "attention_alignment_loss_weight": torch.tensor(
-                float(effective_alignment_weight),
-                device=loss.device,
-                dtype=loss.dtype,
-            ),
-            "attention_alignment_loss_is_differentiable": torch.tensor(
-                float(alignment_loss_is_differentiable),
-                device=loss.device,
-                dtype=loss.dtype,
-            ),
-            "model_pred": model_pred,
-            "target": target,
-            "sat_state": conditioned_sat_state,
-            "condition_mask": condition_mask,
-        }
-        for key, value in alignment_metrics.items():
-            result[f"attention_alignment_{key}"] = value
-        return result
+        return self._forward_denoising_with_sat_state(target_images, sat_state)
 
 
 def create_sd_model(
@@ -997,6 +1733,21 @@ def create_sd_model(
     attention_alignment_max_query_tokens: Optional[int] = 256,
     attention_alignment_valid_radius: float = 0.25,
     attention_alignment_invalid_attention_weight: float = 0.1,
+    transition_aux_enabled: bool = False,
+    transition_aux_loss_weight: float = 0.0,
+    transition_aux_cycle_weight: float = 0.1,
+    transition_aux_composition_weight: float = 0.05,
+    transition_aux_mse_weight: float = 0.1,
+    transition_aux_hidden_channels: int = 128,
+    transition_aux_action_dim: int = 128,
+    transition_aux_source: str = TRANSITION_AUX_SOURCE_GT_LATENT,
+    joint_view_generation_enabled: bool = False,
+    joint_view_generation_loss_weight: float = 0.0,
+    joint_view_generation_hidden_dim: int = 32,
+    joint_view_generation_num_heads: int = 4,
+    joint_view_generation_dropout: float = 0.0,
+    joint_view_generation_bev_sigma: float = 0.25,
+    joint_view_generation_gate_init: float = 0.0,
     satellite_encoder_config: Optional[Dict[str, Any]] = None,
 ) -> SatelliteConditionedSDModel:
     """Create a satellite-conditioned Stable Diffusion model."""
@@ -1104,5 +1855,20 @@ def create_sd_model(
         attention_alignment_max_query_tokens=attention_alignment_max_query_tokens,
         attention_alignment_valid_radius=attention_alignment_valid_radius,
         attention_alignment_invalid_attention_weight=attention_alignment_invalid_attention_weight,
+        transition_aux_enabled=transition_aux_enabled,
+        transition_aux_loss_weight=transition_aux_loss_weight,
+        transition_aux_cycle_weight=transition_aux_cycle_weight,
+        transition_aux_composition_weight=transition_aux_composition_weight,
+        transition_aux_mse_weight=transition_aux_mse_weight,
+        transition_aux_hidden_channels=transition_aux_hidden_channels,
+        transition_aux_action_dim=transition_aux_action_dim,
+        transition_aux_source=transition_aux_source,
+        joint_view_generation_enabled=joint_view_generation_enabled,
+        joint_view_generation_loss_weight=joint_view_generation_loss_weight,
+        joint_view_generation_hidden_dim=joint_view_generation_hidden_dim,
+        joint_view_generation_num_heads=joint_view_generation_num_heads,
+        joint_view_generation_dropout=joint_view_generation_dropout,
+        joint_view_generation_bev_sigma=joint_view_generation_bev_sigma,
+        joint_view_generation_gate_init=joint_view_generation_gate_init,
     )
     return model

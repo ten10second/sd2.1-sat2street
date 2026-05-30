@@ -489,6 +489,7 @@ class Kitti360dDataset(Dataset):
         # Reproducible per-item randomness (e.g. yaw sampling)
         seed: Optional[int] = None,
         view_set: str = "single",
+        pose_chains: Optional[List[Any]] = None,
         virtual_size: Tuple[int, int] = (640, 256),
         front_resize: Optional[Tuple[int, int]] = (640, 256),
         front_center_crop: Optional[Tuple[int, int]] = None,
@@ -527,6 +528,7 @@ class Kitti360dDataset(Dataset):
         self.rng = np.random.RandomState(seed) if seed is not None else None
         self.epoch = 0  # For DDP safety
         self.view_set = str(view_set)
+        self.pose_chains = self._normalize_pose_chains(pose_chains)
 
         self.front_resize = front_resize  # (W,H) if not None
         self.front_center_crop = front_center_crop  # (W,H) if not None
@@ -556,10 +558,16 @@ class Kitti360dDataset(Dataset):
             raise ValueError(f"Unknown vehicle_yaw_sampling: {self.vehicle_yaw_sampling}")
         if self.vehicle_yaw_sampling == "fixed_list" and not self.vehicle_yaw_fixed_list:
             raise ValueError("vehicle_yaw_fixed_list must be non-empty when vehicle_yaw_sampling='fixed_list'")
-        if self.view_set != "single":
+        if self.view_set not in {"single", "pose_chain"}:
             raise ValueError(
-                f"view_set='{self.view_set}' is not supported on this branch; use view_set='single'."
+                f"view_set='{self.view_set}' is not supported on this branch; "
+                "use view_set='single' or view_set='pose_chain'."
             )
+        if self.view_set == "pose_chain" and not self.pose_chains:
+            self.pose_chains = [
+                ("right", [None, 60.0, 90.0, 120.0]),
+                ("left", [None, -60.0, -90.0, -120.0]),
+            ]
         if not 0.0 <= self.front_sample_prob <= 1.0:
             raise ValueError(f"front_sample_prob must be in [0, 1], got {self.front_sample_prob}")
         # fisheye_camera can be auto-selected based on yaw; only validate when explicitly set
@@ -598,8 +606,15 @@ class Kitti360dDataset(Dataset):
             self.mode == "fisheye_virtual"
             and self.yaw_mode == "vehicle_relative"
             and self.vehicle_yaw_sampling == "fixed_list"
+            and self.view_set == "single"
         ):
             self.samples = self._expand_samples_for_fixed_vehicle_yaws(self.samples)
+        elif (
+            self.mode == "fisheye_virtual"
+            and self.yaw_mode == "vehicle_relative"
+            and self.view_set == "pose_chain"
+        ):
+            self.samples = self._expand_samples_for_pose_chains(self.samples)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -633,6 +648,46 @@ class Kitti360dDataset(Dataset):
             normalized.append(float(value))
         return normalized
 
+    @staticmethod
+    def _normalize_pose_chains(
+        chains: Optional[List[Any]],
+    ) -> List[Tuple[str, List[Optional[float]]]]:
+        if chains is None:
+            return []
+
+        normalized: List[Tuple[str, List[Optional[float]]]] = []
+        seen_names: set[str] = set()
+        for chain_index, chain in enumerate(chains):
+            if isinstance(chain, dict):
+                name = str(chain.get("name", f"chain_{chain_index}"))
+                yaw_values = chain.get("yaws", chain.get("views"))
+            else:
+                name = f"chain_{chain_index}"
+                yaw_values = chain
+            if name in seen_names:
+                raise ValueError(f"pose chain names must be unique, got duplicate '{name}'")
+            seen_names.add(name)
+            if yaw_values is None:
+                raise ValueError(f"pose chain '{name}' must define yaws/views")
+            if isinstance(yaw_values, (str, bytes)):
+                raise ValueError(f"pose chain '{name}' yaws/views must be a sequence, not a string")
+            yaws = Kitti360dDataset._normalize_vehicle_yaw_fixed_list(list(yaw_values))
+            if len(yaws) < 2:
+                raise ValueError(f"pose chain '{name}' must contain at least two views")
+            normalized.append((name, yaws))
+        chain_lengths = {len(yaws) for _, yaws in normalized}
+        if len(chain_lengths) > 1:
+            lengths = ", ".join(f"{name}={len(yaws)}" for name, yaws in normalized)
+            raise ValueError(
+                "all pose chains must contain the same number of views for "
+                f"batched pose-chain training, got {lengths}"
+            )
+        return normalized
+
+    @staticmethod
+    def _view_name_for_vehicle_yaw(yaw: Optional[float]) -> str:
+        return "front" if yaw is None else _vehicle_yaw_view_name(float(yaw))
+
     def _expand_samples_for_fixed_vehicle_yaws(
         self,
         samples: List[SampleIndex],
@@ -651,6 +706,32 @@ class Kitti360dDataset(Dataset):
                     meta["mode_override"] = "fisheye_virtual"
                     meta["view_name"] = _vehicle_yaw_view_name(yaw)
                     meta["vehicle_relative_yaw_deg_override"] = yaw
+                expanded.append(
+                    SampleIndex(
+                        drive_dir=sample.drive_dir,
+                        frame_id=sample.frame_id,
+                        meta=meta,
+                    )
+                )
+        return expanded
+
+    def _expand_samples_for_pose_chains(
+        self,
+        samples: List[SampleIndex],
+    ) -> List[SampleIndex]:
+        expanded: List[SampleIndex] = []
+        for sample in samples:
+            base_meta = dict(sample.meta or {})
+            for chain_name, chain_yaws in self.pose_chains:
+                meta = dict(base_meta)
+                meta["mode_override"] = "pose_chain"
+                meta["view_set"] = "pose_chain"
+                meta["pose_chain_name"] = str(chain_name)
+                meta["pose_chain_yaws"] = list(chain_yaws)
+                meta["pose_chain_view_names"] = [
+                    self._view_name_for_vehicle_yaw(yaw)
+                    for yaw in chain_yaws
+                ]
                 expanded.append(
                     SampleIndex(
                         drive_dir=sample.drive_dir,
@@ -944,7 +1025,7 @@ class Kitti360dDataset(Dataset):
         self._front_bev_xy_cache[key] = front_bev_xy
         return front_bev_xy
 
-    def __getitem__(self, idx: int) -> Dict:
+    def _get_single_view_item(self, idx: int) -> Dict:
         s = self.samples[idx]
         drive_dir, frame_id = s.drive_dir, s.frame_id
         view_name = self._resolve_sample_view_name(s)
@@ -1218,3 +1299,123 @@ class Kitti360dDataset(Dataset):
                 "aug": aug_meta,
             },
         }
+
+    @staticmethod
+    def _single_view_override_sample(
+        base_sample: SampleIndex,
+        view_name: str,
+        yaw_deg: Optional[float],
+    ) -> SampleIndex:
+        base_meta = dict(base_sample.meta or {})
+        for key in (
+            "mode_override",
+            "view_set",
+            "pose_chain_name",
+            "pose_chain_yaws",
+            "pose_chain_view_names",
+        ):
+            base_meta.pop(key, None)
+        base_meta["view_name"] = view_name
+        if yaw_deg is None:
+            base_meta["mode_override"] = "front"
+            base_meta.pop("vehicle_relative_yaw_deg_override", None)
+            base_meta.pop("fisheye_relative_yaw_deg_override", None)
+        else:
+            base_meta["mode_override"] = "fisheye_virtual"
+            base_meta["vehicle_relative_yaw_deg_override"] = float(yaw_deg)
+        return SampleIndex(
+            drive_dir=base_sample.drive_dir,
+            frame_id=base_sample.frame_id,
+            meta=base_meta,
+        )
+
+    @staticmethod
+    def _stack_required_tensors(items: List[Dict[str, Any]], key: str) -> torch.Tensor:
+        values = [item[key] for item in items]
+        if not all(torch.is_tensor(value) for value in values):
+            raise ValueError(f"pose-chain item key '{key}' must be tensor for every view")
+        return torch.stack(values, dim=0)
+
+    def _get_pose_chain_item(self, idx: int) -> Dict:
+        base_sample = self.samples[idx]
+        meta = dict(base_sample.meta or {})
+        chain_name = str(meta.get("pose_chain_name", "chain"))
+        chain_yaws = list(meta.get("pose_chain_yaws", []))
+        view_names = list(
+            meta.get(
+                "pose_chain_view_names",
+                [self._view_name_for_vehicle_yaw(yaw) for yaw in chain_yaws],
+            )
+        )
+        if len(chain_yaws) != len(view_names) or len(chain_yaws) < 2:
+            raise ValueError(
+                f"Invalid pose chain for frame={base_sample.frame_id}: "
+                f"yaws={chain_yaws}, view_names={view_names}"
+            )
+
+        original_sample = self.samples[idx]
+        view_items: List[Dict[str, Any]] = []
+        try:
+            for view_name, yaw_deg in zip(view_names, chain_yaws):
+                self.samples[idx] = self._single_view_override_sample(
+                    base_sample,
+                    str(view_name),
+                    yaw_deg,
+                )
+                view_items.append(self._get_single_view_item(idx))
+        finally:
+            self.samples[idx] = original_sample
+
+        first = view_items[0]
+        yaw_tensor = torch.tensor(
+            [float("nan") if yaw is None else float(yaw) for yaw in chain_yaws],
+            dtype=torch.float32,
+        )
+
+        return {
+            "image": self._stack_required_tensors(view_items, "image"),
+            "sat": first["sat"],
+            "sat_available": bool(first.get("sat_available", False)),
+            "sat_m_per_px": first.get("sat_m_per_px", self.sat_m_per_px),
+            "camera_height_m": torch.tensor(
+                [
+                    float(item["camera_height_m"].item())
+                    if torch.is_tensor(item.get("camera_height_m"))
+                    else float(item["camera_height_m"])
+                    for item in view_items
+                ],
+                dtype=torch.float32,
+            ),
+            "front_bev_xy": self._stack_required_tensors(view_items, "front_bev_xy"),
+            "front_ground_valid_mask": self._stack_required_tensors(view_items, "front_ground_valid_mask"),
+            "K": self._stack_required_tensors(view_items, "K"),
+            "T_pose_cam": self._stack_required_tensors(view_items, "T_pose_cam"),
+            "T_imu_to_world": self._stack_required_tensors(view_items, "T_imu_to_world"),
+            "T_cam0_to_world": self._stack_required_tensors(view_items, "T_cam0_to_world"),
+            "T_cam_to_world": self._stack_required_tensors(view_items, "T_cam_to_world"),
+            "frame_id": int(first["frame_id"]),
+            "drive": first["drive"],
+            "chain_name": chain_name,
+            "view_names": [str(view_name) for view_name in view_names],
+            "vehicle_yaw_degs": yaw_tensor,
+            "view_metas": [item.get("meta", {}) for item in view_items],
+            "meta": {
+                "mode": "pose_chain",
+                "requested_mode": self.mode,
+                "view_set": "pose_chain",
+                "chain_name": chain_name,
+                "view_names": [str(view_name) for view_name in view_names],
+                "vehicle_yaw_degs": [
+                    None if yaw is None else float(yaw)
+                    for yaw in chain_yaws
+                ],
+                "drive_dir": str(base_sample.drive_dir),
+            },
+        }
+
+    def __getitem__(self, idx: int) -> Dict:
+        sample = self.samples[idx]
+        meta = sample.meta if isinstance(sample.meta, dict) else {}
+        if self.view_set == "pose_chain" and "pose_chain_yaws" in meta:
+            return self._get_pose_chain_item(idx)
+        return self._get_single_view_item(idx)

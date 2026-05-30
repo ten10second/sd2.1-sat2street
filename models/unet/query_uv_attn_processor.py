@@ -762,6 +762,16 @@ class _QueryUVAttnProcessorBase(nn.Module):
         if semantic_only_scores is not None:
             score_ablation_metrics("semantic_only", semantic_only_scores)
 
+        chain_group_size = int(attention_alignment.get("chain_group_size", 0) or 0)
+        if chain_group_size >= 2 and attention_mean.shape[0] % chain_group_size == 0:
+            pair_metrics = self._build_chain_attention_pair_metrics(
+                attention_mean=attention_mean,
+                query_mask=query_mask,
+                sat_valid=sat_valid,
+                chain_group_size=chain_group_size,
+            )
+            metric_payload.update(pair_metrics)
+
         if query_pe_metrics:
             for name, value in query_pe_metrics.items():
                 if torch.is_tensor(value):
@@ -786,6 +796,59 @@ class _QueryUVAttnProcessorBase(nn.Module):
                 "query_hw": query_hw,
                 "sat_hw": self._infer_square_hw(sat_uv.shape[1]),
             }
+
+    @staticmethod
+    def _build_chain_attention_pair_metrics(
+        *,
+        attention_mean: torch.Tensor,
+        query_mask: torch.Tensor,
+        sat_valid: torch.Tensor,
+        chain_group_size: int,
+    ) -> Dict[str, torch.Tensor]:
+        batch_flat, _, num_sat_tokens = attention_mean.shape
+        num_groups = batch_flat // int(chain_group_size)
+        valid_query = query_mask.to(dtype=attention_mean.dtype).unsqueeze(-1)
+        coverage = (attention_mean.float() * valid_query.float()).sum(dim=1)
+        coverage = coverage * sat_valid.to(dtype=coverage.dtype)
+        coverage = coverage / coverage.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        coverage = coverage.reshape(num_groups, int(chain_group_size), num_sat_tokens)
+
+        left = coverage[:, :-1]
+        right = coverage[:, 1:]
+        soft_intersection = torch.minimum(left, right).sum(dim=-1)
+        soft_union = torch.maximum(left, right).sum(dim=-1)
+        valid_pairs = soft_union > 1e-6
+        if not bool(valid_pairs.any().item()):
+            zero = attention_mean.detach().new_tensor(0.0)
+            return {
+                "chain_attention_coverage_overlap": zero,
+                "chain_attention_centroid_shift": zero,
+                "chain_attention_valid_pair_ratio": zero,
+            }
+
+        overlap = soft_intersection / soft_union.clamp_min(1e-6)
+        sat_side = int(math.isqrt(num_sat_tokens))
+        if sat_side * sat_side == num_sat_tokens:
+            u = torch.linspace(
+                -1.0 + 1.0 / sat_side,
+                1.0 - 1.0 / sat_side,
+                sat_side,
+                device=coverage.device,
+                dtype=coverage.dtype,
+            )
+            yy, xx = torch.meshgrid(u, u, indexing="ij")
+            sat_xy = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+            centroids = torch.matmul(coverage, sat_xy)
+            centroid_shift = (centroids[:, 1:] - centroids[:, :-1]).pow(2).sum(dim=-1).sqrt()
+            centroid_metric = centroid_shift[valid_pairs].mean()
+        else:
+            centroid_metric = attention_mean.detach().new_tensor(0.0)
+
+        return {
+            "chain_attention_coverage_overlap": overlap[valid_pairs].mean().detach(),
+            "chain_attention_centroid_shift": centroid_metric.detach(),
+            "chain_attention_valid_pair_ratio": valid_pairs.float().mean().detach(),
+        }
 
 class QueryUVAttnProcessor2_0(_QueryUVAttnProcessorBase):
     """

@@ -6,20 +6,25 @@ device: 'cuda'
 mixed_precision: 'bf16'
 gradient_checkpointing: false
 attention_slicing: false
-output_dir: './output/wip_pitch_roll_conditioning_sync05_geometry_score'
+output_dir: './output/wip_joint_view_generation'
 
 # 数据配置
 data:
   dataset: 'kitti360'
-  data_dir: '/mnt/shizhm/KITTI-360'
-  batch_size: 8
+  data_dir: '/media/shizhm/Lenovo/KITTI-360'
+  batch_size: 2
   num_workers: 8
   image_size: [256, 256]
   sat_size: 512
   resolution: 0.2
   mode: 'fisheye_virtual'
   yaw_mode: 'vehicle_relative'
-  view_set: 'single'
+  view_set: 'pose_chain'
+  pose_chains:
+    - name: 'right'
+      yaws: ['front', 60.0, 90.0, 120.0]
+    - name: 'left'
+      yaws: ['front', -60.0, -90.0, -120.0]
   vehicle_yaw_min_deg: 60.0
   vehicle_yaw_max_deg: 120.0
   vehicle_yaw_sampling: 'fixed_list'
@@ -99,20 +104,45 @@ training:
     valid_radius: 0.25
     invalid_attention_weight: 0.1
 
+  # Joint fixed-chain generation. UNet predicts per-view x0, then adjacent views
+  # exchange pose-aware latent messages before the main diffusion loss is computed.
+  joint_view_generation:
+    enable: true
+    loss_weight: 0.05
+    hidden_dim: 32
+    num_heads: 4
+    dropout: 0.0
+    bev_sigma: 0.25
+    gate_init: 0.0
+
+  # Keep the previous transition auxiliary off in v1 so attribution belongs to
+  # the joint refiner and its own consistency metrics.
+  transition_aux:
+    enable: false
+    source: predicted_x0
+    loss_weight: 0.05
+    warmup_steps: 1000
+    cycle_weight: 0.1
+    composition_weight: 0.05
+    mse_weight: 0.1
+    hidden_channels: 128
+    action_dim: 128
+    lr_multiplier: 3.0
+
 # 保存配置
 checkpoint:
-  save_dir: './output/wip_pitch_roll_conditioning_sync05_geometry_score/checkpoints'
+  save_dir: './output/wip_joint_view_generation/checkpoints'
   save_every: 20
   max_checkpoints: 5
   resume_from: null
 
 # 日志配置
 logging:
-  log_dir: './output/wip_pitch_roll_conditioning_sync05_geometry_score/logs'
+  log_dir: './output/wip_joint_view_generation/logs'
   log_every: 100
   use_wandb: true
   project_name: 'kitti360_sd'
-  tensorboard_log_dir: './output/wip_pitch_roll_conditioning_sync03_geometry_score/tensorboard'
+  tensorboard_log_dir: './output/wip_joint_view_generation/tensorboard'
 
 # 验证配置
 validation:

@@ -7,6 +7,7 @@ This script uses the simplified trainer interface.
 
 import sys
 from pathlib import Path
+from datetime import timedelta
 
 # Add project root to Python path
 _project_root = Path(__file__).resolve().parent.parent
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SD21_BASE_REPO = "sd2-community/stable-diffusion-2-1-base"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_HOME = _project_root / ".hf-home"
+DEFAULT_DISTRIBUTED_TIMEOUT = timedelta(hours=12)
 
 
 def _worker_init_fn(_worker_id: int) -> None:
@@ -63,7 +65,10 @@ def _init_distributed(args) -> Tuple[bool, int, int, int]:
         torch.cuda.set_device(local_rank)
         args.device = f"cuda:{local_rank}"
 
-    dist.init_process_group(backend="nccl" if args.device.startswith("cuda") else "gloo")
+    dist.init_process_group(
+        backend="nccl" if args.device.startswith("cuda") else "gloo",
+        timeout=DEFAULT_DISTRIBUTED_TIMEOUT,
+    )
     return True, rank, local_rank, world_size
 
 
@@ -136,7 +141,7 @@ def _safe_collate(batch):
     collated = {}
     for key in batch[0].keys():
         values = [item[key] for item in batch]
-        if key in {"meta", "view_names"} or any(value is None for value in values):
+        if key in {"meta", "view_names", "view_metas"} or any(value is None for value in values):
             collated[key] = values
             continue
         collated[key] = default_collate(values)
@@ -363,6 +368,53 @@ def _resolve_attention_alignment_config(config: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+def _resolve_transition_aux_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    aux_config = dict(_config_get(config, ("training", "transition_aux"), {}) or {})
+
+    def _value(name: str, default: Any) -> Any:
+        value = aux_config.get(name, default)
+        return default if value is None else value
+
+    source = str(_value("source", _value("mode", "gt_latent"))).strip().lower().replace("-", "_")
+    if source in {"gt", "gt_latents", "latent", "vae_latent"}:
+        source = "gt_latent"
+    elif source in {"x0", "pred_x0", "pred_original_sample"}:
+        source = "predicted_x0"
+    if source not in {"gt_latent", "predicted_x0"}:
+        raise ValueError(f"training.transition_aux.source must be 'gt_latent' or 'predicted_x0', got {source!r}")
+
+    return {
+        "enabled": bool(aux_config.get("enable", False)),
+        "source": source,
+        "loss_weight": float(_value("loss_weight", 0.0)),
+        "warmup_steps": int(_value("warmup_steps", 0)),
+        "cycle_weight": float(_value("cycle_weight", 0.1)),
+        "composition_weight": float(_value("composition_weight", 0.05)),
+        "mse_weight": float(_value("mse_weight", 0.1)),
+        "hidden_channels": int(_value("hidden_channels", 128)),
+        "action_dim": int(_value("action_dim", 128)),
+        "lr_multiplier": float(_value("lr_multiplier", 1.0)),
+    }
+
+
+def _resolve_joint_view_generation_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    joint_config = dict(_config_get(config, ("training", "joint_view_generation"), {}) or {})
+
+    def _value(name: str, default: Any) -> Any:
+        value = joint_config.get(name, default)
+        return default if value is None else value
+
+    return {
+        "enabled": bool(joint_config.get("enable", False)),
+        "loss_weight": float(_value("loss_weight", 0.0)),
+        "hidden_dim": int(_value("hidden_dim", 32)),
+        "num_heads": int(_value("num_heads", 4)),
+        "dropout": float(_value("dropout", 0.0)),
+        "bev_sigma": float(_value("bev_sigma", 0.25)),
+        "gate_init": float(_value("gate_init", 0.0)),
+    }
+
+
 def _resolve_geometry_score_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     geometry_config = dict(_config_get(config, ("training", "geometry_score"), {}) or {})
     def _value(name: str, default: Any) -> Any:
@@ -389,6 +441,36 @@ def _resolve_gradient_checkpointing_config(config: Dict[str, Any], cli_value: bo
     return bool(_config_get(config, ("gradient_checkpointing",), True))
 
 
+def _infer_pose_chain_group_size(view_set: str, pose_chains: Any) -> int:
+    if str(view_set) != "pose_chain":
+        return 1
+    if not isinstance(pose_chains, list) or not pose_chains:
+        return 4
+    lengths: List[int] = []
+    seen_names: set[str] = set()
+    for chain_index, chain in enumerate(pose_chains):
+        if isinstance(chain, dict):
+            name = str(chain.get("name", f"chain_{chain_index}"))
+            yaw_values = chain.get("yaws", chain.get("views"))
+        else:
+            name = f"chain_{chain_index}"
+            yaw_values = chain
+        if name in seen_names:
+            raise ValueError(f"pose chain names must be unique, got duplicate '{name}'")
+        seen_names.add(name)
+        if yaw_values is None:
+            raise ValueError(f"pose chain {chain_index} must define yaws/views")
+        if isinstance(yaw_values, (str, bytes)):
+            raise ValueError(f"pose chain {chain_index} yaws/views must be a sequence, not a string")
+        lengths.append(len(list(yaw_values)))
+    if len(set(lengths)) > 1:
+        raise ValueError(
+            "all pose chains must contain the same number of views for "
+            f"batched pose-chain training, got lengths={lengths}"
+        )
+    return max(1, lengths[0])
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Stable Diffusion for satellite-to-frontview generation"
@@ -403,7 +485,7 @@ def main():
     )
     parser.add_argument(
         "--split_yaml", type=str, default=None,
-        help="Path to split yaml (defaults to <data_dir>/train_test_split_config.yaml)",
+        help="Path to split yaml (defaults to <data_dir>/train_test_split_config.yaml; val may be named test)",
     )
     parser.add_argument(
         "--output_dir", type=str, default="./output",
@@ -491,10 +573,10 @@ def main():
     )
     parser.add_argument(
         "--view_set", type=str, default="single",
-        choices=["single"],
+        choices=["single", "pose_chain"],
         help=(
-            "This branch trains one independently sampled target yaw per frame; "
-            "grouped fixed-view feed is intentionally disabled."
+            "single trains one target yaw per sample; pose_chain trains ordered "
+            "overlapping yaw chains per frame."
         ),
     )
     parser.add_argument(
@@ -542,6 +624,10 @@ def main():
     parser.add_argument(
         "--visualize_every", type=int, default=10,
         help="Save fixed-sample visualization comparisons every N epochs. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--validate_every", type=int, default=1,
+        help="Run validation every N epochs and always on the final epoch. Set 0 for final epoch only.",
     )
     parser.add_argument(
         "--num_visualizations", type=int, default=4,
@@ -670,6 +756,7 @@ def main():
     args.dataset_mode = str(_prefer_config(args.dataset_mode, "front", _config_get(config, ("data", "mode"))))
     args.yaw_mode = str(_prefer_config(args.yaw_mode, "fisheye_relative", _config_get(config, ("data", "yaw_mode"))))
     args.view_set = str(_prefer_config(args.view_set, "single", _config_get(config, ("data", "view_set"))))
+    args.pose_chains = _config_get(config, ("data", "pose_chains"))
     args.vehicle_yaw_min_deg = float(
         _prefer_config(
             args.vehicle_yaw_min_deg,
@@ -711,6 +798,15 @@ def main():
     args.visualize_every = int(
         _prefer_config(args.visualize_every, 10, _config_get(config, ("validation", "visualize_every")))
     )
+    args.validate_every = int(
+        _prefer_config(
+            args.validate_every,
+            1,
+            _config_get(config, ("validation", "validate_every")),
+            cli_option="--validate_every",
+            cli_options=cli_options,
+        )
+    )
     args.num_visualizations = int(
         _prefer_config(
             args.num_visualizations,
@@ -743,6 +839,8 @@ def main():
     satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     query_geometry_score_config = _attach_query_geometry_score_args(args, config)
     attention_alignment_config = _resolve_attention_alignment_config(config)
+    transition_aux_config = _resolve_transition_aux_config(config)
+    joint_view_generation_config = _resolve_joint_view_generation_config(config)
     geometry_score_training_config = _resolve_geometry_score_training_config(config)
     args.attention_alignment_enabled = attention_alignment_config["enabled"]
     args.attention_alignment_loss_weight = attention_alignment_config["loss_weight"]
@@ -750,6 +848,23 @@ def main():
     args.attention_alignment_max_query_tokens = attention_alignment_config["max_query_tokens"]
     args.attention_alignment_valid_radius = attention_alignment_config["valid_radius"]
     args.attention_alignment_invalid_attention_weight = attention_alignment_config["invalid_attention_weight"]
+    args.transition_aux_enabled = transition_aux_config["enabled"]
+    args.transition_aux_source = transition_aux_config["source"]
+    args.transition_aux_loss_weight = transition_aux_config["loss_weight"]
+    args.transition_aux_warmup_steps = transition_aux_config["warmup_steps"]
+    args.transition_aux_cycle_weight = transition_aux_config["cycle_weight"]
+    args.transition_aux_composition_weight = transition_aux_config["composition_weight"]
+    args.transition_aux_mse_weight = transition_aux_config["mse_weight"]
+    args.transition_aux_hidden_channels = transition_aux_config["hidden_channels"]
+    args.transition_aux_action_dim = transition_aux_config["action_dim"]
+    args.transition_aux_lr_multiplier = transition_aux_config["lr_multiplier"]
+    args.joint_view_generation_enabled = joint_view_generation_config["enabled"]
+    args.joint_view_generation_loss_weight = joint_view_generation_config["loss_weight"]
+    args.joint_view_generation_hidden_dim = joint_view_generation_config["hidden_dim"]
+    args.joint_view_generation_num_heads = joint_view_generation_config["num_heads"]
+    args.joint_view_generation_dropout = joint_view_generation_config["dropout"]
+    args.joint_view_generation_bev_sigma = joint_view_generation_config["bev_sigma"]
+    args.joint_view_generation_gate_init = joint_view_generation_config["gate_init"]
     args.geometry_score_lr_multiplier = geometry_score_training_config["lr_multiplier"]
     args.geometry_score_gate_warmup_steps = geometry_score_training_config["gate_warmup_steps"]
     args.geometry_score_gate_warmup_start_scale = geometry_score_training_config["gate_warmup_start_scale"]
@@ -763,6 +878,8 @@ def main():
     args.local_rank = local_rank
     args.world_size = world_size
     args.effective_batch_size = int(args.batch_size) * int(world_size) * int(args.gradient_accumulation)
+    args.pose_chain_group_size = _infer_pose_chain_group_size(args.view_set, args.pose_chains)
+    args.effective_view_batch_size = int(args.effective_batch_size) * int(args.pose_chain_group_size)
     is_main_process = rank == 0
 
     os.environ["HF_ENDPOINT"] = args.hf_endpoint
@@ -794,6 +911,8 @@ def main():
             "so the auxiliary alignment loss would be logged but not trained. "
             "Use --no-gradient_checkpointing and reduce --batch_size if needed."
         )
+    if joint_view_generation_config["enabled"] and args.view_set != "pose_chain":
+        raise ValueError("training.joint_view_generation.enable=true requires data.view_set=pose_chain")
     if is_main_process:
         logger.info(f"Training configuration: {args}")
 
@@ -813,6 +932,7 @@ def main():
         mode=args.dataset_mode,
         yaw_mode=args.yaw_mode,
         view_set=args.view_set,
+        pose_chains=args.pose_chains,
         virtual_size=front_resize,
         front_resize=front_resize,
         front_center_crop=None,
@@ -826,11 +946,6 @@ def main():
     )
     train_dataset_kwargs = dict(common_dataset_kwargs)
     val_dataset_kwargs = dict(common_dataset_kwargs)
-
-    if args.view_set != "single":
-        raise ValueError(
-            f"view_set='{args.view_set}' is not supported on this branch; use data.view_set='single'."
-        )
 
     if args.dataset_mode != "front" and args.yaw_mode == "vehicle_relative":
         random_vehicle_relative_yaw = args.vehicle_yaw_sampling == "random_range"
@@ -924,6 +1039,21 @@ def main():
         attention_alignment_max_query_tokens=attention_alignment_config["max_query_tokens"],
         attention_alignment_valid_radius=attention_alignment_config["valid_radius"],
         attention_alignment_invalid_attention_weight=attention_alignment_config["invalid_attention_weight"],
+        transition_aux_enabled=transition_aux_config["enabled"],
+        transition_aux_loss_weight=transition_aux_config["loss_weight"],
+        transition_aux_cycle_weight=transition_aux_config["cycle_weight"],
+        transition_aux_composition_weight=transition_aux_config["composition_weight"],
+        transition_aux_mse_weight=transition_aux_config["mse_weight"],
+        transition_aux_hidden_channels=transition_aux_config["hidden_channels"],
+        transition_aux_action_dim=transition_aux_config["action_dim"],
+        transition_aux_source=transition_aux_config["source"],
+        joint_view_generation_enabled=joint_view_generation_config["enabled"],
+        joint_view_generation_loss_weight=joint_view_generation_config["loss_weight"],
+        joint_view_generation_hidden_dim=joint_view_generation_config["hidden_dim"],
+        joint_view_generation_num_heads=joint_view_generation_config["num_heads"],
+        joint_view_generation_dropout=joint_view_generation_config["dropout"],
+        joint_view_generation_bev_sigma=joint_view_generation_config["bev_sigma"],
+        joint_view_generation_gate_init=joint_view_generation_config["gate_init"],
         satellite_encoder_config=satellite_encoder_config,
     )
     _verify_query_geometry_score_model_config(model, query_geometry_score_config)
@@ -960,6 +1090,8 @@ def main():
         lr_scheduler_type=lr_scheduler_type,
         warmup_epochs=args.warmup,
         geometry_score_lr_multiplier=geometry_score_training_config["lr_multiplier"],
+        transition_aux_lr_multiplier=transition_aux_config["lr_multiplier"],
+        transition_aux_warmup_steps=transition_aux_config["warmup_steps"],
         geometry_score_gate_warmup_steps=geometry_score_training_config["gate_warmup_steps"],
         geometry_score_gate_warmup_start_scale=geometry_score_training_config["gate_warmup_start_scale"],
         geometry_score_gate_warmup_end_scale=geometry_score_training_config["gate_warmup_end_scale"],
@@ -970,6 +1102,7 @@ def main():
         output_dir=args.output_dir,
         save_every=save_every,
         log_every=log_every,
+        validate_every=args.validate_every,
         device=args.device,
         use_wandb=args.use_wandb,
         project_name=args.wandb_project,

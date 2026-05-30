@@ -4,6 +4,7 @@ Inference utilities for satellite-to-street generation.
 
 Supported modes:
   - single_yaw_sweep: render one frame at front plus vehicle-relative yaw values.
+  - split_yaw_sweep: render split frames with a yaw sweep preset.
   - split_fixed_views: render split frames at fixed views and save GT comparisons.
 """
 
@@ -14,7 +15,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -72,8 +73,25 @@ TRAIN_FIXED_YAW_SWEEP_SPECS: Sequence[Tuple[str, Optional[float]]] = (
     ("yaw_p120", 120.0),
 )
 
+JOINT_POSE_CHAIN_SPECS: Sequence[Sequence[Tuple[str, Optional[float]]]] = (
+    (("front", None), ("yaw_p60", 60.0), ("yaw_p90", 90.0), ("yaw_p120", 120.0)),
+    (("front", None), ("yaw_m60", -60.0), ("yaw_m90", -90.0), ("yaw_m120", -120.0)),
+)
+
+HELDOUT_YAW_SWEEP_SPECS: Sequence[Tuple[str, Optional[float]]] = (
+    ("yaw_m105", -105.0),
+    ("yaw_m75", -75.0),
+    ("yaw_m45", -45.0),
+    ("yaw_p45", 45.0),
+    ("yaw_p75", 75.0),
+    ("yaw_p105", 105.0),
+)
+
 YAW_SWEEP_PRESETS: Dict[str, Sequence[Tuple[str, Optional[float]]]] = {
     "diagnostic": DEFAULT_YAW_SWEEP_SPECS,
+    "heldout": HELDOUT_YAW_SWEEP_SPECS,
+    "left_chain": JOINT_POSE_CHAIN_SPECS[1],
+    "right_chain": JOINT_POSE_CHAIN_SPECS[0],
     "train_fixed": TRAIN_FIXED_YAW_SWEEP_SPECS,
 }
 
@@ -81,6 +99,42 @@ ABLATION_MODE_CONFIGS: Dict[str, str] = {
     "normal": "normal",
     "sat_zero": "zero",
 }
+
+CHECKPOINT_RUN_CONFIG_KEYS: Tuple[str, ...] = (
+    "view_set",
+    "pose_chains",
+    "pose_chain_group_size",
+    "effective_view_batch_size",
+    "query_geometry_score_enabled",
+    "query_geometry_score_dim",
+    "query_geometry_score_num_freqs",
+    "query_geometry_score_mode",
+    "query_geometry_score_gate_init",
+    "query_geometry_candidate_radius",
+    "query_geometry_candidate_min_k",
+    "query_geometry_candidate_invalid_penalty",
+    "query_semantic_score_dim",
+    "query_semantic_score_alpha",
+    "attention_alignment_enabled",
+    "attention_alignment_loss_weight",
+    "attention_alignment_valid_radius",
+    "joint_view_generation_enabled",
+    "joint_view_generation_loss_weight",
+)
+INFERENCE_GATE_CONFIG_KEYS: Tuple[str, ...] = (
+    "query_geometry_score_enabled",
+    "query_geometry_score_dim",
+    "query_geometry_score_num_freqs",
+    "query_geometry_score_mode",
+    "query_geometry_score_gate_init",
+    "query_geometry_candidate_radius",
+    "query_geometry_candidate_min_k",
+    "query_geometry_candidate_invalid_penalty",
+    "query_semantic_score_dim",
+    "query_semantic_score_alpha",
+    "joint_view_generation_enabled",
+    "joint_view_generation_loss_weight",
+)
 
 
 def _load_frame_ids(frames_file: Path) -> List[int]:
@@ -92,9 +146,103 @@ def _load_frame_ids(frames_file: Path) -> List[int]:
     return frame_ids
 
 
+def _checkpoint_gate_metadata(checkpoint_meta: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(checkpoint_meta, dict):
+        return {}
+    payload: Dict[str, Any] = {}
+    trainer_metadata = checkpoint_meta.get("trainer_metadata")
+    if isinstance(trainer_metadata, dict):
+        payload["trainer_metadata"] = {
+            str(key): value
+            for key, value in trainer_metadata.items()
+            if isinstance(value, (bool, int, float, str)) or value is None
+        }
+    run_config = checkpoint_meta.get("run_config")
+    if isinstance(run_config, dict):
+        payload["run_config"] = {
+            key: run_config[key]
+            for key in CHECKPOINT_RUN_CONFIG_KEYS
+            if key in run_config
+        }
+    return payload
+
+
+def _checkpoint_display_epoch(checkpoint_meta: Dict[str, Any]) -> Optional[int]:
+    if not isinstance(checkpoint_meta, dict):
+        return None
+    trainer_metadata = checkpoint_meta.get("trainer_metadata")
+    if isinstance(trainer_metadata, dict):
+        checkpoint_epoch = trainer_metadata.get("checkpoint_epoch")
+        if isinstance(checkpoint_epoch, (int, float)):
+            return int(checkpoint_epoch)
+    raw_epoch = checkpoint_meta.get("epoch")
+    if isinstance(raw_epoch, (int, float)):
+        return int(raw_epoch) + 1
+    return None
+
+
+def _inference_gate_config(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        key: getattr(args, key)
+        for key in INFERENCE_GATE_CONFIG_KEYS
+        if hasattr(args, key)
+    }
+
+
+def _inference_runtime_config(
+    args: argparse.Namespace,
+    *,
+    sat_condition_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    active_sat_condition_mode = (
+        sat_condition_mode
+        if sat_condition_mode is not None
+        else getattr(args, "sat_condition_mode")
+    )
+    return {
+        "num_inference_steps": int(getattr(args, "num_inference_steps")),
+        "guidance_scale": float(getattr(args, "guidance_scale")),
+        "seed": int(getattr(args, "seed")),
+        "mixed_precision": str(getattr(args, "mixed_precision")),
+        "view_memory_mode": str(getattr(args, "view_memory_mode")),
+        "sat_condition_mode": str(active_sat_condition_mode),
+    }
+
+
+def _gate_values_match(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return bool(left) == bool(right)
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) <= 1e-6
+    return left == right
+
+
+def _checkpoint_inference_mismatches(
+    checkpoint_meta: Dict[str, Any],
+    args: argparse.Namespace,
+) -> List[str]:
+    checkpoint_gate = _checkpoint_gate_metadata(checkpoint_meta)
+    run_config = checkpoint_gate.get("run_config")
+    if not isinstance(run_config, dict):
+        return ["checkpoint is missing run_config metadata for inference consistency checks"]
+
+    inference_config = _inference_gate_config(args)
+    mismatches: List[str] = []
+    for key, inference_value in inference_config.items():
+        if key not in run_config:
+            continue
+        checkpoint_value = run_config[key]
+        if not _gate_values_match(checkpoint_value, inference_value):
+            mismatches.append(
+                f"{key}: checkpoint={checkpoint_value!r} inference={inference_value!r}"
+            )
+    return mismatches
+
+
 def _load_split_from_yaml(
     data_dir: Path,
     split_yaml: Path,
+    eval_split: str = "val",
 ) -> Tuple[List[Path], List[List[int]], List[Path], List[List[int]]]:
     if not split_yaml.exists():
         raise FileNotFoundError(f"Split yaml not found: {split_yaml}")
@@ -106,9 +254,19 @@ def _load_split_from_yaml(
         raise ValueError(f"Invalid split yaml format: {split_yaml}")
 
     train_entries = split_cfg.get("train")
-    val_entries = split_cfg.get("val", split_cfg.get("test"))
-    if not isinstance(train_entries, list) or not isinstance(val_entries, list):
-        raise ValueError("Split yaml must contain list entries for 'train' and 'val' or 'test'")
+    eval_split = str(eval_split)
+    if eval_split == "test":
+        eval_entries = split_cfg.get("test")
+        eval_label = "test"
+    elif eval_split == "val":
+        eval_entries = split_cfg.get("val", split_cfg.get("test"))
+        eval_label = "val/test"
+    else:
+        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+    if not isinstance(train_entries, list):
+        raise ValueError("Split yaml must contain list entries for 'train'")
+    if not isinstance(eval_entries, list):
+        raise ValueError(f"Split yaml must contain list entries for '{eval_split}'")
 
     def parse_entries(entries: List[dict], split_name: str) -> Tuple[List[Path], List[List[int]]]:
         drives: List[Path] = []
@@ -140,8 +298,12 @@ def _load_split_from_yaml(
         return drives, frames_per_drive
 
     train_dirs, train_frames = parse_entries(train_entries, "train")
-    val_dirs, val_frames = parse_entries(val_entries, "val/test")
-    return train_dirs, train_frames, val_dirs, val_frames
+    eval_dirs, eval_frames = parse_entries(eval_entries, eval_label)
+    return train_dirs, train_frames, eval_dirs, eval_frames
+
+
+def _eval_split_for_dataset_split(dataset_split: str) -> str:
+    return "test" if str(dataset_split) == "test" else "val"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -158,7 +320,7 @@ def _parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default="single_yaw_sweep",
-        choices=["single_yaw_sweep", "split_fixed_views", "front_pitch_sweep"],
+        choices=["single_yaw_sweep", "split_yaw_sweep", "split_fixed_views", "front_pitch_sweep"],
         help="Inference mode.",
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained checkpoint.")
@@ -169,7 +331,7 @@ def _parse_args() -> argparse.Namespace:
         help="Path to KITTI-360 data root.",
     )
     parser.add_argument("--split_yaml", type=str, default=None, help="Split yaml for split-based inference.")
-    parser.add_argument("--dataset_split", type=str, default="val", choices=["train", "val"])
+    parser.add_argument("--dataset_split", type=str, default="val", choices=["train", "val", "test"])
     parser.add_argument("--drive", type=str, default=None, help="Drive name for single_yaw_sweep.")
     parser.add_argument("--drive_dir", type=str, default=None, help="Drive path for single_yaw_sweep.")
     parser.add_argument("--frame_id", type=int, default=None, help="Exact frame id for single_yaw_sweep.")
@@ -190,11 +352,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yaw_sweep_preset",
         type=str,
-        default="diagnostic",
+        default="right_chain",
         choices=sorted(YAW_SWEEP_PRESETS.keys()),
         help=(
             "Preset yaw list for single_yaw_sweep when --vehicle_yaws is omitted. "
-            "diagnostic includes +/-30; train_fixed uses front/-120/-90/-60/+60/+90/+120."
+            "right_chain/left_chain are the joint-generation fixed chains; "
+            "diagnostic includes +/-30; train_fixed uses front/-120/-90/-60/+60/+90/+120; "
+            "heldout uses +/-45, +/-75, +/-105."
         ),
     )
     front_group = parser.add_mutually_exclusive_group()
@@ -227,11 +391,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--view_memory_mode",
         type=str,
-        default="independent",
-        choices=["independent"],
+        default="joint_pose_chain",
+        choices=["joint_pose_chain"],
         help=(
-            "How views share satellite memory during inference. Only independent is "
-            "supported in the current single-view conditioning setup."
+            "Jointly sample front/+60/+90/+120 or front/-60/-90/-120. "
+            "Single-view fallback is intentionally disabled."
         ),
     )
     parser.add_argument("--device", type=str, default="cuda")
@@ -260,8 +424,9 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    cli_options = _collect_cli_options(sys.argv[1:])
     config = _load_runtime_config(Path(args.config)) if args.config is not None else {}
-    _apply_config_defaults(args, config)
+    _apply_config_defaults(args, config, cli_options=cli_options)
     return args
 
 
@@ -286,13 +451,35 @@ def _config_get(config: Dict[str, Any], path: Tuple[str, ...], default: Any = No
     return default if node is None else node
 
 
-def _prefer_config(current: Any, cli_default: Any, config_value: Any) -> Any:
+def _collect_cli_options(argv: Sequence[str]) -> Set[str]:
+    options: Set[str] = set()
+    for arg in argv:
+        if arg.startswith("--"):
+            options.add(arg.split("=", 1)[0])
+    return options
+
+
+def _prefer_config(
+    current: Any,
+    cli_default: Any,
+    config_value: Any,
+    *,
+    cli_option: Optional[str] = None,
+    cli_options: Optional[Set[str]] = None,
+) -> Any:
+    if cli_option is not None and cli_options is not None and cli_option in cli_options:
+        return current
     if current == cli_default and config_value is not None:
         return config_value
     return current
 
 
-def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> None:
+def _apply_config_defaults(
+    args: argparse.Namespace,
+    config: Dict[str, Any],
+    *,
+    cli_options: Optional[Set[str]] = None,
+) -> None:
     if not config:
         args.satellite_encoder_config = {}
         args.query_uv_pe_enabled = False
@@ -308,36 +495,95 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
         args.query_geometry_candidate_invalid_penalty = -1e4
         args.query_semantic_score_dim = 64
         args.query_semantic_score_alpha = 0.25
+        args.joint_view_generation_enabled = False
+        args.joint_view_generation_loss_weight = 0.0
+        args.joint_view_generation_hidden_dim = 32
+        args.joint_view_generation_num_heads = 4
+        args.joint_view_generation_dropout = 0.0
+        args.joint_view_generation_bev_sigma = 0.25
+        args.joint_view_generation_gate_init = 0.0
         return
 
-    args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",))))
-    args.device = str(_prefer_config(args.device, "cuda", _config_get(config, ("device",))))
+    args.seed = int(_prefer_config(args.seed, 42, _config_get(config, ("seed",)), cli_option="--seed", cli_options=cli_options))
+    args.device = str(_prefer_config(args.device, "cuda", _config_get(config, ("device",)), cli_option="--device", cli_options=cli_options))
     args.data_dir = str(
         _prefer_config(
             args.data_dir,
             "/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360",
             _config_get(config, ("data", "data_dir")),
+            cli_option="--data_dir",
+            cli_options=cli_options,
         )
     )
     args.base_model = str(
-        _prefer_config(args.base_model, DEFAULT_SD21_BASE_REPO, _config_get(config, ("model", "base_model")))
+        _prefer_config(
+            args.base_model,
+            DEFAULT_SD21_BASE_REPO,
+            _config_get(config, ("model", "base_model")),
+            cli_option="--base_model",
+            cli_options=cli_options,
+        )
     )
     args.base_model_revision = _prefer_config(
         args.base_model_revision,
         None,
         _config_get(config, ("model", "base_model_revision")),
+        cli_option="--base_model_revision",
+        cli_options=cli_options,
     )
-    checkpoint_path = _prefer_config(args.checkpoint, None, _config_get(config, ("model", "checkpoint_path")))
+    checkpoint_path = _prefer_config(
+        args.checkpoint,
+        None,
+        _config_get(config, ("model", "checkpoint_path")),
+        cli_option="--checkpoint",
+        cli_options=cli_options,
+    )
     args.checkpoint = None if checkpoint_path is None else str(checkpoint_path)
     args.num_inference_steps = int(
-        _prefer_config(args.num_inference_steps, 30, _config_get(config, ("inference", "num_inference_steps")))
+        _prefer_config(
+            args.num_inference_steps,
+            30,
+            _config_get(config, ("inference", "num_inference_steps")),
+            cli_option="--num_inference_steps",
+            cli_options=cli_options,
+        )
     )
     args.guidance_scale = float(
-        _prefer_config(args.guidance_scale, 1.0, _config_get(config, ("inference", "guidance_scale")))
+        _prefer_config(
+            args.guidance_scale,
+            1.0,
+            _config_get(config, ("inference", "guidance_scale")),
+            cli_option="--guidance_scale",
+            cli_options=cli_options,
+        )
     )
-    args.pitch_deg = float(_prefer_config(args.pitch_deg, 0.0, _config_get(config, ("data", "pitch_deg"))))
-    args.roll_deg = float(_prefer_config(args.roll_deg, 0.0, _config_get(config, ("data", "roll_deg"))))
-    args.output_dir = str(_prefer_config(args.output_dir, "./inference_results", _config_get(config, ("output", "output_dir"))))
+    args.pitch_deg = float(
+        _prefer_config(
+            args.pitch_deg,
+            0.0,
+            _config_get(config, ("data", "pitch_deg")),
+            cli_option="--pitch_deg",
+            cli_options=cli_options,
+        )
+    )
+    args.roll_deg = float(
+        _prefer_config(
+            args.roll_deg,
+            0.0,
+            _config_get(config, ("data", "roll_deg")),
+            cli_option="--roll_deg",
+            cli_options=cli_options,
+        )
+    )
+    args.output_dir = str(
+        _prefer_config(
+            args.output_dir,
+            "./inference_results",
+            _config_get(config, ("output", "output_dir")),
+            cli_option="--output_dir",
+            cli_options=cli_options,
+        )
+    )
 
     args.satellite_encoder_config = dict(_config_get(config, ("model", "satellite_encoder"), {}) or {})
     args.query_uv_pe_enabled = False
@@ -360,6 +606,26 @@ def _apply_config_defaults(args: argparse.Namespace, config: Dict[str, Any]) -> 
     args.query_geometry_candidate_invalid_penalty = float(score_config.get("candidate_invalid_penalty", -1e4) or -1e4)
     args.query_semantic_score_dim = int(score_config.get("semantic_score_dim", 64) or 64)
     args.query_semantic_score_alpha = float(score_config.get("semantic_alpha_max", 0.25) or 0.25)
+    joint_config = dict(_config_get(config, ("training", "joint_view_generation"), {}) or {})
+    args.joint_view_generation_enabled = bool(joint_config.get("enable", False))
+    args.joint_view_generation_loss_weight = float(joint_config.get("loss_weight", 0.0) or 0.0)
+    args.joint_view_generation_hidden_dim = int(joint_config.get("hidden_dim", 32) or 32)
+    args.joint_view_generation_num_heads = int(joint_config.get("num_heads", 4) or 4)
+    args.joint_view_generation_dropout = float(joint_config.get("dropout", 0.0) or 0.0)
+    args.joint_view_generation_bev_sigma = float(joint_config.get("bev_sigma", 0.25) or 0.25)
+    args.joint_view_generation_gate_init = float(joint_config.get("gate_init", 0.0) or 0.0)
+    default_memory_mode = "joint_pose_chain"
+    args.view_memory_mode = str(
+        _prefer_config(
+            args.view_memory_mode,
+            "joint_pose_chain",
+            _config_get(config, ("inference", "view_memory_mode"), default_memory_mode),
+            cli_option="--view_memory_mode",
+            cli_options=cli_options,
+        )
+    )
+    if args.view_memory_mode != "joint_pose_chain":
+        raise ValueError("Only inference.view_memory_mode=joint_pose_chain is supported in this branch")
 
 
 def _view_token(view_name: str, yaw: Optional[float]) -> str:
@@ -864,6 +1130,13 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
         query_geometry_candidate_invalid_penalty=getattr(args, "query_geometry_candidate_invalid_penalty", -1e4),
         query_semantic_score_dim=getattr(args, "query_semantic_score_dim", 64),
         query_semantic_score_alpha=getattr(args, "query_semantic_score_alpha", 0.25),
+        joint_view_generation_enabled=getattr(args, "joint_view_generation_enabled", False),
+        joint_view_generation_loss_weight=getattr(args, "joint_view_generation_loss_weight", 0.0),
+        joint_view_generation_hidden_dim=getattr(args, "joint_view_generation_hidden_dim", 32),
+        joint_view_generation_num_heads=getattr(args, "joint_view_generation_num_heads", 4),
+        joint_view_generation_dropout=getattr(args, "joint_view_generation_dropout", 0.0),
+        joint_view_generation_bev_sigma=getattr(args, "joint_view_generation_bev_sigma", 0.25),
+        joint_view_generation_gate_init=getattr(args, "joint_view_generation_gate_init", 0.0),
         satellite_encoder_config=getattr(args, "satellite_encoder_config", None),
     )
     if hasattr(model.unet, "set_attention_slice"):
@@ -878,6 +1151,12 @@ def _load_model(args: argparse.Namespace, materialize_sample: Dict):
     if args.checkpoint is None:
         raise ValueError("Pass --checkpoint or set model.checkpoint_path in --config")
     checkpoint_meta = load_model_checkpoint(model, Path(args.checkpoint), args.device)
+    mismatches = _checkpoint_inference_mismatches(checkpoint_meta, args)
+    if mismatches:
+        logger.warning(
+            "Checkpoint/inference gate config mismatch detected: %s",
+            "; ".join(mismatches),
+        )
     model.eval()
     return model, checkpoint_meta
 
@@ -922,6 +1201,154 @@ def _generate_one(
             T_imu_to_world=T_imu_to_world,
             camera_height_m=camera_height_m,
         )[0].cpu()
+
+
+def _camera_height_scalar(sample: Dict) -> torch.Tensor:
+    value = sample.get("camera_height_m")
+    if torch.is_tensor(value):
+        return value.detach().reshape(-1)[0].to(dtype=torch.float32)
+    if value is None:
+        return torch.tensor(1.6, dtype=torch.float32)
+    return torch.tensor(float(value), dtype=torch.float32)
+
+
+@torch.no_grad()
+def _generate_pose_chain(
+    model,
+    view_samples: Sequence[Dict],
+    view_specs: Sequence[Tuple[str, Optional[float]]],
+    args: argparse.Namespace,
+    sat_condition_mode: str,
+) -> List[torch.Tensor]:
+    if not hasattr(model, "generate_pose_chain"):
+        raise RuntimeError("Model does not expose generate_pose_chain")
+    if not view_samples:
+        return []
+
+    sat_image = view_samples[0]["sat"].unsqueeze(0).to(args.device)
+    target_size = tuple(int(x) for x in view_samples[0]["image"].shape[-2:])
+    K = torch.stack([sample["K"] for sample in view_samples], dim=0).unsqueeze(0).to(args.device)
+    T_cam_to_world = torch.stack(
+        [sample["T_cam_to_world"] for sample in view_samples],
+        dim=0,
+    ).unsqueeze(0).to(args.device)
+    T_imu_to_world = torch.stack(
+        [sample["T_imu_to_world"] for sample in view_samples],
+        dim=0,
+    ).unsqueeze(0).to(args.device)
+    camera_height_m = torch.stack(
+        [_camera_height_scalar(sample) for sample in view_samples],
+        dim=0,
+    ).unsqueeze(0).to(args.device)
+    vehicle_yaw_degs = torch.tensor(
+        [[float("nan") if yaw is None else float(yaw) for _, yaw in view_specs]],
+        device=args.device,
+        dtype=torch.float32,
+    )
+
+    front_bev_xy = None
+    if all(torch.is_tensor(sample.get("front_bev_xy")) for sample in view_samples):
+        front_bev_xy = torch.stack([sample["front_bev_xy"] for sample in view_samples], dim=0).unsqueeze(0).to(args.device)
+    front_ground_valid_mask = None
+    if all(torch.is_tensor(sample.get("front_ground_valid_mask")) for sample in view_samples):
+        front_ground_valid_mask = torch.stack(
+            [sample["front_ground_valid_mask"] for sample in view_samples],
+            dim=0,
+        ).unsqueeze(0).to(args.device)
+
+    generator_device = args.device if args.device.startswith("cuda") else "cpu"
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(int(args.seed))
+
+    amp_dtype = (
+        torch.float16
+        if args.mixed_precision == "fp16"
+        else torch.bfloat16
+        if args.mixed_precision == "bf16"
+        else torch.float32
+    )
+    with torch.autocast(
+        device_type="cuda",
+        dtype=amp_dtype,
+        enabled=args.device.startswith("cuda") and amp_dtype in {torch.float16, torch.bfloat16},
+    ):
+        generated = model.generate_pose_chain(
+            sat_image,
+            target_size=target_size,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            generator=generator,
+            sat_condition_mode=sat_condition_mode,
+            K=K,
+            T_cam_to_world=T_cam_to_world,
+            T_imu_to_world=T_imu_to_world,
+            camera_height_m=camera_height_m,
+            vehicle_yaw_degs=vehicle_yaw_degs,
+            front_bev_xy=front_bev_xy,
+            front_ground_valid_mask=front_ground_valid_mask,
+        )[0].cpu()
+    return [generated[index] for index in range(generated.shape[0])]
+
+
+def _matching_chain_indices(
+    view_specs: Sequence[Tuple[str, Optional[float]]],
+    chain_specs: Sequence[Tuple[str, Optional[float]]],
+) -> Optional[List[int]]:
+    indices: List[int] = []
+    used: Set[int] = set()
+    for _, chain_yaw in chain_specs:
+        matched_index = None
+        for index, (_, yaw) in enumerate(view_specs):
+            if index in used:
+                continue
+            if chain_yaw is None and yaw is None:
+                matched_index = index
+                break
+            if chain_yaw is not None and yaw is not None and abs(float(chain_yaw) - float(yaw)) < 1e-4:
+                matched_index = index
+                break
+        if matched_index is None:
+            return None
+        used.add(matched_index)
+        indices.append(matched_index)
+    return indices
+
+
+def _generate_views(
+    model,
+    view_samples: Sequence[Dict],
+    view_specs: Sequence[Tuple[str, Optional[float]]],
+    args: argparse.Namespace,
+    sat_condition_mode: str,
+) -> List[torch.Tensor]:
+    if args.view_memory_mode != "joint_pose_chain":
+        raise ValueError("Only joint_pose_chain inference is supported; single-view fallback has been removed")
+    if not bool(getattr(model, "joint_view_generation_enabled", False)):
+        raise ValueError("Checkpoint/model was not created with joint_view_generation enabled")
+
+    for chain_specs in JOINT_POSE_CHAIN_SPECS:
+        indices = _matching_chain_indices(view_specs, chain_specs)
+        if indices is None or len(indices) != len(view_specs):
+            continue
+        if set(indices) != set(range(len(view_specs))):
+            continue
+        chain_samples = [view_samples[index] for index in indices]
+        chain_view_specs = [view_specs[index] for index in indices]
+        chain_outputs = _generate_pose_chain(model, chain_samples, chain_view_specs, args, sat_condition_mode)
+        generated: List[Optional[torch.Tensor]] = [None] * len(view_samples)
+        for index, output in zip(indices, chain_outputs):
+            generated[index] = output
+        return [item for item in generated if item is not None]
+
+    requested = ", ".join(
+        "front" if yaw is None else f"{float(yaw):g}"
+        for _, yaw in view_specs
+    )
+    raise ValueError(
+        "joint_pose_chain inference requires exactly one fixed chain: "
+        "front,+60,+90,+120 or front,-60,-90,-120. "
+        f"Requested views were: {requested}"
+    )
 
 
 def _save_view_outputs(
@@ -995,6 +1422,7 @@ def _resolve_single_dataset(args: argparse.Namespace) -> Tuple[Kitti360dDataset,
         train_dirs, train_frames, val_dirs, val_frames = _load_split_from_yaml(
             Path(args.data_dir),
             Path(args.split_yaml),
+            eval_split=_eval_split_for_dataset_split(args.dataset_split),
         )
         drives = train_dirs if args.dataset_split == "train" else val_dirs
         frames = train_frames if args.dataset_split == "train" else val_frames
@@ -1038,10 +1466,7 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
             _get_view_sample(dataset, sample_index, view_name, yaw)
             for view_name, yaw in view_specs
         ]
-        generated_views = [
-            _generate_one(model, sample, args, sat_mode)
-            for sample in view_samples
-        ]
+        generated_views = _generate_views(model, view_samples, view_specs, args, sat_mode)
 
         for (view_name, yaw), sample, generated in zip(view_specs, view_samples, generated_views):
             logger.info(
@@ -1066,7 +1491,14 @@ def run_single_yaw_sweep(args: argparse.Namespace) -> None:
             yaml.safe_dump(
                 {
                     "checkpoint": str(Path(args.checkpoint).resolve()),
-                    "checkpoint_epoch": checkpoint_meta.get("epoch"),
+                    "checkpoint_epoch": _checkpoint_display_epoch(checkpoint_meta),
+                    "checkpoint_gate_metadata": _checkpoint_gate_metadata(checkpoint_meta),
+                    "inference_gate_config": _inference_gate_config(args),
+                    "inference_runtime_config": _inference_runtime_config(
+                        args,
+                        sat_condition_mode=sat_mode,
+                    ),
+                    "checkpoint_inference_mismatches": _checkpoint_inference_mismatches(checkpoint_meta, args),
                     "mode": args.mode,
                     "memory_mode": args.view_memory_mode,
                     "ablation_mode": ablation_name,
@@ -1090,6 +1522,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
     train_dirs, train_frames, val_dirs, val_frames = _load_split_from_yaml(
         Path(args.data_dir),
         Path(args.split_yaml),
+        eval_split=_eval_split_for_dataset_split(args.dataset_split),
     )
     drives = train_dirs if args.dataset_split == "train" else val_dirs
     frames = train_frames if args.dataset_split == "train" else val_frames
@@ -1118,10 +1551,7 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                 _get_view_sample(dataset, sample_index, view_name, yaw)
                 for view_name, yaw in FIXED_VIEW_SPECS
             ]
-            generated_views = [
-                _generate_one(model, sample, args, sat_mode)
-                for sample in view_samples
-            ]
+            generated_views = _generate_views(model, view_samples, view_specs, args, sat_mode)
 
             for (view_name, yaw), sample, generated in zip(FIXED_VIEW_SPECS, view_samples, generated_views):
                 progress.set_postfix(
@@ -1146,7 +1576,14 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
             yaml.safe_dump(
                 {
                     "checkpoint": str(Path(args.checkpoint).resolve()),
-                    "checkpoint_epoch": checkpoint_meta.get("epoch"),
+                    "checkpoint_epoch": _checkpoint_display_epoch(checkpoint_meta),
+                    "checkpoint_gate_metadata": _checkpoint_gate_metadata(checkpoint_meta),
+                    "inference_gate_config": _inference_gate_config(args),
+                    "inference_runtime_config": _inference_runtime_config(
+                        args,
+                        sat_condition_mode=sat_mode,
+                    ),
+                    "checkpoint_inference_mismatches": _checkpoint_inference_mismatches(checkpoint_meta, args),
                     "mode": args.mode,
                     "memory_mode": args.view_memory_mode,
                     "dataset_split": args.dataset_split,
@@ -1168,6 +1605,106 @@ def run_split_fixed_views(args: argparse.Namespace) -> None:
                 sort_keys=False,
             )
         logger.info(f"Saved split fixed-view inference to: {active_output_root}")
+
+
+def run_split_yaw_sweep(args: argparse.Namespace) -> None:
+    if args.split_yaml is None:
+        raise ValueError("--split_yaml is required for split_yaw_sweep")
+
+    train_dirs, train_frames, val_dirs, val_frames = _load_split_from_yaml(
+        Path(args.data_dir),
+        Path(args.split_yaml),
+        eval_split=_eval_split_for_dataset_split(args.dataset_split),
+    )
+    drives = train_dirs if args.dataset_split == "train" else val_dirs
+    frames = train_frames if args.dataset_split == "train" else val_frames
+    dataset = _build_base_dataset(
+        drives,
+        frames,
+        args.seed,
+        pitch_deg=args.pitch_deg,
+        roll_deg=args.roll_deg,
+    )
+    sample_indices = _filter_sample_indices(dataset, args.start_frame, args.end_frame, args.max_frames)
+    view_specs = _single_yaw_sweep_view_specs(args)
+
+    materialize_sample = _get_view_sample(dataset, sample_indices[0], *view_specs[0])
+    model, checkpoint_meta = _load_model(args, materialize_sample)
+
+    output_root = Path(args.output_dir)
+    ablation_runs = _resolve_ablation_runs(args)
+    for ablation_name, sat_mode in ablation_runs:
+        active_output_root = output_root / ablation_name if ablation_name is not None else output_root
+        progress = tqdm(sample_indices, desc=f"Split yaw-sweep inference [{ablation_name or 'custom'}]")
+        for sample_index in progress:
+            base_sample = dataset.samples[sample_index]
+            frame_dir = active_output_root / args.yaw_sweep_preset / base_sample.drive_dir.name / f"frame_{base_sample.frame_id:010d}"
+            summary_rows: List[Image.Image] = []
+            view_samples = [
+                _get_view_sample(dataset, sample_index, view_name, yaw)
+                for view_name, yaw in view_specs
+            ]
+            generated_views = [
+                _generate_one(model, sample, args, sat_mode)
+                for sample in view_samples
+            ]
+
+            for (view_name, yaw), sample, generated in zip(view_specs, view_samples, generated_views):
+                progress.set_postfix(
+                    frame=f"{base_sample.frame_id:010d}",
+                    view=view_name,
+                    preset=args.yaw_sweep_preset,
+                    ablation=ablation_name or "custom",
+                )
+                comparison = _save_view_outputs(
+                    sample,
+                    generated,
+                    frame_dir / _view_token(view_name, yaw),
+                    view_name,
+                    yaw,
+                    ablation_name,
+                    sat_mode,
+                )
+                summary_rows.append(comparison)
+            if summary_rows:
+                _stack_panel_rows(summary_rows).save(frame_dir / "summary.png")
+
+        active_output_root.mkdir(parents=True, exist_ok=True)
+        with open(active_output_root / f"run_metadata_{args.yaw_sweep_preset}.yaml", "w") as f:
+            yaml.safe_dump(
+                {
+                    "checkpoint": str(Path(args.checkpoint).resolve()),
+                    "checkpoint_epoch": _checkpoint_display_epoch(checkpoint_meta),
+                    "checkpoint_gate_metadata": _checkpoint_gate_metadata(checkpoint_meta),
+                    "inference_gate_config": _inference_gate_config(args),
+                    "inference_runtime_config": _inference_runtime_config(
+                        args,
+                        sat_condition_mode=sat_mode,
+                    ),
+                    "checkpoint_inference_mismatches": _checkpoint_inference_mismatches(checkpoint_meta, args),
+                    "mode": args.mode,
+                    "memory_mode": args.view_memory_mode,
+                    "dataset_split": args.dataset_split,
+                    "split_yaml": str(Path(args.split_yaml)),
+                    "yaw_sweep_preset": args.yaw_sweep_preset,
+                    "include_front": bool(args.include_front),
+                    "start_frame": args.start_frame,
+                    "end_frame": args.end_frame,
+                    "max_frames": args.max_frames,
+                    "num_frames": len(sample_indices),
+                    "ablation_mode": ablation_name,
+                    "sat_condition_mode": sat_mode,
+                    "virtual_pitch_deg": float(args.pitch_deg),
+                    "virtual_roll_deg": float(args.roll_deg),
+                    "views": [
+                        {"view_name": view_name, "vehicle_yaw_deg": yaw}
+                        for view_name, yaw in view_specs
+                    ],
+                },
+                f,
+                sort_keys=False,
+            )
+        logger.info(f"Saved split yaw-sweep inference to: {active_output_root}")
 
 
 def run_front_pitch_sweep(args: argparse.Namespace) -> None:
@@ -1215,7 +1752,14 @@ def run_front_pitch_sweep(args: argparse.Namespace) -> None:
                 yaml.safe_dump(
                     {
                         "checkpoint": str(Path(args.checkpoint).resolve()),
-                        "checkpoint_epoch": checkpoint_meta.get("epoch"),
+                        "checkpoint_epoch": _checkpoint_display_epoch(checkpoint_meta),
+                        "checkpoint_gate_metadata": _checkpoint_gate_metadata(checkpoint_meta),
+                        "inference_gate_config": _inference_gate_config(args),
+                        "inference_runtime_config": _inference_runtime_config(
+                            args,
+                            sat_condition_mode=sat_mode,
+                        ),
+                        "checkpoint_inference_mismatches": _checkpoint_inference_mismatches(checkpoint_meta, args),
                         "mode": args.mode,
                         "memory_mode": args.view_memory_mode,
                         "ablation_mode": ablation_name,
@@ -1252,6 +1796,8 @@ def main() -> None:
 
     if args.mode == "single_yaw_sweep":
         run_single_yaw_sweep(args)
+    elif args.mode == "split_yaw_sweep":
+        run_split_yaw_sweep(args)
     elif args.mode == "split_fixed_views":
         run_split_fixed_views(args)
     elif args.mode == "front_pitch_sweep":
